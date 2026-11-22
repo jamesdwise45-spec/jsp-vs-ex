@@ -1,0 +1,106 @@
+name: test-prerelease
+
+# FORK ONLY, never upstream: builds a friends' online TEST build and publishes it as a GitHub PRE-release of this fork.
+# Started by pushing a tag test-<version> (for example test-0.7.0-test1): a tag push runs the workflow file of the tagged
+# commit, so this file only has to be on the test branch, not on the default branch. <version> must equal installer/VERSION
+# of that commit (assemble_payload.py --release checks it); it is baked into release.txt, so the game's main menu, the
+# installer and the portable zip name all show it. The setup, the zip and SHA256SUMS are attached to the pre-release.
+#
+# The installer holds no game data: it builds the game on each player's PC from their own copy. No secrets are used:
+# installer.yml downloads only public, SHA-256-pinned files and the submodule is a public URL.
+
+on:
+  push:
+    tags: ['test-*']
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    if: github.repository != 'Tsamiuy/jsp-vs-ex'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - name: Version from the tag
+        id: v
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG#test-}"
+          # The same characters and length the game's version line accepts (jsp_version_line.h valid_version), as X.Y.Z[-suffix].
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$ ]] || [ "${#version}" -gt 24 ]; then
+            echo "tag '$TAG' does not give a version X.Y.Z or X.Y.Z-suffix (24 characters at most)"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "test build $version"
+
+  build:
+    needs: version
+    permissions:
+      contents: read
+    uses: ./.github/workflows/installer.yml
+    with:
+      portable: true
+      keep_days: 14
+      release_version: ${{ needs.version.outputs.version }}
+
+  prerelease:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write   # create the pre-release
+      actions: read     # download this run's artifact
+    steps:
+      - name: Create the pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # The jsp-installer-<sha> artifact of this run (the GitHub CLI, so no extra action and no checkout are needed).
+          gh run download "$GITHUB_RUN_ID" --name "jsp-installer-$GITHUB_SHA" --dir files
+          ls -l files
+          test -f files/jsp-setup.exe
+          test -f "files/jsp-$VERSION-portable.zip"
+          test -f files/SHA256SUMS
+          cat > notes.md <<EOF
+          Online test build $VERSION of draft PR Tsamiuy/jsp-vs-ex#248 (rollback for Online Battle). Not an official release of the project.
+
+          ## New in test3
+
+          - **Steadier on rough connections.** The game now sets how long it waits for the other player's input from the worst recent lag spikes, not the average, and reacts within about 4 seconds instead of 10. When big rewinds start happening it adds a frame of waiting at once. The game also never rewinds more than 6 frames (was 8). On connections like 100-130 ms with big swings this removes most of the large rewinds that showed as hitches.
+          - **Smoother audio.** The game keeps a small reserve of sound so the speakers no longer run dry when a frame is a little late; any gap that still happens fades out and back in instead of clicking.
+
+          ## Fixed in test2 (still in this build)
+
+          - **Each player controls their own fighter**, and **the joining player's buttons work on both PCs** (test1 could swap the fighters or ignore the joiner).
+          - **Cheaper rollbacks:** re-run frames are no longer drawn, so a rewind costs about half as much.
+
+          ## Quick start
+
+          1. Download **jsp-setup.exe** below and run it (or unpack the portable zip outside Program Files and run \`run.cmd\`). Windows SmartScreen may warn about an unsigned program: choose "More info" > "Run anyway".
+          2. Setup asks for your own disc folder (US disc) and your own decrypted \`EBOOT.elf\`, then builds the game on your PC (about 6 minutes on a recent PC).
+          3. Start the game and play one offline Free Battle (1 Player, 2 vs 2) with the characters you plan to use online. It builds their graphics ahead of time, so online fights do not stall.
+          4. Online: Main Menu > Battle Modes > Online Battle > Friendly Match. One player picks **Create a Room**, the other **Search for a Room** and joins it. The host starts the fight.
+          5. When the fight starts you see \`Rollback on: direct connection\` (or \`connected through the server\`), and the ping in ms under the timer. After the match both players return to the room and the host starts the next fight.
+
+          Online works out of the box: a public test server (re-psn), a random name (change it in the settings window, Online tab) and rollback are already set. No IP addresses or port forwarding needed. If Windows asks to allow the game through the firewall, click **Allow access**.
+
+          ## Limits of this build
+
+          - Online is 2 vs 2; each player has 1 fighter + 1 support and COM fighters fill the rest. The two players are on opposite teams.
+          - Only the host can pick characters (the game's own Friendly Match room); the joiner is on Random Select.
+          - Sudden freezes in the connection itself (100+ ms with no data) can still cause a short hitch.
+
+          If something goes wrong, run \`support-bundle.cmd\` in the install folder and send the file it makes. Everyone in a match must use this same build (the main menu shows $VERSION). SHA256SUMS lists each file's hash. Full guide and troubleshooting: ONLINE-GUIDE.md in the install folder. No game data is included: the game is built on your PC from your own copy.
+          EOF
+          gh release create "$TAG" --prerelease --draft --verify-tag --title "J-Stars Victory VS EX online test $VERSION" \
+            --notes-file notes.md files/jsp-setup.exe "files/jsp-$VERSION-portable.zip" files/SHA256SUMS
