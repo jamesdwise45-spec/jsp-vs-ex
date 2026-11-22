@@ -165,15 +165,19 @@ private:
 };
 
 // ---- rendezvous --------------------------------------------------------------------------------------------------------------
-struct PeerSlots { Endpoint ep; uint8_t first_slot = 0; uint8_t count = 0; };
+// ENHANCEMENT (4-player online): `peer` = the peer id (handshake roster slot): host 0, clients 1.. in the order the host took their HELOs.
+struct PeerSlots { Endpoint ep; uint8_t first_slot = 0; uint8_t count = 0; uint8_t peer = 0; uint32_t tag = 0; };   // tag: see DirectRendezvous::set_tag
 struct SessionPlan {
     uint64_t session_id = 0;        // same width as the handshake's session id (jpsm::Host::begin / Client::join)
     bool host = false;
     uint8_t total_players = 0;      // over all peers; slot s is GekkoNet handle s
     uint8_t local_first = 0, local_count = 0;
-    std::vector<PeerSlots> remotes; // 1 entry for the 2-peer case
+    uint8_t local_peer = 0;         // ENHANCEMENT (4-player online): this peer's id (host 0)
+    std::vector<PeerSlots> remotes; // 1 entry for the 2-peer case, one per other peer (peer id order) with N peers
     // Handshake roster mapping: peer id (== handshake roster slot, host 0, client 1) -> mask of game slots that peer owns, e.g. 2+2 = {0b0011, 0b1100}.
+    // One remote: by local_first as before (host = the peer of slot 0); more: by the peer ids.
     std::array<uint8_t, 4> peer_slot_mask() const;
+    uint8_t roster_mask() const;    // ENHANCEMENT (4-player online): the mask of every peer id in the plan (0b11 for 2 peers)
 };
 
 // Pluggable: (a) DirectRendezvous below; (b) a re-psn room (design in the doc, not implemented). poll() never blocks.
@@ -188,6 +192,13 @@ public:
 
 // Host: waits for one client on `mux`'s port; client: sends HELO to `host`. Slots: host first, then the client. The host validates the first
 // message of every new sender: only a well-formed HELO makes a client; a stray datagram is dropped and does not fail the host.
+// ENHANCEMENT (4-player online, off unless set_expected_peers(3..4) or claim_slot): the host waits for N-1 HELOs and every client opens the GekkoNet mesh to every
+// other peer from the plan. Slot claims: a peer that claims its first slot (the battle slot the game gave it = its room record index) gets it, the others fill
+// the lowest free slots in peer order; claims that overlap or leave a gap the others cannot fill fail the host and every client ("slot claims clash").
+// Wire: HELO gains a claim byte and a tag u32 (10 B); the host then answers every client with PLN2 {'P','L','N','2', session_id u64, total u8, you u8, n u8,
+// n x {peer u8, first u8, count u8, endpoint 6 B as the host sees it (zero for the host), tag u32}} or NOPE. Without claims and with 2 peers it is the old 5-byte
+// HELO / 15-byte PLAN. Tag: an opaque id of the peer (the re-psn user id); a client's resolver maps the tag of another client to THIS PC's view of its endpoint.
+constexpr uint8_t kRankClaim = 0x10;   // ENHANCEMENT (4-player online): HELO claim bytes kRankClaim..0xFE = rank claims (claim_rank), 0xFF = none
 class DirectRendezvous : public IRendezvous {
 public:
     DirectRendezvous(UdpMux& mux, MessageHub& hub, uint8_t local_count, uint64_t session_id) // host
@@ -201,12 +212,25 @@ public:
     uint64_t rejected_hello = 0;
     // ENHANCEMENT (rollback over re-psn): the host takes a HELO only from this endpoint (the room's other player as the server gave it), so another host of the
     // internet that knows the UDP port cannot take the client's seat before the plan is agreed. Not set = any endpoint (direct IP).
-    void set_only_peer(const Endpoint& e) { only_ = e; has_only_ = true; }
+    void set_only_peer(const Endpoint& e) { only_.assign(1, e); }
+    void add_only_peer(const Endpoint& e) { only_.push_back(e); }   // ENHANCEMENT (4-player online): one call per other room member
+    void set_expected_peers(uint8_t n) { expect_ = n < 2 ? 2 : n > 4 ? 4 : n; }   // host: peers including the host (2..4, default 2)
+    void claim_slot(uint8_t first) { claim_ = first; }                     // this peer's first game slot (0..3); not called = slots by peer order
+    // ENHANCEMENT (4-player online, review: stale room records): a rank claim instead: the host gives the rank-claiming peers the lowest free slots in key order
+    // (key 0..0xEE = the native room member id), so slots follow the room's member order though no PC knows the others' ids.
+    void claim_rank(uint16_t key) { claim_ = (uint8_t)(kRankClaim + (key > 0xEE ? 0xEE : key)); }
+    void set_tag(uint32_t tag) { tag_ = tag; }                             // carried in HELO / PLN2 (PeerSlots::tag)
+    void set_resolver(std::function<bool(uint32_t tag, Endpoint* out)> f) { resolve_ = std::move(f); }   // client: false = keep the host's view
+    // Host: one channel per client (peer id order); client: the host's. peer_channel() is the first.
+    const std::vector<MessageChannel*>& channels() const { return chs_; }
 private:
-    Endpoint only_{}; bool has_only_ = false;
+    struct Hello { MessageChannel* ch; uint8_t count, claim; uint32_t tag; };
+    int host_plan();
+    std::vector<Endpoint> only_;
     UdpMux& mux_; MessageHub& hub_;
     bool host_; uint8_t local_count_; Endpoint host_ep_;
     SessionPlan plan_; std::string err_; MessageChannel* ch_ = nullptr; bool sent_hello_ = false; int state_ = 0; uint8_t hello_count_ = 0;
+    uint8_t expect_ = 2, claim_ = 0xFF; uint32_t tag_ = 0; std::function<bool(uint32_t, Endpoint*)> resolve_; std::vector<Hello> hellos_; std::vector<MessageChannel*> chs_;
 };
 
 // ---- wire form of one pad (8 bytes) ---------------------------------------------------------------------------------------------
@@ -280,16 +304,21 @@ struct SessionStats {
     uint64_t advances = 0, resimulated = 0, saves = 0, loads = 0, deferred = 0;
     float frames_ahead = 0;
     float ping_ms = -1, jitter_ms = 0;        // GekkoNet's average round trip to the first remote player and its jitter (-1: no remote / not known yet)
+    // ENHANCEMENT (4-player online): GekkoNet's average round trip and jitter per slot (-1: local, gone or not known yet). The worst connected remote
+    // link is worst_* below (one rule for the input delay and the ping counter).
+    std::array<float, 4> slot_ping_ms{{-1, -1, -1, -1}}, slot_jitter_ms{{0, 0, 0, 0}};
     float last_ping_ms = -1;                 // ENHANCEMENT (adaptive input delay, rule 2): GekkoNet's last single round trip to that player (one every 500 ms)
     uint32_t rtt_seq = 0;                    // FIX (RTT sampling): round trips measured so far for that player (GekkoNet's count, +1 per ping answer): a reader
                                              // that sees the same count again has no new round trip, whatever last_ping_ms says
     // ENHANCEMENT (worst remote, 2v2): the same four for the WORST remote slot (jpdr::worst_of in jsp_net_delay_rule.h: the largest average + 2 x jitter),
     // which the adaptive input delay reads: this PC's inputs must reach every other PC in time. worst_rtt_seq carries the slot in its top byte (a count is
-    // per remote). With one remote PC: the numbers above. The fields above stay the first remote's (the ping counter, the perf summary's acks).
+    // per remote). With one remote PC: the numbers above. The fields above stay the first remote's (the perf summary's acks). ENHANCEMENT (4-player
+    // online): only connected remotes count (a slot in gone_mask is skipped), and the ping counter shows worst_ping_ms.
     float worst_ping_ms = -1, worst_jitter_ms = 0, worst_last_ping_ms = -1;
     uint32_t worst_rtt_seq = 0;
     int worst_slot = -1;                     // -1: no remote with a known round trip
     int32_t acked_frame = -1;               // ENHANCEMENT (match perf summary): the newest frame of this PC's input that player acknowledged (-1 none)
+    uint8_t gone_mask = 0;                    // remote slots GekkoNet reported disconnected (their input is neutral from the agreed frame on)
     uint8_t local_delay = 0;                  // the input delay this peer's local players run with now
     uint64_t keepalive_polls = 0;            // polls made by the keepalive thread (the game thread was busy)
 };
@@ -357,6 +386,9 @@ public:
     std::vector<SessionEvent> take_events(int* final_frame);
     SessionStats stats() const;
     const SessionPlan& plan() const { return plan_; }
+    // ENHANCEMENT (4-player online): the remote peers whose slots are not all disconnected. A match of 3-4 peers goes on while this is >= 1 (the leaver's
+    // fighter gets GekkoNet's agreed neutral input on every PC); with 2 peers a disconnect ends it as before.
+    unsigned remote_peers_connected() const;
     // ENHANCEMENT (adaptive input delay, test): the input delay of this peer's local players from now on (GekkoNet SetLocalDelay: a longer delay repeats
     // the last input, a shorter one drops the overlap). Each peer sets only its own delay; the other peer sees only its input stamps. All local players alike.
     void set_local_delay(uint8_t d);
@@ -368,6 +400,7 @@ public:
     int final_frame() const;
 private:
     uint8_t cur_delay_ = 0;   // the local players' input delay now (set_local_delay)
+    uint8_t gone_ = 0;        // ENHANCEMENT (4-player online): slots of Disconnected events (stats().gone_mask)
 
     static constexpr int kNoTick = 0x7fffffff;
     void fail(const std::string& why);

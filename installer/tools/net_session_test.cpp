@@ -8,6 +8,7 @@
 //       [--jitter ms] [--delay ms] [--cheat TICK] [--leave TICK] [--settings STR] [--pred N] [--depth N] [--stepper-depth N] [--dirty 1]
 //       [--tick-ms N] [--blackout from,to] [--timeout-ms N] [--busy-stall TICK,MS] [--keepalive-ms N] [--max-ms N] [--out FILE]
 //       [--ko-from TICK] [--ko-every N] [--ko-scan 0|1] [--mute-at TICK] [--idle-from UPDATE] [--gap-at TICK,MS]
+//       [--peers N (host, 3-4: a mesh of N processes)] [--claim SLOT] [--die TICK] [--die-at-start 1] [--cut SLOT,TICK]
 // FIX (review of PR 248, the end rules of jsp_net_ko_rule.h, the same classes as jsp_net_game.cpp): --ko-from T records a winner on every save of a
 // tick >= T whose state has fold % N == 0 (--ko-every, default 1 = every such tick), predicted or not, and drops the entries a rollback undoes.
 // After each pass's events: a Disconnected decides once with jkr::disconnect_result ("KO disconnect: ..." line, with the old any-recorded-winner rule
@@ -24,7 +25,9 @@
 #include "jsp_net_glue.h"
 #include "jsp_net_ko_rule.h"
 #include "jsp_net_delay_rule.h"
+#include "jsp_net_four.h"   // ENHANCEMENT (4-player online): the leaver rule (leave_policy)
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -115,6 +118,11 @@ int main(int argc, char** argv)
         if (!parse_endpoint(arg(argc, argv, "--peer", ""), peer)) { std::printf("SUMMARY role=client bad --peer\n"); return 2; }
         rz.reset(new DirectRendezvous(mux, hub, (uint8_t)local, peer));
     }
+    // ENHANCEMENT (4-player online): --peers N (host: 3-4 processes in a mesh), --claim S (this process's first slot), --die TICK (the process ends at once
+    // without telling anyone, as a killed game: exit 9, no tick log)
+    if (host && arg(argc, argv, "--peers")) rz->set_expected_peers((uint8_t)atoi(arg(argc, argv, "--peers", "2")));
+    if (const char* c = arg(argc, argv, "--claim")) rz->claim_slot((uint8_t)atoi(c));
+    const int die_at = atoi(arg(argc, argv, "--die", "-1"));
     auto sleep_ms = [](int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); };
     auto t0 = std::chrono::steady_clock::now();
     auto since = [&] { return (int)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count(); };
@@ -122,23 +130,45 @@ int main(int argc, char** argv)
     while ((rs = rz->poll()) == 0 && since() < 15000) sleep_ms(2);
     if (rs != 1) { std::printf("SUMMARY role=%s rendezvous failed: %s\n", role.c_str(), rz->error().c_str()); return 2; }
     SessionPlan plan = rz->plan();
-    MessageChannel* ch = rz->peer_channel();
+    if (plan.remotes.size() > 1) { std::printf("PLAN slots=%u..%u/%u\n", plan.local_first, plan.local_first + plan.local_count - 1, plan.total_players); std::fflush(stdout); }   // a killed process prints no SUMMARY
+    // ENHANCEMENT (4-player online): --die-at-start 1 = the process ends right after the plan, before the settings barrier (a game killed between the
+    // rendezvous and the match): the others must give up within their barrier timeout (exit 2), never hang
+    if (atoi(arg(argc, argv, "--die-at-start", "0"))) { std::printf("DIED at start\n"); std::fflush(stdout); std::_Exit(9); }
+    const std::vector<MessageChannel*> chs = rz->channels();   // host: every client (a star for the stand-ins below); client: the host
     mux.set_link_model(lm);   // impairment starts after the rendezvous (the plan exchange has its own tests)
+    // ENHANCEMENT (4-player online, review): --cut SLOT,TICK drops every datagram this process sends to the peer of game slot SLOT from tick TICK on (give it to
+    // both ends: one broken link of the mesh, the others intact)
+    std::atomic<bool> cut_on{false}; Endpoint cut_ep{}; int cut_tick = -1;
+    if (const char* c = arg(argc, argv, "--cut")) {
+        unsigned sl = 0, tk = 0; std::sscanf(c, "%u,%u", &sl, &tk); cut_tick = (int)tk;
+        for (const PeerSlots& r : plan.remotes) if (r.first_slot == sl) cut_ep = r.ep;
+        mux.set_hooks(nullptr, [&cut_on, cut_ep](const Endpoint& to, const std::vector<uint8_t>&) { return cut_on.load() && to == cut_ep; });
+    }
+    // One message from every channel, in channel order; false when `until` passed first.
+    auto recv_each = [&](std::vector<std::string>& got, int until) {
+        got.assign(chs.size(), std::string()); std::vector<bool> have(chs.size(), false); size_t n = 0; std::vector<uint8_t> in;
+        while (n < chs.size() && since() < until) {
+            hub.pump(); bool any = false;
+            for (size_t i = 0; i < chs.size(); i++) if (!have[i] && chs[i]->recv(in)) { got[i].assign(in.begin(), in.end()); have[i] = true; n++; any = true; }
+            if (!any) sleep_ms(2);
+        }
+        return n == chs.size();
+    };
+    auto all_idle = [&] { for (MessageChannel* c : chs) if (!c->idle()) return false; return true; };
 
     // Settings-handshake stand-in: settings manifest compare, then a READY barrier (the real settings handshake is exercised in net_m2_link_test).
     {
         const std::string m = "SET:" + settings;
-        ch->send((const uint8_t*)m.data(), m.size());
-        std::vector<uint8_t> in; std::string theirs; bool got = false;
-        while (!got && since() < 15000) { hub.pump(); if (ch->recv(in)) { theirs = std::string(in.begin(), in.end()); got = true; } else sleep_ms(2); }
-        if (!got) { std::printf("SUMMARY role=%s handshake timeout\n", role.c_str()); return 2; }
-        if (theirs != m) { std::printf("SUMMARY role=%s settings mismatch mine=%s theirs=%s\n", role.c_str(), m.c_str(), theirs.c_str()); return 3; }
+        for (MessageChannel* c : chs) c->send((const uint8_t*)m.data(), m.size());
+        std::vector<std::string> theirs;
+        if (!recv_each(theirs, 15000)) { std::printf("SUMMARY role=%s handshake timeout\n", role.c_str()); return 2; }
+        for (const std::string& t : theirs) if (t != m) { std::printf("SUMMARY role=%s settings mismatch mine=%s theirs=%s\n", role.c_str(), m.c_str(), t.c_str()); return 3; }
         const uint8_t ok[5] = {'R', 'E', 'A', 'D', 'Y'};
-        ch->send(ok, 5);
-        got = false;
-        while (!got && since() < 15000) { hub.pump(); if (ch->recv(in)) got = in.size() == 5; else sleep_ms(2); }
+        for (MessageChannel* c : chs) c->send(ok, 5);
+        bool got = recv_each(theirs, 15000);
+        for (const std::string& t : theirs) got = got && t.size() == 5;
         if (!got) { std::printf("SUMMARY role=%s ready barrier timeout\n", role.c_str()); return 2; }
-        while (!ch->idle() && since() < 15000) { hub.pump(); sleep_ms(2); }   // our READY acknowledged
+        while (!all_idle() && since() < 15000) { hub.pump(); sleep_ms(2); }   // our READY acknowledged
     }
 
     if (atoi(arg(argc, argv, "--dirty", "0"))) {
@@ -204,9 +234,12 @@ int main(int argc, char** argv)
     // --idle-from N: from update N on this copy sends the all-zero wire input, which is also what GekkoNet fills in for a disconnected peer (so the peer's
     // predictions of it are never corrected when it goes: its predicted saves stay, as when a real player stops pressing before the link dies)
     const int idle_from = atoi(arg(argc, argv, "--idle-from", "-1"));
+    // ENHANCEMENT (4-player online, ownership mutation, TEST ONLY): --own-mutate 1 makes this process send the pads of the NEXT slot's generator for its own slot (a swapped pad, as the
+    // testers' control swap): every process still simulates the same inputs, so the hashes agree, and only the OWN check can see it
+    const unsigned own_mutate = (unsigned)atoi(arg(argc, argv, "--own-mutate", "0"));
     tg.lp = [&](uint8_t n, uint8_t* wire) {
         if (idle_from >= 0 && frame >= idle_from) { std::memset(wire, 0, 8); return; }
-        const jsi::Pad p = pad_for(seed, plan.local_first + n, frame); pad_pack_to_wire(p.pack().data(), wire);
+        const jsi::Pad p = pad_for(seed, (plan.local_first + n + own_mutate) % players, frame); pad_pack_to_wire(p.pack().data(), wire);
     };
     Glue glue(s, stepper, tg);
     glue.set_skip_final(skip_final);
@@ -296,6 +329,14 @@ int main(int argc, char** argv)
                 if (!lost_now) std::printf("DISCONNECT-EVENT %d ms after this copy's last new tick %u\n", since() - progress_ms, max_tick);
                 lost_now = true;
             }
+            // ENHANCEMENT (4-player online, review): the game's leaver rule (jsp4::leave_policy): one player gone goes on, a second one ends the match here
+            if (e.kind == SessionEventKind::Disconnected && plan.remotes.size() > 1 && !s.failed()) {
+                const SessionStats gs = s.stats(); unsigned gone = 0; for (unsigned q = 0; q < 4; q++) gone += (gs.gone_mask >> q) & 1u;
+                if (jsp4::leave_policy(true, s.remote_peers_connected(), gone) == jsp4::Leave::EndMatch) {
+                    std::printf("CONNECTION LOST at tick %u (%u slots gone, %u peers connected)\n", max_tick, gone, s.remote_peers_connected()); std::fflush(stdout);
+                    s.abort("connection lost");
+                }
+            }
         }
         if (max_tick != progress_tick) { progress_tick = max_tick; progress_ms = since(); }
         // FIX (review of PR 248): the boundary's order in jsp_net_game.cpp: the events first (a Disconnected decides with the live watermark), then the
@@ -320,8 +361,10 @@ int main(int argc, char** argv)
             std::fflush(stdout);
         }
         if (mute_at >= 0 && !muted && (int)max_tick >= mute_at) { LinkModel m = lm; m.loss_permille = 1000; mux.set_link_model(m); muted = true; std::printf("MUTED at tick %u\n", max_tick); std::fflush(stdout); }
+        if (cut_tick >= 0 && !cut_on.load() && (int)max_tick >= cut_tick) cut_on = true;
         if (s.failed()) { linger_until = linger_until < 0 ? since() + 700 : linger_until; if (since() > linger_until) break; }
         if (leave_at >= 0 && !left && (int)max_tick >= leave_at) { s.leave(0); left = true; linger_until = since() + 500; }
+        if (die_at >= 0 && (int)max_tick >= die_at) { std::printf("DIED at tick %u\n", max_tick); std::fflush(stdout); std::_Exit(9); }
         if (linger_until < 0 && (int)max_tick >= ticks) linger_until = since() + 2500;   // stay alive so the peer can finish
         if (linger_until >= 0 && since() > linger_until) break;
         if (since() > max_ms) break;
@@ -355,11 +398,13 @@ int main(int argc, char** argv)
     }
     // Neutral check: after a peer left, the slots it owned must read neutral (buttons 0, sticks centre, not connected) at the end.
     int tail_neutral = -1;
+    const SessionStats st = s.stats();
     if (!s.failed() && max_tick > 6) {
         tail_neutral = 1;
         for (uint32_t t = max_tick - 3; t <= max_tick; t++)
             for (unsigned p = 0; p < players; p++) {
                 if (p >= plan.local_first && p < (unsigned)plan.local_first + plan.local_count) continue;
+                if (st.gone_mask && !(st.gone_mask >> p & 1)) continue;   // ENHANCEMENT (4-player online): once a peer left, only its slots (the others still play)
                 const jsi::Pad& pd = pads_of[t][p];
                 if (pd.buttons || pd.lx != 128 || pd.ly != 128 || pd.rx != 128 || pd.ry != 128) {   // `connected` is forced by jsi::Table::serve (slot in the mask)
                     if (tail_neutral) std::printf("TAIL tick %u slot %u buttons=%04x sticks=%u,%u,%u,%u connected=%d\n", t, p, pd.buttons, pd.lx, pd.ly, pd.rx, pd.ry, (int)pd.connected);
@@ -383,12 +428,33 @@ int main(int argc, char** argv)
     const double rate = iters_after_first_run ? (double)live_after_first / (double)iters_after_first_run : 0.0;
     const double all_rate = iters_after_first_run ? (double)runs_after_first / (double)iters_after_first_run : 0.0;
     const double min_rate = atof(arg(argc, argv, "--min-rate", "0")), min_all = atof(arg(argc, argv, "--min-all-rate", "0"));
-    const SessionStats st = s.stats();
     if (adapt_on)
         std::printf("ADAPTED delay=%d changes=%d slow_state=%d slow_n=%d slow_min=%.1f ping=%.1f last_ping=%.1f rtt_seq=%u worst_ping=%.1f worst_last_ping=%.1f "
                     "worst_rtt_seq=%u worst_slot=%d first_remote=%u taken=%u\n", (int)st.local_delay, adapt_changes, ads.slow_state, ads.slow_n, ads.slow_min,
                     st.ping_ms, st.last_ping_ms, st.rtt_seq, st.worst_ping_ms, st.worst_last_ping_ms, st.worst_rtt_seq, st.worst_slot,
                     plan.local_first == 0 ? (unsigned)plan.local_count : 0u, ads.rtt_taken);
+    if (plan.remotes.size() > 1) {   // ENHANCEMENT (4-player online): the mesh facts (2-peer runs print no MESH line: their output is unchanged)
+        const auto mk = plan.peer_slot_mask();
+        std::printf("MESH role=%s peer=%u roster=%x masks=%x,%x,%x,%x gone=%x remotes_connected=%u worst_ping=%.0f worst_jitter=%.0f pings=%.0f,%.0f,%.0f,%.0f\n",
+                    role.c_str(), plan.local_peer, plan.roster_mask(), mk[0], mk[1], mk[2], mk[3], st.gone_mask, s.remote_peers_connected(),
+                    st.worst_ping_ms, st.worst_jitter_ms, st.slot_ping_ms[0], st.slot_ping_ms[1], st.slot_ping_ms[2], st.slot_ping_ms[3]);
+        // ENHANCEMENT (4-player online, ownership: "own pad -> own fighter"): every process generates its pads from (seed, ITS slot, frame) only, so the final pad of slot p at any tick
+        // must be one of slot p's own pads and never another slot's. ok[p] = ticks whose pad came from slot p's generator, bad = a pad of another slot's
+        // generator (a swapped or mixed-up slot), none = no generator (neutral: before the first input, or a leaver's agreed neutral input).
+        std::map<uint64_t, unsigned> gen;   // pad (buttons, sticks) -> the slot whose generator made it
+        auto pk = [](const jsi::Pad& p) { return (uint64_t)p.buttons | (uint64_t)p.lx << 16 | (uint64_t)p.ly << 24 | (uint64_t)p.rx << 32 | (uint64_t)p.ry << 40; };
+        const int frames = (int)max_tick * 4 + 4000;
+        for (unsigned p = 0; p < players; p++) for (int f = 0; f < frames; f += g_change) gen.emplace(pk(pad_for(seed, p, f)), p);
+        unsigned ok[4] = {0, 0, 0, 0}, bad = 0, none = 0; uint32_t first_bad = 0;
+        for (const auto& kv : pads_of)
+            for (unsigned p = 0; p < players && p < 4; p++) {
+                auto it = gen.find(pk(kv.second[p]));
+                if (it == gen.end()) none++;
+                else if (it->second == p) ok[p]++;
+                else { if (!bad) first_bad = kv.first; bad++; }
+            }
+        std::printf("OWN role=%s local_slot=%u ok=%u,%u,%u,%u bad=%u none=%u first_bad=%u ticks=%zu\n", role.c_str(), plan.local_first, ok[0], ok[1], ok[2], ok[3], bad, none, first_bad, pads_of.size());
+    }
     std::printf("SUMMARY role=%s slots=%u..%u/%u maxtick=%u rollbacks=%u maxdepth=%u resim=%llu saves=%llu loads=%llu stalls=%u deferred=%llu desync=%d failed=%s "
                 "ref_ticks=%d ref_bad=%d tail_neutral=%d rate=%.3f all_rate=%.3f iters=%llu paced=%llu paced_ms=%llu keepalive_polls=%llu sent=%llu dropped=%llu skipped=%llu round=%d/%d events:%s\n",
                 role.c_str(), plan.local_first, plan.local_first + plan.local_count - 1, plan.total_players, max_tick, st.rollbacks, st.max_rollback_frames,
@@ -405,11 +471,12 @@ int main(int argc, char** argv)
       if (s.running() || s.synced() || s.failed() || !s.take_events().empty() || z.advances || z.saves || z.rollbacks) { std::printf("SUMMARY role=%s stop() left session state behind (round %d)\n", role.c_str(), round); return 8; } }
     {   // both peers have stopped before either starts again (stragglers of the old session carry its magic and are dropped by the new one)
         const std::string m = "ROUND" + std::to_string(round + 1);
-        ch->send((const uint8_t*)m.data(), m.size());
-        std::vector<uint8_t> in; bool got = false; const int until = since() + 15000;
-        while (!got && since() < until) { hub.pump(); if (ch->recv(in)) got = std::string(in.begin(), in.end()) == m; else sleep_ms(2); }
+        for (MessageChannel* c : chs) c->send((const uint8_t*)m.data(), m.size());
+        std::vector<std::string> theirs; const int until = since() + 15000;
+        bool got = recv_each(theirs, until);
+        for (const std::string& t : theirs) got = got && t == m;
         if (!got) { std::printf("SUMMARY role=%s round barrier timeout (round %d)\n", role.c_str(), round + 1); return 2; }
-        while (!ch->idle() && since() < until) { hub.pump(); sleep_ms(2); }
+        while (!all_idle() && since() < until) { hub.pump(); sleep_ms(2); }
     }
     }   // rounds
 }

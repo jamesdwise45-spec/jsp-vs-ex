@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Two-process rollback session tests (no game, no GPU): starts net_session_test as host and client over localhost UDP and checks them.
+ENHANCEMENT (4-player online): MESH below runs 3 and 4 processes (one player each) in a GekkoNet mesh: equal hashes on every peer, slot claims, a peer killed mid-match.
     python3 installer/tools/net_session_test.py --exe PATH [--only NAME] [--ticks N] [--deadline S]
 Scenarios and what each must show are in SCENARIOS below; exit 1 on any failure. Build: installer/tools/net_session_test.sh (which also runs it).
 The exe may also be the MinGW build when run where Windows programs run (not done by default).
@@ -275,6 +276,219 @@ def ko_check(kind, ho, co):
     return f
 ROUNDS_EXPECTED = {"restart_3_rounds": 3}
 
+# ENHANCEMENT (4-player online): N processes (3 or 4: host + clients, --local 1 each) in a GekkoNet mesh; every process has its own simulated link (its sends:
+# loss / delay / jitter, as JSP_NET_LINK does in the game). name: (args per process, host first, kind, extra). Every kind checks equal hashes across ALL processes.
+L1, L2, L3 = ["--loss", "50", "--jitter", "20", "--delay", "10"], ["--loss", "100", "--jitter", "30", "--delay", "15"], ["--loss", "20", "--jitter", "10", "--delay", "5"]
+MESH = {
+    "mesh3_clean": ([["--peers", "3"], [], []], "mesh_agree", {}),
+    "mesh4_impaired": ([["--peers", "4"] + L1, L2, L3, ADV], "mesh_agree_rb", {}),
+    # each PC claims its battle slot (reverse of the join order); the plan must give exactly those slots, every peer the same roster masks
+    "mesh4_claims": ([["--peers", "4", "--claim", "3"] + L1, ["--claim", "2"] + L2, ["--claim", "0"] + L3, ["--claim", "1"]], "mesh_agree", {"slots": [3, 2, 0, 1]}),
+    # two clients claim slot 1: the host refuses and every process fails the rendezvous (exit 2) naming the clash
+    "mesh4_clash": ([["--peers", "4", "--max-ms", "4000"], ["--claim", "1"], ["--claim", "1"], []], "mesh_clash", {}),
+    # one of four is killed mid-match (no goodbye): the three others see its disconnect once, agree on its neutral input from the same frame, and play on to the end
+    "mesh4_kill": ([["--peers", "4", "--timeout-ms", "1500"] + L1, ["--timeout-ms", "1500"] + L2, ["--timeout-ms", "1500", "--die", "200"] + L3, ["--timeout-ms", "1500"]], "mesh_gone", {"gone": 2}),
+    "mesh3_kill_host": ([["--peers", "3", "--timeout-ms", "1500", "--die", "250"] + L1, ["--timeout-ms", "1500"] + L2, ["--timeout-ms", "1500"]], "mesh_gone", {"gone": 0}),
+    "mesh3_leave": ([["--peers", "3"], ["--leave", "200"], []], "mesh_gone", {"gone": 1}),
+    # one peer's state flipped at tick 300: every peer reports exactly tick 300
+    "mesh4_cheat": ([["--peers", "4"], [], ["--cheat", "300"], []], "mesh_cheat", {}),
+    # ENHANCEMENT (review: one broken link): the A-D link (slots 0 and 3) is cut at tick 200, every other link stays up. GekkoNet's disconnect claims make the
+    # peers disagree on who is in; the leaver rule must end the match on EVERY process ("CONNECTION LOST"), never play on split. Hashes equal up to the cut.
+    "mesh4_cut": ([["--peers", "4", "--claim", "0", "--timeout-ms", "1500", "--cut", "3,200"], ["--claim", "1", "--timeout-ms", "1500"], ["--claim", "2", "--timeout-ms", "1500"],
+                   ["--claim", "3", "--timeout-ms", "1500", "--cut", "0,200"]], "mesh_cut", {"cut": 200}),
+    # one far peer (60 ms one way on its sends): its link is the worst on every other peer (per-slot ping) and on itself
+    "mesh4_far_peer": ([["--peers", "4"], [], [], ["--delay", "60"]], "mesh_ping", {"far": 3}),
+    # ENHANCEMENT (4-player online): a 2v2 of four PCs, each claiming its battle slot, every link different (loss 3-10 %, jitter 10-40 ms, one way 5-70 ms) and every PC on
+    # its own input delay (1, 2, 3, 2): equal hashes everywhere, the claimed slots, rollbacks, and each slot's input from its own PC only (OWN)
+    "mesh4_2v2_asym": ([["--peers", "4", "--claim", "0", "--loss", "30", "--jitter", "10", "--delay", "5", "--delays", "1"],
+                        ["--claim", "1", "--loss", "80", "--jitter", "25", "--delay", "20", "--delays", "2"],
+                        ["--claim", "2", "--loss", "50", "--jitter", "40", "--delay", "45", "--delays", "3"],
+                        ["--claim", "3", "--loss", "100", "--jitter", "15", "--delay", "70", "--delays", "2"]], "mesh_agree_rb", {"slots": [0, 1, 2, 3]}),
+    # ENHANCEMENT (4-player online): a peer killed very early, and one killed late: the others play on to the end either way
+    "mesh4_kill_early": ([["--peers", "4", "--timeout-ms", "1500"] + L1, ["--timeout-ms", "1500", "--die", "40"] + L2, ["--timeout-ms", "1500"] + L3, ["--timeout-ms", "1500"]], "mesh_gone", {"gone": 1}),
+    # ENHANCEMENT (4-player online): two of four killed (no goodbye): the two left must END (the leaver rule: a second player gone ends the match), never hang or play on split
+    "mesh4_kill2": ([["--peers", "4", "--timeout-ms", "1500"] + L1, ["--timeout-ms", "1500", "--die", "200"] + L2, ["--timeout-ms", "1500"] + L3, ["--timeout-ms", "1500", "--die", "230"]],
+                    "mesh_lost", {"dead": [1, 3], "upto": 180}),
+    # ENHANCEMENT (4-player online): one PC dies between the plan and the match (a game killed in the loading): every other process gives up (exit 2), none hangs
+    # ENHANCEMENT (4-player online, ownership mutation): PC 2 sends slot 3's pads for its own slot. The hashes still agree everywhere (every PC simulates the same inputs); the OWN
+    # check must see the swap on every PC. Proves the ownership check catches what a hash comparison misses.
+    "mesh4_swapped": ([["--peers", "4", "--claim", "0"], ["--claim", "1"], ["--claim", "2", "--own-mutate", "1"], ["--claim", "3"]], "mesh_swapped", {"slots": [0, 1, 2, 3]}),
+    "mesh4_die_start": ([["--peers", "4"], [], ["--die-at-start", "1"], []], "mesh_dead_start", {"dead": 2}),
+}
+
+
+def run_n(exe, argvs, tmp, deadline_s=DEADLINE_S):
+    """Starts the host (argvs[0]) and then every client against its port. Returns ([rc], [output], problems)."""
+    end = time.monotonic() + deadline_s
+    left = lambda: max(0.0, end - time.monotonic())
+    procs, problems = [], []
+    try:
+        h = Proc([exe, "--role", "host", "--out", str(tmp / "p0.log")] + argvs[0]); procs.append(h)
+        h.port_or_eof.wait(left())
+        port = h.port()
+        if port is None: problems.append("host printed no PORT line")
+        else:
+            for i, a in enumerate(argvs[1:], 1):
+                procs.append(Proc([exe, "--role", "client", "--peer", f"127.0.0.1:{port}", "--out", str(tmp / f"p{i}.log")] + a))
+        for i, pr in enumerate(procs):
+            try: pr.p.wait(timeout=left())
+            except subprocess.TimeoutExpired: problems.append(f"hung: process {i} was still running at the {deadline_s} s scenario deadline (killed)")
+    finally:
+        for pr in procs:
+            if pr.p.poll() is None: pr.p.kill()
+            pr.p.wait(); pr.t.join(10)
+    return [p.p.returncode for p in procs], [p.out() for p in procs], problems
+
+
+def mesh_line(out):
+    m = [l for l in out.splitlines() if l.startswith("MESH")]
+    return m[-1] if m else ""
+
+
+def check_mesh(kind, rcs, outs, tmp, T, extra):
+    f, n = [], len(outs)
+    ss, ms = [summary(o) for o in outs], [mesh_line(o) for o in outs]
+    if kind == "mesh_clash":
+        if any(rc != 2 for rc in rcs): f.append(f"every process must fail the rendezvous (exit 2): {rcs}")
+        if not all("clash" in o for o in outs): f.append("not every process names the slot clash")
+        return f
+    if kind == "mesh_swapped":   # equal hashes AND a swap seen by the OWN check on every process
+        for i in range(n):
+            if num(own_line(outs[i]), "bad", 0) <= 0: f.append(f"process {i}: the OWN check did not see the swapped pad: {own_line(outs[i])[:160]}")
+        lg = {}
+        for i in range(n):
+            q = tmp / f"p{i}.log"; t = q.read_text().split() if q.exists() else []
+            lg[i] = {int(t[k]): t[k + 1] for k in range(0, len(t), 2)}
+        for a in range(1, n):
+            common = [t for t in lg[0] if t in lg[a] and t <= T - 30]
+            if len(common) < T - 40 or any(lg[0][t] != lg[a][t] for t in common): f.append(f"processes 0,{a}: hashes differ or too few ticks (the swap alone must not change them)")
+        return f
+    if kind == "mesh_dead_start":   # every other process gives up at the barrier (exit 2), the dead one exited 9
+        d = extra["dead"]
+        if rcs[d] != 9 or "DIED at start" not in outs[d]: f.append(f"process {d} did not die at the start: rc={rcs[d]}")
+        for i in range(n):
+            if i != d and rcs[i] != 2: f.append(f"process {i}: exit {rcs[i]}, expected 2 (gave up at the barrier): {(ss[i] or outs[i][-200:])[:200]}")
+        return f
+    if kind == "mesh_lost":   # two of four gone: the others end on the leaver rule; hashes equal before the first death
+        dead = extra["dead"]; live_ = [i for i in range(n) if i not in dead]
+        for d in dead:
+            if rcs[d] != 9 or "DIED" not in outs[d]: f.append(f"process {d} was not killed: rc={rcs[d]}")
+        for i in live_:
+            if "CONNECTION LOST" not in outs[i]: f.append(f"process {i}: did not end on the leaver rule (no CONNECTION LOST): {(ss[i] or outs[i][-200:])[:200]}")
+            if ss[i] and num(ss[i], "desync", -1) != -1: f.append(f"process {i}: a desync was reported: {ss[i][:120]}")
+        lg = {}
+        for i in range(n):
+            q = tmp / f"p{i}.log"; t = q.read_text().split() if q.exists() else []
+            lg[i] = {int(t[k]): t[k + 1] for k in range(0, len(t), 2)}
+        upto = extra["upto"]
+        for a in live_:
+            for b in live_:
+                if a >= b: continue
+                common = [t for t in lg[a] if t in lg[b] and t <= upto]
+                if len(common) < upto - 20: f.append(f"processes {a},{b}: only {len(common)} comparable ticks before the first death")
+                if any(lg[a][t] != lg[b][t] for t in common): f.append(f"processes {a},{b}: hashes differ before the first death")
+        return f
+    if kind == "mesh_cut":   # ENHANCEMENT (review): every process ends on the leaver rule, none plays on split; no desync; equal hashes before the cut
+        cut = extra["cut"]
+        for i in range(n):
+            if "CONNECTION LOST" not in outs[i]: f.append(f"process {i}: did not end on the leaver rule (no CONNECTION LOST): {(ss[i] or outs[i][-200:])[:200]}")
+            if ss[i] and num(ss[i], "desync", -1) not in (-1,): f.append(f"process {i}: a desync was reported: {ss[i][:120]}")
+        lg = {}
+        for i in range(n):
+            p = tmp / f"p{i}.log"; t = p.read_text().split() if p.exists() else []
+            lg[i] = {int(t[k]): t[k + 1] for k in range(0, len(t), 2)}
+        for a in range(n):
+            for b in range(a + 1, n):
+                common = [t for t in lg[a] if t in lg[b] and t <= cut - 20]
+                if len(common) < cut - 40: f.append(f"processes {a},{b}: only {len(common)} comparable ticks before the cut")
+                if any(lg[a][t] != lg[b][t] for t in common): f.append(f"processes {a},{b}: hashes differ before the cut")
+        return f
+    gone = extra.get("gone")
+    live = [i for i in range(n) if i != gone]   # the leaver stops early: it is not compared over the whole run
+    slots = {}
+    for i in range(n):
+        m = re.search(r"slots=(\d+)\.\.(\d+)/(\d+)", ss[i] or next((l for l in outs[i].splitlines() if l.startswith("PLAN ")), ""))
+        if m: slots[i] = int(m.group(1))
+        if not m or int(m.group(3)) != n: f.append(f"process {i}: no plan for {n} players: {ss[i][:120] or outs[i][-200:]}")
+    if sorted(slots.values()) != list(range(n)) and len(slots) == n: f.append(f"slots are not a permutation: {slots}")
+    if "slots" in extra and [slots.get(i) for i in range(n)] != extra["slots"]: f.append(f"claimed slots {extra['slots']}, plan gave {slots}")
+    masks = {re.search(r"masks=(\S+)", l).group(1) for l in ms if l}
+    if len(masks) != 1: f.append(f"the peers disagree on the roster masks: {masks}")
+    for i in live:
+        if not re.search(r"roster=%x\b" % ((1 << n) - 1), ms[i]): f.append(f"process {i}: roster mask is not all {n} peers: {ms[i][:120]}")
+    logs_ = {i: {} for i in range(n)}
+    for i in range(n):
+        p = tmp / f"p{i}.log"; t = p.read_text().split() if p.exists() else []
+        logs_[i] = {int(t[k]): t[k + 1] for k in range(0, len(t), 2)}
+    for i in live:
+        if not logs_[i]: f.append(f"process {i}: tick log missing or empty")
+    upto = 295 if kind == "mesh_cheat" else T - 30
+    for a in live:
+        for b in live:
+            if a >= b: continue
+            common = [t for t in logs_[a] if t in logs_[b] and t <= upto]
+            bad = [t for t in common if logs_[a][t] != logs_[b][t]]
+            if len(common) < upto - 10: f.append(f"processes {a},{b}: only {len(common)} comparable ticks")
+            if bad: f.append(f"processes {a},{b}: hashes differ at ticks {bad[:3]}")
+    f += own_check(outs, slots, live, T, extra.get("gone"))
+    if kind == "mesh_cheat":
+        for i in range(n):
+            if num(ss[i], "desync", -1) != 300: f.append(f"process {i}: first desync tick {num(ss[i], 'desync', -1)}, expected exactly 300")
+        return f
+    for i in live:
+        s = ss[i]
+        if rcs[i]: f.append(f"process {i}: exit code {rcs[i]}")
+        if num(s, "ref_bad", 1) != 0 or num(s, "ref_ticks", 0) < T: f.append(f"process {i}: rollback run differs from straight replay: " + s[:120])
+        if num(s, "desync", 0) != -1: f.append(f"process {i}: unexpected desync: " + s[:100])
+        if "failed=-" not in s: f.append(f"process {i}: session failed: " + s[:160])
+        if num(s, "maxtick", 0) < T: f.append(f"process {i}: stopped at tick {num(s, 'maxtick', 0)} of {T}")
+        if kind == "mesh_agree_rb" and num(s, "rollbacks", 0) <= 0: f.append(f"process {i}: no rollbacks happened")
+        f += once_per_handle(s, f"process {i}", n - 1)
+    if kind == "mesh_gone":
+        g = slots.get(gone, -1)
+        if "--leave" in MESH_ARGS[gone]:
+            if rcs[gone]: f.append(f"leaver exit code {rcs[gone]}")
+        elif rcs[gone] != 9 or "DIED" not in outs[gone]: f.append(f"process {gone} was not killed mid-match: rc={rcs[gone]}")
+        for i in live:
+            d = re.findall(r"disconnected\(h=(\d+)", ss[i])
+            if d != [str(g)]: f.append(f"process {i}: disconnect events {d}, expected exactly one for slot {g}")
+            if num(ss[i], "tail_neutral", 0) != 1: f.append(f"process {i}: the leaver's slot does not read neutral at the end")
+            if not re.search(r"gone=%x\b" % (1 << g), ms[i]) or num(ms[i], "remotes_connected", -1) != n - 2: f.append(f"process {i}: gone mask / connected peers wrong: {ms[i][:160]}")
+    if kind == "mesh_ping":
+        far = extra["far"]; fs = slots.get(far, -1)
+        for i in range(n):
+            pings = [float(x) for x in re.search(r"pings=(\S+)", ms[i]).group(1).split(",")] if ms[i] else []
+            w = float(re.search(r"worst_ping=(-?\d+)", ms[i]).group(1)) if ms[i] else -1
+            if w < 50: f.append(f"process {i}: worst ping {w} ms, expected >= 50 (a 60 ms one-way link)")
+            if i != far and pings and max(range(len(pings)), key=lambda k: pings[k]) != fs: f.append(f"process {i}: the worst slot is not the far peer's slot {fs}: {pings}")
+    return f
+
+
+MESH_ARGS = []   # the scenario's per-process args (check_mesh reads it)
+
+
+def own_line(out):
+    m = [l for l in out.splitlines() if l.startswith("OWN")]
+    return m[-1] if m else ""
+
+
+def own_check(outs, slots, live, T, gone=None):
+    """ENHANCEMENT (4-player online, ownership: "own pad -> own fighter"): on every live process no slot ever carried another slot's pad (bad=0), and every live slot's pad
+    came from its own PC on (nearly) every tick (the first ticks before the first input and a leaver's neutral tail are the only "none")."""
+    f = []
+    gs = slots.get(gone, -1) if gone is not None else -1
+    for i in live:
+        o = own_line(outs[i])
+        if not o: f.append(f"process {i}: no OWN line"); continue
+        if num(o, "bad", 1) != 0: f.append(f"process {i}: a slot carried another slot's pad (SWAPPED / mixed): {o[:160]}")
+        ok = [int(x) for x in re.search(r"ok=(\S+)", o).group(1).split(",")]
+        for p in sorted(slots.values()):
+            if p == gs: continue
+            if ok[p] < T - 30: f.append(f"process {i}: slot {p} carried its own PC's pad on only {ok[p]} ticks: {o[:160]}")
+        if gs >= 0 and ok[gs] <= 0: f.append(f"process {i}: the leaver's slot {gs} never carried its pad")
+    return f
+
+
 
 def rounds_check(name, ho, co, T):
     """agree_rounds: every round's SUMMARY of both peers is there, in order, and clean (the last round also had the full agree_rb check on its tick logs)."""
@@ -424,18 +638,18 @@ def in_part(name, names, part):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--exe", required=True, help="the net_session_test binary (net_session_test.sh builds it and passes it here)")
-    ap.add_argument("--only"); ap.add_argument("--ticks", type=int, default=600)
+    ap.add_argument("--only"); ap.add_argument("--prefix", default="", help="only the scenarios whose name starts with this (e.g. --prefix mesh)"); ap.add_argument("--ticks", type=int, default=600)
     ap.add_argument("--part", help="K/N: only the K-th of N parts of the scenarios (CI runs each part as its own row)")
     ap.add_argument("--deadline", type=float, default=DEADLINE_S, help="seconds per scenario, both processes together (default %(default)s)")
     ap.add_argument("--replay-exe", help="the net_replay_test binary (the record_replay scenario)")
     a = ap.parse_args()
     part = parse_part(a.part) if a.part else None
-    names = list(SCENARIOS)
+    names = list(SCENARIOS) + list(MESH)   # ENHANCEMENT (4-player online): the mesh rows are split over the parts too
     global REPLAY_EXE
     REPLAY_EXE = a.replay_exe
     fails = 0
     for name, (ha, ca, kind) in SCENARIOS.items():
-        if (a.only and a.only != name) or not in_part(name, names, part): continue
+        if (a.only and a.only != name) or not name.startswith(a.prefix) or not in_part(name, names, part): continue
         with tempfile.TemporaryDirectory() as td:
             tmp = pathlib.Path(td)
             ex = ["--ticks", str(a.ticks), "--seed", "5"]
@@ -456,6 +670,22 @@ def main():
             for x in fl: print("   !", x)
             if problems:
                 for x in tails(tmp, ho, co): print("   |", x)
+            fails += bool(fl)
+    global MESH_ARGS
+    for name, (argvs, kind, extra) in MESH.items():   # ENHANCEMENT (4-player online)
+        if (a.only and a.only != name) or not name.startswith(a.prefix) or not in_part(name, names, part): continue
+        with tempfile.TemporaryDirectory() as td:
+            tmp = pathlib.Path(td)
+            ex = ["--local", "1", "--ticks", str(a.ticks), "--seed", "5"]
+            MESH_ARGS = argvs
+            t0 = time.monotonic()
+            rcs, outs, problems = run_n(a.exe, [x + ex for x in argvs], tmp, a.deadline)
+            fl = problems or check_mesh(kind, rcs, outs, tmp, a.ticks, extra)
+            print(f"{'PASS' if not fl else 'FAIL'} {name} ({time.monotonic() - t0:.1f} s)", flush=True)
+            for o in outs: print("   ", summary(o)[:330]); print("   ", mesh_line(o)[:200]); print("   ", own_line(o)[:200])
+            for x in fl: print("   !", x)
+            if problems:
+                for i, o in enumerate(outs): print(f"   | process {i}:", *o.splitlines()[-6:], sep="\n   |   ")
             fails += bool(fl)
     print("RESULT", "FAIL" if fails else "ok", f"({fails} failed)")
     return 1 if fails else 0

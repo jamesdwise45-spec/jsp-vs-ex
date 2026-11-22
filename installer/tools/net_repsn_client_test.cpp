@@ -12,6 +12,7 @@
 #include <unistd.h>
 #include <cstdio>
 #include <mutex>
+#include <set>
 
 using namespace jspnet;
 static int g_fail = 0, g_n = 0;
@@ -30,6 +31,7 @@ struct FakeRepsn {
     std::vector<Conn*> conns; std::vector<Room> rooms; uint64_t next_room = 0x100000007ull; uint32_t next_user = 1000;
     int probes = 0, relayed = 0, hellos = 0, leaves = 0, searches = 0;
     std::string last_name;
+    std::set<std::pair<std::string, std::string>> cut;   // ENHANCEMENT (four players): {viewer, member} online names: the viewer gets an unreachable endpoint for that member
 
     bool start()
     {
@@ -66,7 +68,7 @@ struct FakeRepsn {
         p16(b, r.data[m].first); p32(b, m->user); fixed(b, m->name, 16);
         const uint8_t ip[4] = { 127, 0, 0, 1 }; b.insert(b.end(), ip, ip + 4);
         uint16_t port = m->probed_ok ? ntohs(m->probed.sin_port) : m->p2p;
-        if (blackhole && viewer != m) port = 9;
+        if ((blackhole && viewer != m) || cut.count({ viewer->name, m->name })) port = 9;
         p16(b, port); b.push_back(r.data[m].first == r.owner ? 1 : 0); blob(b, r.data[m].second);
     }
     void room_joined(Conn* c, uint32_t req, Room& r)
@@ -171,20 +173,46 @@ struct FakeRepsn {
     }
 };
 
+// ENHANCEMENT (four players): the N-peer HELO/PLAN stood in for. Every member sends its user id on the 'G' tag to every other member's endpoint (THIS PC's view) every
+// 100 ms; done when one arrived from every member, from the endpoint this PC has for it (relayed ones rewritten by the rx hook): every link carries datagrams both ways.
+struct PingInner : IRendezvous {
+    UdpMux& mux; RePsnRendezvous::MeshStart m; SessionPlan p; std::string err; std::set<uint32_t> got; uint64_t last = 0; int wrong = 0;
+    PingInner(UdpMux& x, const RePsnRendezvous::MeshStart& s) : mux(x), m(s) {}
+    int poll() override
+    {
+        if (now_ms() - last >= 100) { last = now_ms(); uint8_t b[4]; psnr_put32(b, m.self_user); for (auto& x : m.members) if (x.user != m.self_user) mux.send(x.ep, kTagGekko, b, 4); }
+        std::vector<uint8_t> d; Endpoint from;
+        while (mux.pop(kTagGekko, from, d)) {
+            bool ok = false;
+            for (auto& x : m.members) if (d.size() == 4 && x.user != m.self_user && x.user == psnr_get32(d.data()) && x.ep == from) { got.insert(x.user); ok = true; }
+            wrong += !ok;
+        }
+        if (got.size() + 1 < m.members.size()) return 0;
+        p.host = m.host; p.session_id = m.session_id; p.total_players = (uint8_t)m.members.size(); return 1;
+    }
+    const SessionPlan& plan() const override { return p; }
+    const std::string& error() const override { return err; }
+    MessageChannel* peer_channel() override { return nullptr; }
+};
+
 // ---- two players ---------------------------------------------------------------------------------------------------------------------------------
 struct Player {
     UdpMux mux; std::unique_ptr<MessageHub> hub; std::unique_ptr<PsnrClientTransport> tr; std::unique_ptr<RePsnRendezvous> rz; Path last = Path::None; int result = 0;
-    void init(FakeRepsn& sv, const std::string& name, bool host, uint32_t build, bool allow_relay, int punch_ms = 4000, int give_up_ms = 20000, int lookup_every_ms = 300)
+    PingInner* ping = nullptr;   // four players: owned by rz
+    void init(FakeRepsn& sv, const std::string& name, bool host, uint32_t build, bool allow_relay, int punch_ms = 4000, int give_up_ms = 20000, int lookup_every_ms = 300,
+              std::function<void(RePsnRendezvous::Config&)> tweak = nullptr)
     {
         std::string err; CHECK(mux.open(0, &err));
         RepsnIdentity id; id.host = "127.0.0.1"; id.port = sv.port; id.name = name; id.comm_id = "NPWR08138_00";
         hub.reset(new MessageHub(mux)); tr.reset(new PsnrClientTransport(mux, id));
         RePsnRendezvous::Config c; c.host = host; c.build = build; c.allow_relay = allow_relay; c.punch_ms = punch_ms; c.give_up_ms = give_up_ms; c.lookup_every_ms = lookup_every_ms;
+        if (tweak) tweak(c);
         rz.reset(new RePsnRendezvous(*tr, mux, *hub, c));
+        rz->make_mesh_inner = [this](const RePsnRendezvous::MeshStart& s) { ping = new PingInner(mux, s); return ping; };
         rz->on_path = [this](Path p, uint32_t u) { last = p; tr->set_peer_user(u); tr->set_relay_mode(p == Path::Relay); };
         tr->start(allow_relay);
     }
-    void step() { mux.pump(); hub->pump(); if (tr) tr->pump(); if (result == 0) result = rz->poll(); }   // after the plan the channels keep acknowledging (the glue keeps pumping hub and transport)
+    void step() { mux.pump(); hub->pump(); if (tr) tr->pump(); if (result == 0) result = rz->poll(); else if (result == 1 && ping) ping->poll(); }   // four players: keep answering   // after the plan the channels keep acknowledging (the glue keeps pumping hub and transport)
 };
 static void drive(Player& h, Player& c, int ms, bool stagger = true)
 {
@@ -298,6 +326,60 @@ int main()
       Player c; c.init(sv, "GuestPlayer", false, B, false); (void)dead_port;
       const uint64_t t0 = now_ms(); while (now_ms() - t0 < 8000 && c.result == 0) { c.step(); std::this_thread::sleep_for(std::chrono::milliseconds(5)); }
       CHECK(c.result == -1 && c.rz->error().find("cannot connect") != std::string::npos && now_ms() - t0 < 8000); }
+
+    // ---- ENHANCEMENT (four players): four real transports, one rollback room of max 4 (paired by the native room id), a link per pair ----
+    { struct Four { FakeRepsn sv; Player p[4]; bool ok = false; };
+      const char* names[4] = { "Alice-rb", "Bob-rb", "Carol-rb", "Dan-rb" };
+      auto four = [&](Four& f, bool relay, std::function<void(int, RePsnRendezvous::Config&)> tweak, int ms) {
+          CHECK(f.sv.start());
+          for (int i = 0; i < 4; i++)
+              f.p[i].init(f.sv, names[i], i == 0, B, relay, 1500, 20000, 300, [&, i](RePsnRendezvous::Config& c) {
+                  c.players = 4; c.pair = 0x0123456789abcdefull; c.link_ms = 5000; c.expect_names = { names[0], names[1], names[2], names[3] }; if (tweak) tweak(i, c); });
+          { const uint64_t t0 = now_ms(); while (now_ms() - t0 < 5000) { f.p[0].step(); { std::lock_guard<std::mutex> lk(f.sv.mu); if (!f.sv.rooms.empty()) break; } std::this_thread::sleep_for(std::chrono::milliseconds(3)); } }
+          const uint64_t t0 = now_ms();
+          while (now_ms() - t0 < (uint64_t)ms) {
+              bool all = true; for (auto& x : f.p) { x.step(); all = all && x.result != 0; }
+              if (all) break;
+              std::this_thread::sleep_for(std::chrono::milliseconds(3));
+          }
+          f.ok = true; for (auto& x : f.p) f.ok = f.ok && x.result == 1;
+      };
+      // all direct: every PC 3 direct links, every link carried datagrams both ways, nothing relayed; CREATE_ROOM says max 4
+      { Four f; four(f, false, nullptr, 15000);
+        if (!f.ok) for (auto& x : f.p) std::printf("four direct: %d '%s'\n", x.result, x.rz->error().c_str());
+        CHECK(f.ok && f.sv.relayed == 0);
+        { std::lock_guard<std::mutex> lk(f.sv.mu); CHECK(!f.sv.last_create.empty() && f.sv.last_create[0] == 4 && f.sv.rooms.size() == 1 && f.sv.rooms[0].members.size() == 4); }
+        for (auto& x : f.p) CHECK(x.rz->path_line() == "Rollback on: direct connection" && x.rz->links().size() == 3 && x.ping && x.ping->wrong == 0 && x.rz->plan().session_id == f.p[0].rz->room_id());
+        int seen = 0; for (auto& x : f.p) seen |= 1 << x.rz->local_index();   // member-id order (the joiners' order varies with the search answers)
+        std::string carol; for (auto& l : f.p[2].rz->links()) carol += l.name + ";";
+        CHECK(f.p[0].rz->plan().host && !f.p[3].rz->plan().host && f.p[0].rz->local_index() == 0 && seen == 0xF && carol.find("Alice;") == 0 && carol.find("Dan;") != std::string::npos); }
+      // Carol and Dan cannot reach each other directly, the relay is allowed and offered: only that link goes through the server, its datagrams arrive as Carol's / Dan's
+      { Four f; f.sv.relay_flag = true; f.sv.cut = { { "Carol-rb", "Dan-rb" }, { "Dan-rb", "Carol-rb" } }; four(f, true, nullptr, 15000);
+        if (!f.ok) for (auto& x : f.p) std::printf("four relay: %d '%s'\n", x.result, x.rz->error().c_str());
+        CHECK(f.ok && f.sv.relayed > 0);
+        CHECK(f.p[0].rz->path_line() == "Rollback on: direct connection" && f.p[1].rz->path_line() == "Rollback on: direct connection");
+        CHECK(f.p[2].rz->path_line() == "Rollback on: 1 of 3 links through the server" && f.p[3].rz->path_line() == "Rollback on: 1 of 3 links through the server");
+        for (auto& x : f.p) CHECK(x.ping && x.ping->wrong == 0);
+        CHECK(f.p[2].tr->relay_tx > 0 && f.p[2].tr->relay_rx > 0 && f.p[0].tr->relay_tx == 0 && !f.p[2].tr->relay_mode()); }   // per link: the 2-player relay switch stays off
+      // Dan can reach nobody and the relay is not allowed: everyone stops within the link bound, and the text names who could not connect
+      { Four f; f.sv.relay_flag = true;
+        for (int i = 0; i < 3; i++) { f.sv.cut.insert({ names[i], "Dan-rb" }); f.sv.cut.insert({ "Dan-rb", names[i] }); }
+        const uint64_t t0 = now_ms(); four(f, false, nullptr, 15000); const uint64_t took = now_ms() - t0;
+        for (auto& x : f.p) CHECK(x.result == -1);
+        if (f.p[0].rz->error().find("Dan") == std::string::npos) std::printf("four unreachable: '%s'\n", f.p[0].rz->error().c_str());
+        // the first to reach its bound leaves; the others name Dan all the same ("could not connect to Dan (relay is not allowed in the settings; Carol gave up)")
+        for (int i = 0; i < 3; i++) if (f.p[i].rz->error().find("re-psn: could not connect to Dan ") != 0) std::printf("four unreachable %d: %s\n", i, f.p[i].rz->error().c_str());
+        for (int i = 0; i < 3; i++) CHECK(f.p[i].rz->error().find("re-psn: could not connect to Dan ") == 0 && f.p[i].rz->error().find("relay is not allowed in the settings") != std::string::npos);
+        CHECK(f.p[3].rz->error().find("re-psn: could not connect to ") == 0 || f.p[3].rz->error().find("left the room") != std::string::npos);   // Alice, Bob and Carol, less the one that gave up first
+        CHECK(took < 5000 + 4000 && f.sv.relayed == 0); }
+      // mixed builds: Dan runs another build of the same native room. ENHANCEMENT (4-player online; the release's version rule, now in the mesh too): Dan joins once and fails with the
+      // version message; the host sees his record (same pair, another build) and fails with the version message too, no retry (it used to wait out its window)
+      { Four f; four(f, false, [](int i, RePsnRendezvous::Config& c) { c.give_up_ms = 3000; if (i == 3) c.build = B + 1; }, 8000);
+        CHECK(f.p[3].result == -1 && f.p[3].rz->error().find("another version (build 1234abcd, yours 1234abce)") != std::string::npos);
+        if (!f.p[0].rz->version_mismatch()) std::printf("four mixed builds, host: %s\n", f.p[0].rz->error().c_str());
+        CHECK(f.p[0].result == -1 && f.p[0].rz->version_mismatch() && f.p[0].rz->notice1().find("same version") != std::string::npos);
+        { std::lock_guard<std::mutex> lk(f.sv.mu); CHECK(f.sv.rooms.empty() || f.sv.rooms[0].members.size() <= 3); } }
+    }
 
     std::printf("%d checks, %d failed\n", g_n, g_fail);
     return g_fail ? 1 : 0;

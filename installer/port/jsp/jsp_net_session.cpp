@@ -364,9 +364,67 @@ std::array<uint8_t, 4> SessionPlan::peer_slot_mask() const
     auto mask = [](unsigned first, unsigned n) { return (uint8_t)(((1u << n) - 1) << first); };
     const uint8_t mine = mask(local_first, local_count);
     if (remotes.empty()) { m[0] = mine; return m; }
+    if (remotes.size() > 1) {   // ENHANCEMENT (4-player online): by peer id
+        m[local_peer & 3] |= mine;
+        for (const PeerSlots& r : remotes) m[r.peer & 3] |= mask(r.first_slot, r.count);
+        return m;
+    }
     const uint8_t theirs = mask(remotes[0].first_slot, remotes[0].count);
     if (local_first == 0) { m[0] = mine; m[1] = theirs; } else { m[0] = theirs; m[1] = mine; }
     return m;
+}
+uint8_t SessionPlan::roster_mask() const { const auto m = peer_slot_mask(); uint8_t r = 0; for (unsigned i = 0; i < 4; i++) if (m[i]) r |= (uint8_t)(1u << i); return r; }
+
+// ENHANCEMENT (4-player online): the host's plan for 3-4 peers or with slot claims (see the header). Claimed ranges first, then the others in peer order on the
+// lowest free run; every client gets its own PLN2 (its peer id in `you`).
+int DirectRendezvous::host_plan()
+{
+    struct P { uint8_t count, claim, first; Endpoint ep; uint32_t tag; };
+    std::vector<P> ps = {{local_count_, claim_, 0xFF, Endpoint{}, tag_}};
+    for (const Hello& h : hellos_) ps.push_back({h.count, h.claim, 0xFF, h.ch->peer(), h.tag});
+    unsigned total = 0, used = 0; bool clash = false;
+    for (const P& p : ps) total += p.count;
+    for (P& p : ps) {
+        if (p.claim == 0xFF || p.claim >= kRankClaim) continue;
+        if (p.claim + p.count > total) { clash = true; continue; }
+        const unsigned m = ((1u << p.count) - 1) << p.claim;
+        if (used & m) clash = true; else { used |= m; p.first = p.claim; }
+    }
+    // ENHANCEMENT (4-player online, review: stale room records): rank claims (kRankClaim + key, the key = the native room member id) take the lowest free runs
+    // in key order, so the slots follow the native room's member order without any PC knowing the others' ids. Two equal keys clash.
+    std::vector<P*> ranked;
+    for (P& p : ps) if (p.claim != 0xFF && p.claim >= kRankClaim) ranked.push_back(&p);
+    std::sort(ranked.begin(), ranked.end(), [](const P* a, const P* b) { return a->claim < b->claim; });
+    for (size_t i = 0; i < ranked.size() && !clash; i++) {
+        if (i && ranked[i]->claim == ranked[i - 1]->claim) { clash = true; break; }
+        P& p = *ranked[i]; const unsigned m = (1u << p.count) - 1;
+        for (unsigned f = 0; f + p.count <= total && p.first == 0xFF; f++) if (!(used & (m << f))) { used |= m << f; p.first = (uint8_t)f; }
+        if (p.first == 0xFF) clash = true;
+    }
+    for (P& p : ps) {
+        if (p.first != 0xFF || clash) continue;
+        const unsigned m = (1u << p.count) - 1;
+        for (unsigned f = 0; f + p.count <= total && p.first == 0xFF; f++) if (!(used & (m << f))) { used |= m << f; p.first = (uint8_t)f; }
+        if (p.first == 0xFF) clash = true;
+    }
+    if (clash) {
+        for (MessageChannel* c : chs_) { const uint8_t no[4] = {'N', 'O', 'P', 'E'}; c->send(no, 4); c->pump(); }   // sent now: a failed host is not polled again
+        err_ = "slot claims clash"; return state_ = -1;
+    }
+    plan_.host = true; plan_.total_players = (uint8_t)total; plan_.local_first = ps[0].first; plan_.local_count = local_count_; plan_.local_peer = 0; plan_.remotes.clear();
+    for (size_t i = 1; i < ps.size(); i++) plan_.remotes.push_back({ps[i].ep, ps[i].first, ps[i].count, (uint8_t)i, ps[i].tag});
+    for (size_t you = 1; you < ps.size(); you++) {
+        std::vector<uint8_t> r = {'P', 'L', 'N', '2'}; put64(r, plan_.session_id);
+        r.push_back((uint8_t)total); r.push_back((uint8_t)you); r.push_back((uint8_t)ps.size());
+        for (size_t i = 0; i < ps.size(); i++) {
+            r.push_back((uint8_t)i); r.push_back(ps[i].first); r.push_back(ps[i].count);
+            const std::array<uint8_t, 6> w = i ? ps[i].ep.wire() : std::array<uint8_t, 6>{};
+            r.insert(r.end(), w.begin(), w.end());
+            for (int k = 0; k < 4; k++) r.push_back((uint8_t)(ps[i].tag >> (8 * k)));
+        }
+        chs_[you - 1]->send(r.data(), r.size());
+    }
+    return state_ = 1;
 }
 
 int DirectRendezvous::poll()
@@ -375,37 +433,66 @@ int DirectRendezvous::poll()
     hub_.pump();
     std::vector<uint8_t> m;
     if (host_) {
-        if (!ch_) {
+        if (hellos_.size() + 1 < expect_) {
             const std::vector<Endpoint> cand = hub_.new_peers;
             hub_.new_peers.clear();
             for (const Endpoint& p : cand) {
                 MessageChannel* c = hub_.find(p);
-                if (has_only_ && !(p == only_)) { rejected_hello++; hub_.close(p); continue; }   // re-psn: only the room's other player
-                const bool ok = c && c->recv(m) && m.size() == 5 && std::memcmp(m.data(), "HELO", 4) == 0 && m[4] >= 1 && m[4] + local_count_ <= 4 && local_count_ >= 1;
-                if (ok && !ch_) { ch_ = c; hello_count_ = m[4]; }
+                if (!only_.empty() && std::find(only_.begin(), only_.end(), p) == only_.end()) { rejected_hello++; hub_.close(p); continue; }   // re-psn: only the room's other players
+                unsigned taken = local_count_; for (const Hello& h : hellos_) taken += h.count;
+                const bool ok = c && c->recv(m) && (m.size() == 5 || m.size() == 10) && std::memcmp(m.data(), "HELO", 4) == 0 && m[4] >= 1 && m[4] + taken <= 4 && local_count_ >= 1 &&
+                                (m.size() == 5 || m[5] < 4 || m[5] >= kRankClaim);   // 0xFF none, kRankClaim.. rank keys
+                if (ok && hellos_.size() + 1 < expect_) { hellos_.push_back({c, m[4], m.size() == 10 ? m[5] : (uint8_t)0xFF, m.size() == 10 ? get32(m.data() + 6) : 0u}); chs_.push_back(c); }
                 else { rejected_hello++; hub_.close(p); }
             }
-            if (!ch_) return 0;
+            if (hellos_.size() + 1 < expect_) return 0;
+            ch_ = hellos_[0].ch; hello_count_ = hellos_[0].count;
         }
-        if (ch_->failed()) { err_ = "client channel failed"; return state_ = -1; }
+        for (MessageChannel* c : chs_) if (c->failed()) { err_ = "client channel failed"; return state_ = -1; }
+        bool v2 = expect_ > 2 || claim_ != 0xFF;
+        for (const Hello& h : hellos_) v2 = v2 || h.claim != 0xFF;
+        if (v2) return host_plan();
         const uint8_t cc = hello_count_;
         std::vector<uint8_t> r = {'P', 'L', 'A', 'N'}; put64(r, plan_.session_id);
         r.push_back(local_count_); r.push_back(local_count_); r.push_back(cc);
         ch_->send(r.data(), r.size());
         plan_.host = true; plan_.total_players = local_count_ + cc; plan_.local_first = 0; plan_.local_count = local_count_;
-        plan_.remotes = {{ch_->peer(), local_count_, cc}};
+        plan_.remotes = {{ch_->peer(), local_count_, cc, 1}};
         return state_ = 1;
     }
-    if (!ch_) { ch_ = hub_.open(host_ep_); if (!ch_) { err_ = "no channel"; return state_ = -1; } }
-    if (!sent_hello_) { const uint8_t h[5] = {'H', 'E', 'L', 'O', local_count_}; ch_->send(h, 5); sent_hello_ = true; }
+    if (!ch_) { ch_ = hub_.open(host_ep_); if (!ch_) { err_ = "no channel"; return state_ = -1; } chs_ = {ch_}; }
+    if (!sent_hello_) {
+        const uint8_t h[10] = {'H', 'E', 'L', 'O', local_count_, claim_, (uint8_t)tag_, (uint8_t)(tag_ >> 8), (uint8_t)(tag_ >> 16), (uint8_t)(tag_ >> 24)};
+        ch_->send(h, claim_ == 0xFF && !tag_ ? 5 : 10); sent_hello_ = true;
+    }
     if (ch_->failed()) { err_ = "host unreachable"; return state_ = -1; }
     if (!ch_->recv(m)) return 0;
+    if (m.size() == 4 && std::memcmp(m.data(), "NOPE", 4) == 0) { err_ = "the host refused the plan: slot claims clash"; return state_ = -1; }
+    if (m.size() >= 15 && std::memcmp(m.data(), "PLN2", 4) == 0) {   // ENHANCEMENT (4-player online): see the header
+        const uint8_t total = m[12], you = m[13], n = m[14];
+        if (m.size() != 15 + 13u * n || n < 2 || n > 4 || you == 0 || you >= n) { err_ = "bad PLAN"; return state_ = -1; }
+        plan_ = SessionPlan{}; plan_.session_id = get64(m.data() + 4); plan_.total_players = total; plan_.local_peer = you;
+        unsigned used = 0, sum = 0; bool ok = plan_.session_id != 0 && total <= 4;
+        for (unsigned i = 0; i < n && ok; i++) {
+            const uint8_t* e = m.data() + 15 + 13 * i;
+            ok = e[0] == i && e[2] >= 1 && e[2] <= 4 && e[1] < 4 && e[1] + e[2] <= total;
+            const unsigned msk = ok ? ((1u << e[2]) - 1) << e[1] : 0;
+            ok = ok && !(used & msk);
+            used |= msk; sum += e[2];
+            PeerSlots ps{host_ep_, e[1], e[2], e[0], get32(e + 9)};
+            if (i && !Endpoint::from_wire(e + 3, 6, &ps.ep)) ok = false;
+            if (i && i != you && resolve_) { Endpoint mine{}; if (resolve_(ps.tag, &mine)) ps.ep = mine; }   // this PC's own view of that peer (re-psn)
+            if (i == you) { plan_.local_first = e[1]; plan_.local_count = e[2]; } else plan_.remotes.push_back(ps);
+        }
+        if (!ok || sum != total || plan_.local_count != local_count_ || (claim_ < 4 && plan_.local_first != claim_)) { err_ = "plan disagrees with local player count or slot claim"; return state_ = -1; }
+        return state_ = 1;
+    }
     if (m.size() != 15 || std::memcmp(m.data(), "PLAN", 4) != 0) { err_ = "bad PLAN"; return state_ = -1; }
     plan_.session_id = get64(m.data() + 4);
     const uint8_t hc = m[12], cf = m[13], cc = m[14];
     if (!plan_.session_id || cc != local_count_ || !hc || hc + cc > 4 || cf != hc) { err_ = "plan disagrees with local player count"; return state_ = -1; }
-    plan_.host = false; plan_.total_players = hc + cc; plan_.local_first = cf; plan_.local_count = cc;
-    plan_.remotes = {{host_ep_, 0, hc}};
+    plan_.host = false; plan_.total_players = hc + cc; plan_.local_first = cf; plan_.local_count = cc; plan_.local_peer = 1;
+    plan_.remotes = {{host_ep_, 0, hc, 0}};
     return state_ = 1;
 }
 
@@ -474,7 +561,7 @@ void NetSession::stop()
     if (gs_) { GekkoSession* g = (GekkoSession*)gs_; gekko_destroy(&g); gs_ = nullptr; }
     g_mux = nullptr;   // one session per process (see start): nothing else is bound to the adapter
     g_results.clear();
-    mode_ = SessionMode::Game; cur_delay_ = 0;
+    mode_ = SessionMode::Game; cur_delay_ = 0; gone_ = 0;
     rec_copy_.clear(); rec_updates_ = 0; recording_ = false; replay_finished_ = false;
     game_call_ms_.store(0); max_gap_ms_.store(0); ka_stop_.store(false); last_poll_ms_.store(0); ka_polls_.store(0);
     plan_ = SessionPlan{}; cfg_ = SessionConfig{};
@@ -685,7 +772,7 @@ void NetSession::poll_impl()
     for (int i = polled_events_; i < cnt; i++) {
         const GekkoSessionEvent& s = *se[i]; SessionEvent o{};
         switch (s.type) {
-        case GekkoPlayerDisconnected: o.kind = SessionEventKind::Disconnected; o.handle = s.data.disconnected.handle; break;
+        case GekkoPlayerDisconnected: o.kind = SessionEventKind::Disconnected; o.handle = s.data.disconnected.handle; gone_ |= (uint8_t)(1u << (o.handle & 3)); break;
         case GekkoPlayerConnected: o.kind = SessionEventKind::Connected; o.handle = s.data.connected.handle; break;
         case GekkoPlayerSyncing: o.kind = SessionEventKind::Syncing; o.handle = s.data.syncing.handle; o.tick = s.data.syncing.current; break;
         default: continue;   // Started and Desync come with update's own read
@@ -771,7 +858,7 @@ bool NetSession::update(std::vector<NetEvent>& out, bool consumer_idle)
         case GekkoPlayerSyncing: o.kind = SessionEventKind::Syncing; o.handle = s.data.syncing.handle; o.tick = s.data.syncing.current; break;
         case GekkoPlayerConnected: o.kind = SessionEventKind::Connected; o.handle = s.data.connected.handle; break;
         case GekkoSessionStarted: o.kind = SessionEventKind::Started; started_ = true; break;
-        case GekkoPlayerDisconnected: o.kind = SessionEventKind::Disconnected; o.handle = s.data.disconnected.handle; break;
+        case GekkoPlayerDisconnected: o.kind = SessionEventKind::Disconnected; o.handle = s.data.disconnected.handle; gone_ |= (uint8_t)(1u << (o.handle & 3)); break;
         case GekkoDesyncDetected:
             o.kind = SessionEventKind::Desync; o.handle = s.data.desynced.remote_handle; o.tick = s.data.desynced.frame + 1;   // stepper tick numbering: the state after advancing frame F is tick F+1
             o.local_hash = s.data.desynced.local_checksum; o.remote_hash = s.data.desynced.remote_checksum;
@@ -811,14 +898,20 @@ SessionStats NetSession::stats() const
         s.rollbacks = r.total_count; s.max_rollback_frames = r.max_frames; s.stalls = r.total_stalls;
         s.frames_ahead = gekko_frames_ahead((GekkoSession*)gs_);
         s.local_delay = cur_delay_;
-        jpdr::Remote rem[4]; int nrem = 0;   // ENHANCEMENT (worst remote): every remote slot (at most 4 players, start())
-        for (unsigned sl = 0; sl < plan_.total_players && nrem < 4; sl++) {
+        s.gone_mask = gone_;
+        // ENHANCEMENT (worst remote, 2v2): every remote slot (at most 4 players, start()); ENHANCEMENT (4-player online): per-slot numbers, and only the
+        // connected remotes are candidates for the worst link (a gone slot's last numbers would hold the delay and the ping counter up for the rest)
+        jpdr::Remote rem[4]; int nrem = 0; bool first = true;
+        for (unsigned sl = 0; sl < plan_.total_players && sl < 4; sl++) {
             if (sl >= plan_.local_first && sl < (unsigned)plan_.local_first + plan_.local_count) continue;
             GekkoNetworkStats ns{}; gekko_network_stats((GekkoSession*)gs_, (int)sl, &ns);
-            if (nrem == 0) {   // the first remote, as before
+            if (first) {   // the first remote, as before
+                first = false;
                 if (ns.avg_ping > 0) { s.ping_ms = ns.avg_ping; s.jitter_ms = ns.jitter; s.last_ping_ms = ns.last_ping; }
                 s.rtt_seq = ns.rtt_count; s.acked_frame = ns.last_acked_frame;
             }
+            if (gone_ >> sl & 1) continue;
+            if (ns.avg_ping > 0) { s.slot_ping_ms[sl] = ns.avg_ping; s.slot_jitter_ms[sl] = ns.jitter; }
             jpdr::Remote& r = rem[nrem++];
             r.slot = (int)sl; r.ping_avg = ns.avg_ping; r.jitter = ns.jitter; r.last_ping = ns.last_ping; r.rtt_count = ns.rtt_count;
         }
@@ -829,6 +922,14 @@ SessionStats NetSession::stats() const
         }
     }
     return s;
+}
+
+unsigned NetSession::remote_peers_connected() const
+{
+    std::lock_guard<std::recursive_mutex> lk(gmu_);
+    unsigned n = 0;
+    for (const PeerSlots& r : plan_.remotes) if ((((1u << r.count) - 1) << r.first_slot) & ~(unsigned)gone_) n++;
+    return n;
 }
 
 int NetSession::final_frame() const

@@ -125,6 +125,66 @@ int main()
         for (int i = 0; i < 50; i++) { h2.pump(); host.poll(); sleep_ms(2); }
         CHECK(host.poll() == 1 && host.plan().remotes.size() == 1 && host.plan().remotes[0].ep == local_ep(mc));
     }
+    // ---- ENHANCEMENT (4-player online): the 2-peer wire form is unchanged (5-byte HELO in, the 15-byte PLAN out) ----
+    {
+        UdpMux mh, mc; CHECK(mh.open(0) && mc.open(0));
+        MessageHub hh(mh), hc(mc);
+        DirectRendezvous host(mh, hh, 1, 0x0102030405060708ull);
+        MessageChannel* c = hc.open(local_ep(mh));
+        const uint8_t helo[5] = {'H', 'E', 'L', 'O', 1}; c->send(helo, 5);
+        std::vector<uint8_t> in;
+        const bool got = until(3000, &mh, &mc, [&] { host.poll(); hh.pump(); hc.pump(); return c->recv(in); });
+        const uint8_t want[15] = {'P', 'L', 'A', 'N', 8, 7, 6, 5, 4, 3, 2, 1, 1, 1, 1};   // session id little endian, host count, client first, client count
+        if (!(got && in.size() == 15)) std::printf("  plan v1: got=%d size=%zu host=%d (%s)\n", (int)got, in.size(), host.poll(), host.error().c_str());
+        CHECK(got && in.size() == 15 && !std::memcmp(in.data(), want, 15));
+        CHECK(host.plan().remotes.size() == 1 && host.plan().remotes[0].peer == 1 && host.plan().roster_mask() == 0x3);
+    }
+    // ---- ENHANCEMENT (4-player online): hand-built N-peer plans map peers by id ----
+    {
+        SessionPlan p; p.total_players = 4; p.local_first = 2; p.local_count = 1; p.local_peer = 3;
+        p.remotes = {{Endpoint{}, 3, 1, 0}, {Endpoint{}, 0, 1, 1}, {Endpoint{}, 1, 1, 2}};
+        const auto m = p.peer_slot_mask(); CHECK(m[0] == 0x8 && m[1] == 0x1 && m[2] == 0x2 && m[3] == 0x4 && p.roster_mask() == 0xF);
+    }
+    // ---- ENHANCEMENT (4-player online): a 4-peer rendezvous with slot claims, a 3-peer one in join order, and a clash ----
+    {
+        auto mesh = [&](int n, const int* claims, std::vector<SessionPlan>* plans, std::vector<std::string>* errs) {
+            std::vector<std::unique_ptr<UdpMux>> mx; std::vector<std::unique_ptr<MessageHub>> hb; std::vector<std::unique_ptr<DirectRendezvous>> rz;
+            for (int i = 0; i < n; i++) { mx.emplace_back(new UdpMux); CHECK(mx.back()->open(0)); hb.emplace_back(new MessageHub(*mx.back())); }
+            const Endpoint eh = local_ep(*mx[0]);
+            for (int i = 0; i < n; i++) {
+                rz.emplace_back(i ? new DirectRendezvous(*mx[i], *hb[i], 1, eh) : new DirectRendezvous(*mx[0], *hb[0], 1, 0xABCDull));
+                if (claims && claims[i] >= 0) rz[i]->claim_slot((uint8_t)claims[i]);
+                rz[i]->set_tag(100u + i);   // the re-psn user id stand-in
+            }
+            Endpoint fake{}; parse_endpoint("127.0.0.9:9", fake);
+            if (n > 2) rz[1]->set_resolver([&](uint32_t tag, Endpoint* out) { if (tag != 102) return false; *out = fake; return true; });   // process 1 sees process 2 elsewhere
+            rz[0]->set_expected_peers((uint8_t)n);
+            until(4000, nullptr, nullptr, [&] { bool all = true; for (int i = 0; i < n; i++) { all = rz[i]->poll() != 0 && all; hb[i]->pump(); } return all; });   // a finished rendezvous no longer pumps its hub (the game's loop does)
+            for (int i = 0; i < n; i++) {
+                plans->push_back(rz[i]->plan()); errs->push_back(rz[i]->error());
+                if (rz[i]->poll() == 1 && i) CHECK(plans->back().remotes.size() == (size_t)n - 1 && plans->back().remotes[0].ep == eh);
+                if (rz[i]->poll() == 1 && i) {   // a client's endpoints of the other clients are their real sockets (the mesh)
+                    for (const PeerSlots& r : plans->back().remotes) if (r.peer) CHECK(r.tag >= 101 && r.tag < 100u + n && r.ep == (i == 1 && r.tag == 102 ? fake : local_ep(*mx[r.tag - 100])));
+                    CHECK(plans->back().remotes[0].tag == 100);
+                }
+            }
+        };
+        std::vector<SessionPlan> ps; std::vector<std::string> es;
+        const int claims[4] = {3, 2, 0, 1};
+        mesh(4, claims, &ps, &es);
+        bool ok = ps.size() == 4;
+        for (int i = 0; ok && i < 4; i++) ok = es[i].empty() && ps[i].total_players == 4 && ps[i].local_first == claims[i] && ps[i].local_peer == i && ps[i].peer_slot_mask() == ps[0].peer_slot_mask() && ps[i].roster_mask() == 0xF;
+        if (!ok) for (size_t i = 0; i < es.size(); i++) std::printf("  mesh4 claims: peer %zu first=%u err=%s\n", i, ps[i].local_first, es[i].c_str());
+        CHECK(ok);
+        CHECK(ps[0].peer_slot_mask()[0] == 0x8 && ps[0].peer_slot_mask()[2] == 0x1);
+        ps.clear(); es.clear(); mesh(3, nullptr, &ps, &es);
+        unsigned used = 0; for (const SessionPlan& p : ps) used |= 1u << p.local_first;
+        CHECK(ps.size() == 3 && ps[0].local_first == 0 && used == 0x7 && ps[1].roster_mask() == 0x7);
+        const int clash[3] = {-1, 1, 1};
+        ps.clear(); es.clear(); mesh(3, clash, &ps, &es);
+        bool all_clash = es.size() == 3; for (const std::string& e : es) all_clash = all_clash && e.find("clash") != std::string::npos;
+        CHECK(all_clash);
+    }
     // ---- bounded queues, oversize ----
     {
         UdpMux a, b; CHECK(a.open(0) && b.open(0));

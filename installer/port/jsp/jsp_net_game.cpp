@@ -48,6 +48,7 @@ extern "C" int jsp_pick_pressing(void) { return 0; }
 extern "C" int jsp_pick_enabled(void) { return 0; }
 extern "C" int jsp_pick_choose(int) { return 0; }
 extern "C" int jsp_pick_submit(unsigned, unsigned, int, int) { return 0; }
+extern "C" int jsp_net_mesh_players(void) { return 0; }   // ENHANCEMENT (4-player online)
 #else
 
 #include <atomic>
@@ -94,6 +95,7 @@ static bool clock_diag() { static const bool v = [] { const char* e = std::geten
 #include "jsp_net_pick_page.h"      // ENHANCEMENT (JSP_PICK_NATIVE_SELECT=1): Select character on the game's own page for every player (pure, host-tested)
 #include "jsp_pick_skin.h"         // ENHANCEMENT (after-match menu art): the game's own menu art from the player's archives, and the layouts (pure, host-tested)
 static_assert(jspf::kTagPostgame == jspnet::kLinkTagPostgame && jspf::kTagPick == jspnet::kLinkTagPick, "one set of link tags");
+#include "jsp_net_four.h"           // ENHANCEMENT (4-player online): pairing, slot claim, mesh factory, leaver rules (pure, host-tested)
 #include "jsp_session_reader.h"
 #include "jsp_session_manifest.h"
 #include "jsp_mods_glue.h"   // rollback_gate, kModsNotAsListed (ENHANCEMENT, mods)
@@ -284,6 +286,7 @@ struct State {
     UdpMux mux; std::unique_ptr<MessageHub> hub; std::unique_ptr<IRendezvous> rz;
     std::unique_ptr<PsnrClientTransport> rp; RePsnRendezvous* rrz = nullptr;   // ENHANCEMENT (rollback over re-psn): the client transport and the rendezvous over it (rz owns the rendezvous)
     std::string path_line; uint64_t path_until = 0;   // the "direct" / "relay" line shown for the first seconds of the match
+    std::string left_line;                            // ENHANCEMENT (4-player online): "Player N left", cleared like the path line
     std::unique_ptr<M2LinkT<jpsm::Transport>> link; M2Pump pump;
     GameReader reader; jpsm::EffectiveValues ev{&reader}; jpsm::Caps caps;
     std::unique_ptr<jpsm::Host> mh; std::unique_ptr<jpsm::Client> mc;
@@ -545,6 +548,22 @@ std::string path_word() { const int k = g.path_kind.load(); return k == 1 ? "dir
 // ENHANCEMENT (post-game / pick): JSP_ROLLBACK_PICK=1 (jspf::key_on), read once; default 0 = no prompt, no pick, no roster write (today's behaviour).
 bool pick_on() { static int v = -1; if (v < 0) { char b[8] = {}; v = jsp_setting_get(jspf::kKey, b, sizeof b) && jspf::key_on(b) ? 1 : 0; } return v == 1; }
 std::atomic<int> g_pick_active{0};   // jsp_pick_active(): a pair is applied at the coming build (read on guest threads; written by pick_frame)
+// ENHANCEMENT (4-player online, JSP_ROLLBACK_MAX_PLAYERS = 2..4, default 2 = two players only): with 3-4 peers in the plan the input delay and the ping counter
+// follow the WORST link (this PC's inputs must reach every other PC in time; with 2 peers that is the one remote, as before): the rule reads the worst
+// connected remote's average, jitter, last round trip and count together (SessionStats::worst_*, jpdr::worst_of: the largest average + 2 x jitter), with
+// its JSP_INPUT_DELAY_AUTO_MULTI_MIN / _MAX range (default 2..5 ticks: from the 4-player simulator, not measured) and, when set, JSP_INPUT_DELAY_AUTO_MULTI_MARGIN_MS
+// for both margins; every other parameter (the slow-link start, the depth trigger) is rule 2's own, so with 3-4 peers a slow link starts at
+// min(SLOW_START_DELAY, MULTI_MAX) = 3 and the rule moves within 2..5 from there. The time-sync stretch may reach 4 ms a tick, and one leaver does not
+// end the match (see the Disconnected event). With 2 peers nothing changes.
+int max_players()
+{
+    static int m = 0;
+    if (!m) { char b[8] = {}; m = jsp4::max_players(jsp_setting_get("JSP_ROLLBACK_MAX_PLAYERS", b, sizeof b) ? b : nullptr); }
+    return m;
+}
+bool multi_peer() { return max_players() > 2 && g.plan.remotes.size() > 1; }
+void g_nat_replan_next();   // ENHANCEMENT (4-player online): after a slot-mismatch refusal (defined with g_nat)
+jpdr::Params g_ad_pm;      // ENHANCEMENT (4-player online): the rule's parameters with 3-4 peers (adapt_settings)
 jpdr::State g_ad;   // per match (reset_match)
 int g_ad_on = -1;   // the switches are read once per process
 jpdr::Params g_ad_p;
@@ -602,6 +621,10 @@ void adapt_settings()
     g_ad_pred = std::min(std::max(g_ad_pred, 1), 8);
     if (g_ad_pred != 8) std::fprintf(stderr, "[net] prediction window %d ticks (JSP_ROLLBACK_PREDICTION; 8 = as before)\n", g_ad_pred);
     p.clamp();
+    g_ad_pm = p; g_ad_pm.lo = 2; g_ad_pm.hi = 5;   // ENHANCEMENT (4-player online): see max_players()
+    num("JSP_INPUT_DELAY_AUTO_MULTI_MIN", g_ad_pm.lo); num("JSP_INPUT_DELAY_AUTO_MULTI_MAX", g_ad_pm.hi);
+    { int mm = -1; num("JSP_INPUT_DELAY_AUTO_MULTI_MARGIN_MS", mm); if (mm >= 0) { g_ad_pm.margin_ms = mm; g_ad_pm.high_margin_ms = mm; } }
+    g_ad_pm.clamp();
     if (!g_ad_on) std::fprintf(stderr, "[net] adaptive input delay off (JSP_INPUT_DELAY_AUTO=0: the manifest's InputDelay holds)\n");
     else if (p.rule == 1) std::fprintf(stderr, "[net] adaptive input delay on (%d..%d ticks, margin %d ms; JSP_INPUT_DELAY_AUTO=0 turns it off)\n", p.lo, p.hi, p.margin_ms);
     else std::fprintf(stderr, "[net] adaptive input delay on (%d..%d ticks, margin %d ms; rule 2: p%d of %d round trips, margin %d ms from %d ms, first reading %d ms, "
@@ -613,9 +636,12 @@ void adapt_settings()
                                         std::min(p.slow_delay, p.hi), p.slow_ms);
         else std::fprintf(stderr, "[net] slow-link start off (the default; JSP_INPUT_DELAY_AUTO_SLOW_START=1 turns it on)\n");
     }
+    if (g_ad_on && max_players() > 2)   // ENHANCEMENT (4-player online): the range with 3-4 peers (multi_peer)
+        std::fprintf(stderr, "[net] with 3-4 players: input delay %d..%d ticks, margin %d ms (JSP_INPUT_DELAY_AUTO_MULTI_MIN, _MAX, _MARGIN_MS)%s\n", g_ad_pm.lo, g_ad_pm.hi,
+                     g_ad_pm.margin_ms, g_ad_pm.rule == 2 && g_ad_pm.slow_ms > 0 ? "; a slow-link start goes to min(SLOW_START_DELAY, max)" : "");
 }
 // A rollback of `depth` ticks (the glue's rollback, main thread): rule 2's depth trigger.
-void adapt_note_rollback(int64_t depth) { if (g_ad_on > 0 && !g.bench) jpdr::note_rollback(g_ad, g_ad_p, GetTickCount64(), depth); }
+void adapt_note_rollback(int64_t depth) { if (g_ad_on > 0 && !g.bench) jpdr::note_rollback(g_ad, multi_peer() ? g_ad_pm : g_ad_p, GetTickCount64(), depth); }
 void adapt_delay(uint64_t now)
 {
     adapt_settings();
@@ -623,9 +649,11 @@ void adapt_delay(uint64_t now)
     if (!g_ad.start && g_ad_pred != 8) g.sess.set_prediction_window((uint8_t)g_ad_pred);   // once per match (g_ad is reset per match)
     if (!g_ad_on) { if (!g_ad.start) g_ad.start = now; return; }
     jpdr::note_time(g_ad, now, g.bv.delay);   // ENHANCEMENT (rematch carry): the time at each delay, for jpdr::settled at the match end
-    const jpdr::Decision d = jpdr::step(g_ad, g_ad_p, now, [] {
+    const jpdr::Params& prm = multi_peer() ? g_ad_pm : g_ad_p;   // ENHANCEMENT (4-player online)
+    const jpdr::Decision d = jpdr::step(g_ad, prm, now, [] {
         const SessionStats st = g.sess.stats();
-        // ENHANCEMENT (worst remote, 2v2): the worst remote slot's numbers (one remote PC: the same as ping_ms .. rtt_seq; see jsp_net_delay_rule.h)
+        // ENHANCEMENT (worst remote, 2v2; 4-player online): the worst connected remote slot's numbers (one remote PC: the same as ping_ms .. rtt_seq;
+        // see jsp_net_delay_rule.h and NetSession::stats)
         jpdr::Reading r; r.ping_avg = st.worst_ping_ms; r.jitter = st.worst_jitter_ms; r.last_ping = st.worst_last_ping_ms; r.rtt_seq = st.worst_rtt_seq;
         r.cur = st.local_delay;
         r.stretch_us = jpdr::stretch_recent(g_ts_peak_us, g_ts_peak_ms, GetTickCount64());   // FIX (depth trigger vs a slow peer): 0 when over ~1 s old
@@ -1214,13 +1242,14 @@ void pump_tick(uint64_t t)
         if (r == 0) return;
         if (g.rrz) g_rdv.met();   // met: the waiting notice goes
         g.plan = g.rz->plan();
-        g.link->set_peer(g.host ? 1 : 0, g.plan.remotes[0].ep);
+        // ENHANCEMENT (4-player online): every remote by its peer id (host 0, clients 1..; with 2 peers: the one remote at host ? 1 : 0, as before)
+        for (const PeerSlots& r : g.plan.remotes) g.link->set_peer(r.peer, r.ep);
         if (mods_refuse_now()) return;   // the same check right before the Hello (begin / join send it)
         if (g.host) {
             g.mh.reset(new jpsm::Host(*g.link, g.ev, g.caps, 0));
-            if (g.mh->begin(g.plan.session_id, 0b11, g.plan.session_id ^ 0x5eedull, t) != jpsm::Reason::None) { pump_fail("settings handshake: cannot begin"); return; }
+            if (g.mh->begin(g.plan.session_id, g.plan.roster_mask(), g.plan.session_id ^ 0x5eedull, t) != jpsm::Reason::None) { pump_fail("settings handshake: cannot begin"); return; }   // roster 0b11 for 2 peers
         } else {
-            g.mc.reset(new jpsm::Client(*g.link, g.ev, g.caps, 1));
+            g.mc.reset(new jpsm::Client(*g.link, g.ev, g.caps, g.plan.local_peer));   // 1 for 2 peers
             if (g.mc->join(g.plan.session_id, 0, t) != jpsm::Reason::None) { pump_fail("settings handshake: cannot join"); return; }
         }
         g.plan_ready = true;
@@ -1241,7 +1270,9 @@ void pump_tick(uint64_t t)
         }
         if (g.rrz && g.rrz->room_id()) g.presence_room = g.rrz->room_id();
         log("rendezvous", to_string(g.plan.remotes[0].ep) + (g.rrz ? std::string(" via re-psn, path ") + path_name(g.rrz->path()) + ", room " + std::to_string((unsigned long long)g.rrz->room_id()) : std::string()));
-        if (g.rrz) g.path_line = g.rrz->path() == Path::Relay ? std::string("Rollback on: connected through the server") : std::string("Rollback on: ") + path_name(g.rrz->path()) + " connection";   // FIX (player wording): no "re-psn" jargon on screen
+        if (g.rrz && !g.rrz->links().empty())   // ENHANCEMENT (4-player online): one line per link, and this PC's slot
+            log("rendezvous links", std::to_string((unsigned)g.plan.total_players) + " players, this PC slot " + std::to_string((unsigned)g.plan.local_first) + " peer " + std::to_string((unsigned)g.plan.local_peer) + ": " + jsp4::links_text(g.rrz->links()));
+        if (g.rrz) g.path_line = g.rrz->path_line();   // FIX (player wording): no "re-psn" jargon on screen; 4-player: "N of M links through the server"
         g.path_kind = !g.rrz ? 1 : g.rrz->path() == Path::Direct ? 1 : g.rrz->path() == Path::Relay ? 2 : 0;   // direct IP is always direct
         return;
     }
@@ -1249,7 +1280,8 @@ void pump_tick(uint64_t t)
     if (g.host) {
         g.mh->tick(t);
         const jpsm::State st = g.mh->state();
-        if (st == jpsm::State::Open && (g.mh->hellos() & 0b10) && g.propose_tries < 20) {
+        const uint8_t clients = (uint8_t)(g.plan.roster_mask() & ~1u);   // ENHANCEMENT (4-player online): every client's Hello (0b10 for 2 peers)
+        if (st == jpsm::State::Open && (g.mh->hellos() & clients) == clients && g.propose_tries < 20) {
             jpsm::Values v = g.ev.local_values();
             v.v[static_cast<size_t>(jpsm::Id::Rollback)] = 1;
             const jpsm::Reason r = g.mh->propose(v, t);
@@ -1268,10 +1300,10 @@ void pump_tick(uint64_t t)
         if (st == jpsm::State::Started) g.m2_started = true;
         // ENHANCEMENT (same-link rematch): a re-armed host waiting for its client's Hello says which match it is at, so a client that is still behind follows
         // (jsp_net_match.h; the first match on a link sends nothing new)
-        if (g.match_k > 0 && st == jpsm::State::Open && !(g.mh->hellos() & 0b10) && t >= g.beacon_next) {
+        if (g.match_k > 0 && st == jpsm::State::Open && (g.mh->hellos() & clients) != clients && t >= g.beacon_next) {
             g.beacon_next = t + 1000;
             const std::vector<uint8_t> b = match_beacon(g.plan.session_id, g.match_k);
-            g.link->send(1, b.data(), b.size());
+            for (const PeerSlots& r : g.plan.remotes) if (!(g.mh->hellos() & (1u << r.peer))) g.link->send(r.peer, b.data(), b.size());   // 2 peers: peer 1, as before
         }
     } else {
         g.mc->tick(t);
@@ -1295,8 +1327,8 @@ bool match_arm(uint32_t k)
         g.m2_ended = false;
         const uint64_t sid = match_session_id(g.plan.session_id, k), t = now_ms();
         bool ok;
-        if (g.host) { g.mh.reset(new jpsm::Host(*g.link, g.ev, g.caps, 0)); ok = g.mh->begin(sid, 0b11, sid ^ 0x5eedull, t) == jpsm::Reason::None; }
-        else { g.mc.reset(new jpsm::Client(*g.link, g.ev, g.caps, 1)); ok = g.mc->join(sid, 0, t) == jpsm::Reason::None; }
+        if (g.host) { g.mh.reset(new jpsm::Host(*g.link, g.ev, g.caps, 0)); ok = g.mh->begin(sid, g.plan.roster_mask(), sid ^ 0x5eedull, t) == jpsm::Reason::None; }   // ENHANCEMENT (4-player online): every peer
+        else { g.mc.reset(new jpsm::Client(*g.link, g.ev, g.caps, g.plan.local_peer)); ok = g.mc->join(sid, 0, t) == jpsm::Reason::None; }
         if (!ok) pump_fail("settings handshake: cannot begin match " + std::to_string(k));
     }
     g.settings_shown_ms = 0;
@@ -1600,7 +1632,7 @@ void start_session(ppu_context* c)
     int start_delay = man_delay;
     if (!g.bench && g_ad_on > 0 && g_ad_carry_on) {
         const uint64_t lk = link_key();
-        start_delay = jpdr::carry_start(g_ad_carry, lk, man_delay, g_ad_p);
+        start_delay = jpdr::carry_start(g_ad_carry, lk, man_delay, multi_peer() ? g_ad_pm : g_ad_p);   // 4-player: the 3-4 player range
         if (lk && g_ad_carry.link == lk)   // one line per session on a link that already ran a match
             std::fprintf(stderr, "[net] input delay starts at %d ticks (%s; manifest %d; JSP_INPUT_DELAY_AUTO_CARRY=0 turns it off)\n", start_delay,
                          g_ad_carry.delay < 0 ? "the manifest's: the last match on this link ran under 20 s"
@@ -1620,10 +1652,20 @@ void start_session(ppu_context* c)
     // The battle slot the game gave this PC (host 0, join 1) must be the rollback slot (plan.local_first), or each PC would drive the other's fighter.
     // Not adjusted here: the two plans must agree, so a mismatch refuses the session on this side (and the handshake Cancel tells the other one).
     const bool native_online = jsp_native_fight_online() == 1;
+    unsigned humans = 0;   // ENHANCEMENT (4-player online): the fight's human records (3-4 players); 0 = the native pad-take rule (2 players, unchanged)
     if (native_online) {
         const int slot = jsp_native_fight_slot();
-        if (slot != (int)g.plan.local_first)
-            why = "the game's battle slot (" + std::to_string(slot) + ") is not the rollback slot (" + std::to_string((int)g.plan.local_first) + "): the native room owner must host";
+        if (slot != (int)g.plan.local_first)   // with 3-4 players the claims made them equal (HELO claim = room record index); a mismatch means the records moved
+            why = "the game's battle slot (" + std::to_string(slot) + ") is not the rollback slot (" + std::to_string((int)g.plan.local_first) + ")" +
+                  (g.plan.total_players > 2 ? std::string(": the room's places changed; planning again for the next fight") : std::string(": the native room owner must host"));
+        if (!why.empty() && g.plan.total_players > 2) g_nat_replan_next();   // FIX (review): re-planned from the records this fight filled (native_poll)
+        else if (g.plan.total_players > 2) {
+            // battle slot s = GekkoNet slot s for every human record; a human record outside the plan's slots would read a pad nobody serves
+            jsp4::RoomView rv; uint16_t me = 0; uint8_t com[4] = {1, 1, 1, 1};
+            if (jsp_native_room_read(rv.member, com, &me)) for (int i = 0; i < 4; i++) rv.com[i] = com[i] != 0;
+            humans = jsp4::human_mask(rv);
+            if (!humans || (humans & ~((1u << g.plan.total_players) - 1u))) why = "the room's human records (mask " + std::to_string(humans) + ") do not fit the " + std::to_string((unsigned)g.plan.total_players) + " rollback slots";
+        }
         // FIX (swapped controls, testers on 0.7.0-test1): the builder numbers the fighters' net slots in team placement order, not record order, so each
         // net slot is mapped to its owner's rollback slot (room record) for the pad take, and this PC's own fighter must come out on this PC's slot.
         if (why.empty()) {
@@ -1634,6 +1676,7 @@ void start_session(ppu_context* c)
             if (!ok) why = "this PC's fighter is not the one its pad would drive (the game's fighter slots do not match the rollback slots)";
         }
     }
+    jsp_native_fight_set_humans(humans);
     if (why.empty()) {
         if (!jsp_snapshot_ext_active()) why = "the snapshot ring is not active (JSP_SNAPSHOT_EXT/WW did not start)";
         else if (!g.sess.start(g.mux, g.plan, cfg)) why = "session refused: " + g.sess.error();
@@ -1890,7 +1933,7 @@ void boundary(ppu_context* c)
         load_diag();
     }
     if (jpno::cancel_held(cancel_key(), GetTickCount64(), g.cancel_since)) { g.sess.abort("match ended by the player"); end_with("Match ended"); return; }   // End match: F9 held 1.5 s
-    if (g.path_until && GetTickCount64() > g.path_until) { g.path_until = 0; if (g.shown == g.path_line) show(""); }   // never blanks a later message (a reconnect or an end line)
+    if (g.path_until && GetTickCount64() > g.path_until) { g.path_until = 0; if (g.shown == g.path_line || g.shown == g.left_line) show(""); }   // never blanks a later message (a reconnect or an end line)
     if (perf_on() && g.sess.synced()) {   // ENHANCEMENT (match perf summary): the frame the last iteration presented (none after a replay tick)
         const double pn = perf_now();
         hitch_frame(hz, pn);   // DIAGNOSTIC (per-hitch line): before on_frame moves last_frame
@@ -1940,6 +1983,23 @@ void boundary(ppu_context* c)
         switch (e.kind) {
         case SessionEventKind::Started: log("gekko session synchronized", ""); if (!g.path_line.empty()) { show(g.path_line); g.path_until = GetTickCount64() + 6000; } else show(""); break;
         case SessionEventKind::Disconnected:   // GekkoNet fires it after the disconnect timeout = the grace window: the match is over
+            // ENHANCEMENT (4-player online): one of 3-4 peers left and others remain: every PC feeds the leaver's slot GekkoNet's agreed neutral input from the
+            // same frame (disconnect claims), so the match goes on to its normal KO / time with that fighter idle
+            {
+                unsigned gone = 0; for (unsigned s = 0; s < 4; s++) gone += (g.sess.stats().gone_mask >> s) & 1u;
+                if (jsp4::leave_policy(multi_peer(), g.sess.remote_peers_connected(), gone) == jsp4::Leave::GoOn) {
+                    std::fprintf(stderr, "[net] player %d (slot %d) left; %u other peer(s) remain: the match goes on, the slot's input is neutral\n", e.handle + 1, e.handle, g.sess.remote_peers_connected());
+                    g.left_line = jsp4::left_text(e.handle); show(g.left_line); g.path_until = GetTickCount64() + 6000; break;
+                }
+                // FIX (review: one cut link in a mesh): a second player gone (or both ends of a cut link dropped by the others' disconnect claims) may mean the PCs no
+                // longer agree who is in: end here, on every PC that sees it, instead of simulating different inputs. FIX (review of PR 248, as with 2 players):
+                // only a result the live confirmation watermark covers is kept (ko_after_disconnect); a predicted one is not a completed match.
+                if (multi_peer()) {
+                    if (const int w = ko_after_disconnect()) { g.sess.abort("match over (a player left after the KO)"); std::fprintf(stderr, "[net] match over, not a disconnect\n"); end_with(jkr::disconnect_end_text(w), true); return; }
+                    std::fprintf(stderr, "[net] player %d (slot %d) gone too (%u slots gone, %u peers connected): the match ends, the PCs may no longer agree who is in\n", e.handle + 1, e.handle, gone, g.sess.remote_peers_connected());
+                    g.sess.abort("connection lost"); end_with("Connection lost"); return;
+                }
+            }
             { std::string why; if (m2_cancelled_within(300, &why)) { g.sess.abort(why); end_with(why); return; } }   // the peer's handshake Cancel (a local failure there) names the reason
             // FIX (a missed KO): a KO was already recorded here: the other PC ended its match on it and its session went; this is a normal end, not a failure.
             // FIX (review of PR 248): only a result the live confirmation watermark covers; a predicted one is not a completed match (ko_after_disconnect).
@@ -2007,7 +2067,7 @@ void boundary(ppu_context* c)
         if (g.badge_on) { const std::string b = jpnb::text(g.bv); if (b != g.badge_shown || !jsp_overlay_active()) { g.badge_shown = b; redraw(); } }
     }
     if (g.ping_on && !g.bench && g.ping_every.due(now, jpnb::kPingRefreshMs)) {   // the ping counter: at most twice a second; drawn again if the layer was closed
-        const float ms = g.sess.stats().ping_ms; const std::string pt = jpnb::ping_text(ms); const uint32_t col = jpnb::ping_rgba(ms);
+        const float ms = g.sess.stats().worst_ping_ms; const std::string pt = jpnb::ping_text(ms); const uint32_t col = jpnb::ping_rgba(ms);
         if (pt != g.ping_shown || (!pt.empty() && (col != g.ping_rgba || !jsp_overlay_active()))) { g.ping_shown = pt; g.ping_rgba = col; redraw(); }
     }
     if (g.status_every.due(now, jpnb::kLogMs) && now - g.started_ms >= 1000) {
@@ -2106,7 +2166,8 @@ fn_t SceneTimer::orig;
 //   conn_open / conn_close  per session: role, socket, re-psn client and room, rendezvous, link, handshake objects, pump thread; Phase Off <-> Handshake
 // The start-up role paths (LISTEN / JOIN, VIA=repsn + ROLE) and jsp_net_lobby_open both call conn_open: one implementation.
 struct Conn { bool host = true, repsn = false, relay = false; uint16_t port = 0; Endpoint join{}; uint64_t room = 0;
-              uint64_t pair = 0; };   // ENHANCEMENT (native-room pairing): the game's own room id (re-psn only; 0 = not paired)
+              uint64_t pair = 0;     // ENHANCEMENT (native-room pairing): the game's own room id (re-psn only; 0 = not paired)
+              int players = 2, claim = -1; std::vector<std::string> expect; };   // ENHANCEMENT (4-player online): 3-4 = the re-psn mesh, this PC's battle slot, rollback names
 uint32_t g_net_build = 0;     // build_id() with the mod set folded in (jsp_net_game_install)
 bool g_installed = false;     // install_process_wide ran: a rollback-capable process (not the bench), so jsp_net_lobby_open may run
 std::string g_lobby_why;      // jsp_net_lobby_reason (main thread)
@@ -2197,7 +2258,16 @@ bool conn_open(const Conn& c, std::string* why, jpno::Refusal* code)
             std::fprintf(stderr, "[net] TEST: re-psn relay forced (JSP_ROLLBACK_FORCE_RELAY=1; used only when relay is allowed (%s) and the server offers it)\n", c.relay ? "yes" : "no");
         }
         if (!c.host && c.room) { rc.join_room = c.room; std::fprintf(stderr, "[net] re-psn: joining room %llu\n", (unsigned long long)rc.join_room); }   // ENHANCEMENT (Discord Join): that room, not the oldest
+        if (c.players > 2) { rc.players = (uint8_t)c.players; rc.expect_names = c.expect; }   // ENHANCEMENT (4-player online): the mesh (jsp_net_repsn.h)
         g.rrz = new RePsnRendezvous(*g.rp, g.mux, *g.hub, rc);
+        if (c.players > 2) {   // the N-peer HELO/PLN2 over the mesh's links: the claim is this PC's room record index, peers' endpoints from this PC's own re-psn view
+            const int claim = c.claim;
+            g.rrz->make_mesh_inner = [claim](const RePsnRendezvous::MeshStart& s) -> IRendezvous* {   // pump thread, inside rz->poll()
+                std::fprintf(stderr, "[net] re-psn mesh: %zu members, every link up; %s, claiming slot %d\n", s.members.size(), s.host ? "hosting the plan" : "asking the owner for the plan", claim);
+                return jsp4::make_mesh_inner(g.mux, *g.hub, s, claim);
+            };
+            g.rrz->on_link = [](const RePsnRendezvous::LinkInfo& l) { std::fprintf(stderr, "[net] re-psn link to %s: %s\n", l.name.c_str(), path_name(l.path)); };
+        }
         g.rrz->on_progress = [](const std::string& line, const std::string& n1, const std::string& n2) {   // runs inside rz->poll() (the pump thread): every 10 s while waiting
             std::fprintf(stderr, "[net] %s\n", line.c_str());
             if (g.rrz && g.rrz->room_id()) g.presence_room = g.rrz->room_id();   // same thread as the rendezvous
@@ -2287,7 +2357,25 @@ struct Native {
     uint64_t seen_room = 0, seen_since = 0, away_since = 0, next_poll = 0, retry_at = 0, rearm_at = 0;
     int tries = 0, fails = 0;     // link opens for this native room; matches in a row that did not end normally on this link
     uint64_t given_up = 0;        // a native room this game stopped trying with (until it is in another one)
+    int players = 0;              // ENHANCEMENT (4-player online): the rollback players the open link was planned for (2..4)
+    int seen_players = 0;         // the count seen_since belongs to (a change restarts the settle wait)
+    uint64_t claim_said = 0;      // last "waiting for the room records" line
+    uint64_t replan_since = 0;    // FIX (review): the count differs from the planned one since then (a re-plan waits kReplanDebounceMs)
+    bool replan_next = false;     // FIX (review): the last session refused on a slot mismatch: plan again from the records that fight filled
 } g_nat;
+constexpr uint64_t kReplanDebounceMs = 1500;   // FIX (a 4-copy run: a 3-player rendezvous failed visibly while the 4th joined): the count must hold this long before a re-plan
+void g_nat_replan_next() { g_nat.replan_next = true; }
+// ENHANCEMENT (4-player online): TEST ONLY knob kept at 0 in play (JSP_NET_TEST_BOTS needs JSP_ROLLBACK_ALLOW_DEBUG=1): extra rollback peers that are not in
+// the native room. No bot ships with this change (four real copies are the test), so it stays 0 unless set by hand.
+int test_bots()
+{
+    static int b = -1;
+    if (b < 0) { const char* e = std::getenv("JSP_NET_TEST_BOTS"); b = env_on("JSP_ROLLBACK_ALLOW_DEBUG") && e ? std::atoi(e) : 0; if (b < 0 || b > 2) b = 0; }
+    return b;
+}
+// A room of 3-4 is opened once it is full (the setting's count, or the room's own maximum) for 0.5 s, or once its member count held this long: players join
+// one by one, and a link planned for 2 or 3 would be re-planned (close and reopen) on every join before the fight.
+constexpr uint64_t kRoomSettleMs = 4000;
 
 void native_close(const char* why)
 {
@@ -2295,16 +2383,18 @@ void native_close(const char* why)
     g_nat.link = false; g_nat.room = 0; g_nat.away_since = 0; g_nat.rearm_at = 0;
     jsp_net_lobby_close();   // tells the other player (the session's disconnect, or a handshake Cancel / leave) and closes everything
 }
-void native_open(uint64_t room, bool owner)
+void native_open(uint64_t room, bool owner, int players, int claim, const std::vector<std::string>& expect)
 {
     Conn c; c.repsn = true; c.host = owner; c.pair = room;
+    c.players = players; c.claim = claim; c.expect = expect;   // ENHANCEMENT (4-player online): 2 = the 2-player path, unchanged
     { char r[8] = {}; c.relay = jsp_setting_get(jpno::kKeyRelay, r, sizeof r) && jpno::flag_on(r); }   // the player's relay choice
     if (const char* w = jmods::rollback_gate(jsp_mods_copy_mismatch() != 0)) { log("native room: no rollback link", std::string("rollback refused: ") + w); g_nat.given_up = room; return; }
     reset_match();   // the fight hash forgets any earlier fight (no fight runs: native_poll waits for the HUD to be gone)
     std::string why; jpno::Refusal code = jpno::Refusal::None;
     if (!conn_open(c, &why, &code)) { conn_close(); log("native room: no rollback link", why); g_nat.given_up = room; return; }
-    g_nat.link = true; g_nat.room = room; g_nat.tries++; g_nat.fails = 0; g_nat.rearm_at = 0; g_nat.away_since = 0;
-    std::fprintf(stderr, "[net] native room %llu: 2 players, rollback link opening as %s (try %d), build %08x\n", (unsigned long long)room, owner ? "host (room owner)" : "client", g_nat.tries, g.caps.build);
+    g_nat.link = true; g_nat.room = room; g_nat.tries++; g_nat.fails = 0; g_nat.rearm_at = 0; g_nat.away_since = 0; g_nat.players = players;
+    std::fprintf(stderr, "[net] native room %llu: %d players, rollback link opening as %s (try %d), build %08x%s\n", (unsigned long long)room, players, owner ? "host (room owner)" : "client", g_nat.tries, g.caps.build,
+                 players > 2 ? (", slot claim " + std::to_string(claim)).c_str() : "");
 }
 // ENHANCEMENT (version mismatch message): the message line kept after the link closed (conn_close clears it), until the fight is drawn or kVersionMsgMs passed.
 constexpr uint64_t kVersionMsgMs = 30000;
@@ -2320,6 +2410,13 @@ void native_maintain(uint64_t now)
         g_nat.link = false; g_nat.room = 0;
         conn_close();
         g_nat.seen_room = room; g_nat.seen_since = now;
+        // FIX (a 4-copy run): a rendezvous that failed because the room's count changed meanwhile (a 4th joined while 3 met; one of them already re-planned and left)
+        // is superseded, not a failure: no notice (conn_close cleared it; vm is false then), no try counted; the room's new count is planned after the settle
+        uint64_t r = 0; int mem = 0, mx = 0, own = 0;
+        if (ps3_np_matching2_room(&r, &mem, &mx, &own, nullptr, 0) == 2 && r == room && jsp4::link_players(mem, test_bots(), max_players()) != g_nat.players) {
+            log("native room", "the rendezvous ended while the room's player count changed: planned again, not counted as a try");
+            g_nat.tries = g_nat.tries > 0 ? g_nat.tries - 1 : 0; g_nat.seen_players = 0; return;
+        }
         if (!v1.empty()) g_rdv.failed(v1, v2);   // the menu notice comes back (a retry's waiting text replaces it)
         if (vm) {   // another version: no retry can help; the message line comes back too
             g_nat.given_up = room; log("native room", "the other player runs another version: no rollback in this room");
@@ -2344,8 +2441,9 @@ void native_poll()
     if (now < g_nat.next_poll) return;
     g_nat.next_poll = now + 100;
     if (g_vmsg_until && (now >= g_vmsg_until || g_hud_idle == 0)) { g_vmsg_until = 0; if (g.shown == g_vmsg) show(""); }   // the version mismatch line: until the fight or its time
-    uint64_t room = 0; int members = 0, max = 0, own = 0;
-    const int st = ps3_np_matching2_room(&room, &members, &max, &own, nullptr, 0);
+    uint64_t room = 0; int members = 0, max = 0, own = 0; char peer[64] = {};
+    const int st = ps3_np_matching2_room(&room, &members, &max, &own, peer, (int)sizeof peer);
+    const int mp = max_players(), want = st == 2 ? jsp4::link_players(members, test_bots(), mp) : 0;   // ENHANCEMENT (4-player online): 2..4, 0 = no link
     if (g_nat.link && g.phase.load() == Phase::Off && !g.mux.is_open()) {   // closed by someone else (jsp_net_lobby_close): not reopened in this room
         log("native room", "the rollback link was closed by the lobby API: not reopened in this room");
         g_nat.given_up = g_nat.room; g_nat.link = false; g_nat.room = 0; g_nat.away_since = 0; g_nat.rearm_at = 0;
@@ -2358,15 +2456,61 @@ void native_poll()
         // disconnect timer ends a match whose peer is really gone first); 1 s between matches, as before.
         const uint64_t away_ms = g.phase.load() == Phase::Running ? 10000 : 1000;
         if (g_nat.away_since && now - g_nat.away_since >= away_ms) { native_close(st != 2 ? "this game left the native room" : room != g_nat.room ? "this game is in another native room" : "the other player left the native room"); return; }
+        // ENHANCEMENT (4-player online): the room's player count changed outside a fight (a join before the first fight, a leave between matches): the link is planned
+        // again for the new count (a new rendezvous; 2 left = the 2-player path). FIX: with JSP_ROLLBACK_MAX_PLAYERS 2, a link opened at 2 members whose room grew
+        // to 3-4 is closed (it would take over a fight of more humans than it has slots); the room gets no rollback until it is back to 2 in another room.
+        const bool running = g.phase.load() == Phase::Running;
+        if (!g_nat.away_since && st == 2 && room == g_nat.room && !running && g_hud_idle >= kHudIdleFrames) {
+            // FIX (a 4-copy run): debounced: the new count must hold kReplanDebounceMs (players join one by one: 2 -> 3 -> 4 re-planned twice, one attempt failed visibly)
+            const bool differs = jsp4::replan(g_nat.players, want, running, mp) || (mp == 2 && members > 2);
+            if (!differs) g_nat.replan_since = 0;
+            else if (!g_nat.replan_since) g_nat.replan_since = now;
+            // FIX (review): the last session refused on a slot mismatch (the claim guessed the member order wrong): plan again, now from the records that fight filled
+            if (g_nat.replan_next && g.phase.load() == Phase::Ended) {
+                g_nat.replan_next = false; native_close("the battle slots did not match the plan: planning again from the room's records");
+                g_nat.seen_room = room; g_nat.seen_since = now; g_nat.seen_players = want; g_nat.tries = 0; g_nat.retry_at = 0;
+                return;
+            }
+            if (differs && now - g_nat.replan_since >= kReplanDebounceMs) {
+                g_nat.replan_since = 0;
+                const std::string why = mp == 2 ? std::string("the room has more than 2 players (JSP_ROLLBACK_MAX_PLAYERS is 2)")
+                                                : "the room now makes " + std::to_string(want) + " rollback players (was " + std::to_string(g_nat.players) + ")";
+                native_close(why.c_str());
+                // FIX (review): never given up for good: with JSP_ROLLBACK_MAX_PLAYERS 2 a room of 3 gets no link (link_players 0) and opens again once it is back to 2
+                g_nat.seen_room = room; g_nat.seen_since = now; g_nat.seen_players = want; g_nat.tries = 0; g_nat.retry_at = 0;
+                return;
+            }
+        }
         if (!g_nat.away_since) native_maintain(now);
         return;
     }
     if (g.phase.load() != Phase::Off || g.mux.is_open()) return;   // a link of the lobby API: not ours
-    if (st != 2 || members != 2 || !room || room == g_nat.given_up) { if (st != 2 || room != g_nat.seen_room) g_nat.seen_room = 0; return; }
-    if (room != g_nat.seen_room) { g_nat.seen_room = room; g_nat.seen_since = now; g_nat.tries = 0; g_nat.retry_at = 0; return; }
-    if (now - g_nat.seen_since < 500 || now < g_nat.retry_at) return;   // two members for half a second (a join in progress settles)
+    if (st != 2 || !want || !room || room == g_nat.given_up) { if (st != 2 || room != g_nat.seen_room) g_nat.seen_room = 0; return; }
+    if (room != g_nat.seen_room) { g_nat.seen_room = room; g_nat.seen_since = now; g_nat.seen_players = want; g_nat.tries = 0; g_nat.retry_at = 0; return; }
+    if (want != g_nat.seen_players) { g_nat.seen_players = want; g_nat.seen_since = now; return; }   // ENHANCEMENT (4-player online): a join or a leave restarts the wait
+    // two members for half a second (a join in progress settles). ENHANCEMENT (4-player online): 3-4 wait until the room is full (the setting's count or the room's
+    // own size) for half a second, or its count held kRoomSettleMs (players join one by one; the coordinator's test: a 4-room otherwise opened at 2)
+    const bool full = want == mp || (max > 0 && members >= max);
+    const uint64_t settle = mp == 2 || want == 2 || full ? 500 : kRoomSettleMs;   // 2 members: as before (a later join re-plans)
+    if (now - g_nat.seen_since < settle || now < g_nat.retry_at) return;
     if (g_hud_idle < kHudIdleFrames) return;   // never during a fight: the open resets the fight hash (jsp_net_lobby.h contract)
-    native_open(room, own != 0);
+    int claim = -1; std::vector<std::string> expect;
+    if (want > 2) {   // ENHANCEMENT (4-player online): the slot claim: the record index when the room's records are exact, else the member order (jsp4::room_claim)
+        jsp4::RoomView rv; uint8_t com[4] = {1, 1, 1, 1}; uint16_t me = 0;
+        if (jsp_native_room_read(rv.member, com, &me)) for (int i = 0; i < 4; i++) rv.com[i] = com[i] != 0;
+        const jsp4::Claim cl = jsp4::room_claim(rv, me, members, &claim);
+        if (cl == jsp4::Claim::Unknown) {   // FIX (review): never silent: the wait is logged, and after 10 s it is on the menu notice too
+            if (now - g_nat.claim_said >= 5000) {
+                g_nat.claim_said = now; std::fprintf(stderr, "[net] native room %llu: %d players, waiting: %s\n", (unsigned long long)room, want, jsp4::claim_text(cl));
+                if (now - g_nat.seen_since > 10000) g_rdv.waiting("Rollback: waiting for this player's place in the room.", "The fight uses the game's own connection if it starts before this is known.");
+            }
+            return;
+        }
+        std::fprintf(stderr, "[net] native room %llu: slot claim by %s (member %u, records %u/%u/%u/%u)\n", (unsigned long long)room, jsp4::claim_text(cl), (unsigned)me,
+                     (unsigned)rv.member[0], (unsigned)rv.member[1], (unsigned)rv.member[2], (unsigned)rv.member[3]);
+        if (peer[0]) expect.push_back(rollback_name(peer));   // ASSUMPTION: patch 7924 names only the first other member; the others stay unnamed in a give-up text
+    }
+    native_open(room, own != 0, want, claim, expect);
 }
 // A newer match of the other side was seen (the pump's match_peek): follow it while this side is armed or waiting. An ended match follows only on a link that
 // re-arms by itself (native); a start-up or lobby link that ended stays ended (unchanged) unless jsp_net_match_begin arms it.
@@ -3000,6 +3144,9 @@ extern "C" unsigned long long jsp_net_presence_room(char* server, int sn)
     if (server && sn > 0) std::snprintf(server, (size_t)sn, "%s", r ? g.presence_srv : "");
     return r;
 }
+// ENHANCEMENT (4-player online): the player count of the agreed 3-4 player mesh this PC is in (0 = none, or 2 players), for jsp_net_native.cpp's team rule.
+// Any thread; racy plain reads (the plan is written once by the pump thread before plan_ready).
+extern "C" int jsp_net_mesh_players(void) { return g.plan_ready && g.rrz && g.plan.total_players > 2 ? (int)g.plan.total_players : 0; }
 extern "C" int jsp_net_presence(int* players, int* host)
 {
     *players = g.started_ms && !g.bench ? (int)g.plan.total_players : 0; *host = g.host ? 1 : 0;

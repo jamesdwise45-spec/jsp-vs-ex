@@ -5,6 +5,8 @@
 #include "jsp_net_repsn.h"
 #include <cstdio>
 #include <functional>
+#include <map>
+#include <set>
 #include <thread>
 
 using namespace jspnet;
@@ -14,33 +16,67 @@ static int g_fail = 0, g_n = 0;
 struct FakeServer {
     struct Room { PsnrRoom r; std::vector<PsnrMember> members; };
     std::vector<Room> rooms; uint64_t next_room = 100; uint32_t next_member = 1; bool relay = false;
+    // ENHANCEMENT (four players): every client of a mesh test (MEMBER_JOINED / MEMBER_LEFT to all members) and the cut links (a PUNCH from first never reaches second)
+    std::vector<struct FakeClient*> all; std::set<std::pair<uint32_t, uint32_t>> cut;
+    struct FakeClient* find(uint32_t u);
 };
 struct FakeClient : IPsnrTransport {
     FakeServer& sv; uint32_t user; Endpoint ep; bool is_ready = true;
     std::vector<PsnrEvent> ev; int punches = 0, joins = 0, leaves = 0; FakeClient* peers[2] = { nullptr, nullptr };
     int searches = 0; std::vector<uint64_t> search_at; std::function<uint64_t()> clock;   // every room-list request, at the fake time
+    std::string name; bool allow = false; int kicks = 0;   // four players: the online name, the player's relay choice (a relayed member is followed only when allowed)
+    struct L { Endpoint ep; bool relay = false, heard = false, acked = false; }; std::map<uint32_t, L> links;
     FakeClient(FakeServer& s, uint32_t u, const Endpoint& e) : sv(s), user(u), ep(e) {}
+    void set_link(uint32_t u, const Endpoint& e, bool relay) override {
+        L& l = links[u]; l.ep = e; l.relay = l.relay || relay;
+        if (relay) if (FakeClient* o = sv.find(u)) if (o->allow) o->links[user].relay = true;   // its first relayed datagram: the real transport follows
+    }
+    void punch_link(uint32_t u) override {
+        punches++; if (sv.cut.count({ user, u })) return;
+        if (FakeClient* o = sv.find(u)) { L& l = o->links[user]; l.heard = true; l.acked = l.acked || links[u].heard; }   // our PUNCH says whether we hear it
+    }
+    unsigned link_seen(uint32_t u) override { auto it = links.find(u); return it == links.end() ? 0u : (it->second.heard ? 1u : 0u) | (it->second.relay ? 2u : 0u) | (it->second.acked ? 4u : 0u); }
+    void kick(uint32_t u) override {
+        kicks++;
+        for (auto& r : sv.rooms) for (size_t i = 0; i < r.members.size(); i++) if (r.members[i].user == u) {
+            r.members.erase(r.members.begin() + (long)i); r.r.members--;
+            for (FakeClient* p : sv.all) if (p->user != u) { PsnrEvent e; e.kind = PsnrEvent::MemberLeft; e.room_id = r.r.id; e.user = u; p->ev.push_back(e); }
+            return;
+        }
+    }
     bool ready() override { return is_ready; }
     uint32_t self_user() override { return user; }
     bool relay_offered() override { return sv.relay; }
     bool search(std::vector<PsnrRoom>& out) override { searches++; if (clock) search_at.push_back(clock()); out.clear(); for (auto& r : sv.rooms) out.push_back(r.r); return true; }
-    void create_room(uint32_t flags, const std::string& external, const std::string& data) override {
-        FakeServer::Room r; r.r.id = sv.next_room++; r.r.flags = flags; r.r.external = external; r.r.owner = user; r.r.members = 1; r.r.max_members = 2;
-        r.members.push_back(PsnrMember{ user, sv.next_member++, ep, data });
+    void create_room(uint32_t flags, const std::string& external, const std::string& data, uint8_t max) override {
+        FakeServer::Room r; r.r.id = sv.next_room++; r.r.flags = flags; r.r.external = external; r.r.owner = user; r.r.members = 1; r.r.max_members = max;
+        r.members.push_back(PsnrMember{ user, (uint16_t)sv.next_member++, ep, data, name });
         PsnrEvent e; e.kind = PsnrEvent::RoomJoined; e.room_id = r.r.id; e.owner = user; e.members = r.members; ev.push_back(e);
         sv.rooms.push_back(r);
     }
     void join_room(uint64_t id, const std::string& data) override {
         joins++;
         for (auto& r : sv.rooms) if (r.r.id == id) {
-            PsnrMember me{ user, (uint16_t)sv.next_member++, ep, data }; r.members.push_back(me); r.r.members++;
+            if (r.r.members >= r.r.max_members) { PsnrEvent e; e.kind = PsnrEvent::Error; e.err = 3; ev.push_back(e); return; }   // ROOM_FULL
+            PsnrMember me{ user, (uint16_t)sv.next_member++, ep, data, name }; r.members.push_back(me); r.r.members++;
             PsnrEvent e; e.kind = PsnrEvent::RoomJoined; e.room_id = id; e.owner = r.r.owner; e.members = r.members; ev.push_back(e);
             for (FakeClient* p : peers) if (p && p->user == r.r.owner) { PsnrEvent j; j.kind = PsnrEvent::MemberJoined; j.room_id = id; j.members = { me }; p->ev.push_back(j); }
+            for (FakeClient* p : sv.all) if (p != this && p->user != r.r.owner) for (auto& m : r.members) if (m.user == p->user) { PsnrEvent j; j.kind = PsnrEvent::MemberJoined; j.room_id = id; j.members = { me }; p->ev.push_back(j); }
         }
     }
     bool poll_event(PsnrEvent& e) override { if (ev.empty()) return false; e = ev.front(); ev.erase(ev.begin()); return true; }
     void send_punch(const Endpoint&) override { punches++; }
     void leave_room() override { leaves++; }
+};
+FakeClient* FakeServer::find(uint32_t u) { for (FakeClient* c : all) if (c->user == u) return c; return nullptr; }
+// ENHANCEMENT (four players): the N-peer HELO/PLAN stood in for (piece 1 builds the real one): a plan two polls after the links are up
+struct FakeInner : IRendezvous {
+    RePsnRendezvous::MeshStart m; SessionPlan p; std::string err; int polls = 0;
+    explicit FakeInner(const RePsnRendezvous::MeshStart& s) : m(s) {}
+    int poll() override { if (++polls < 3) return 0; p.host = m.host; p.session_id = m.session_id; p.total_players = (uint8_t)m.members.size(); return 1; }
+    const SessionPlan& plan() const override { return p; }
+    const std::string& error() const override { return err; }
+    MessageChannel* peer_channel() override { return nullptr; }
 };
 
 struct Side {
@@ -55,7 +91,9 @@ struct Side {
         rz->on_path = [this](Path p, uint32_t) { last = p; };
         rz->on_progress = [this](const std::string& l, const std::string& a, const std::string& b) { progress.push_back(l); n1 = a; n2 = b; };
         cl->clock = [this] { return clock; };
+        rz->make_mesh_inner = [this](const RePsnRendezvous::MeshStart& s) { inner_members = s.members.size(); return new FakeInner(s); };
     }
+    size_t inner_members = 0;
     // polls this side alone for `ms` of fake time in `step` ms steps; the result of the last poll (stops at a decision)
     int run_alone(uint64_t ms, uint64_t step = 50) { int r = 0; for (uint64_t e = 0; e < ms && r == 0; e += step) { clock += step; r = rz->poll(); } return r; }
 };
@@ -72,6 +110,26 @@ static void drive(Side& a, Side& b, int steps, int* ra, int* rb)
     }
 }
 static RePsnRendezvous::Config cfg(bool host, uint32_t build, bool relay = false) { RePsnRendezvous::Config c; c.host = host; c.build = build; c.allow_relay = relay; return c; }
+// ENHANCEMENT (four players): Alice hosts, Bob, Carol and Dan join (users 11..14); every side steps 50 ms of fake time per round until all decided or `rounds` run out
+struct Mesh {
+    FakeServer sv; Side s[4]; int r[4] = { 0, 0, 0, 0 }; int n;
+    Mesh(uint32_t build, bool relay, bool offered, int count = 4, std::function<void(RePsnRendezvous::Config&)> tweak = nullptr) : n(count) {
+        sv.relay = offered; const char* names[4] = { "Alice-rb", "Bob-rb", "Carol-rb", "Dan-rb" };
+        for (int i = 0; i < n; i++) {
+            auto c = cfg(i == 0, build, relay); c.players = 4; c.pair = 0x77; if (tweak) tweak(c);
+            s[i].init(sv, 11 + (uint32_t)i, c); s[i].cl->name = names[i]; s[i].cl->allow = relay; sv.all.push_back(s[i].cl.get());
+            s[i].cl->peers[0] = i ? s[0].cl.get() : nullptr;
+        }
+    }
+    bool run(int rounds) {
+        for (int k = 0; k < rounds; k++) {
+            bool all = true;
+            for (int i = 0; i < n; i++) { if (r[i]) continue; s[i].clock += 50; r[i] = s[i].rz->poll(); all = all && r[i]; }
+            if (all) return true;
+        }
+        return false;
+    }
+};
 
 int main()
 {
@@ -85,7 +143,7 @@ int main()
       all[3] = { 5, kRoomFlagRollback, make_record(B + 1), 1, 1, 2 };        // other build
       all[4] = { 6, kRoomFlagRollback, make_record(B), 1, 2, 2 };            // full
       const auto f = filter_rooms(all, B); CHECK(f.size() == 2 && f[0].id == 3 && f[1].id == 7); }
-    { std::vector<PsnrMember> m = { { 50, 9, {}, "" }, { 60, 2, {}, "" }, { 70, 5, {}, "" } };
+    { std::vector<PsnrMember> m = { { 50, 9, {}, "", "" }, { 60, 2, {}, "", "" }, { 70, 5, {}, "", "" } };
       CHECK(player_index(m, 60) == 0 && player_index(m, 70) == 1 && player_index(m, 50) == 2 && player_index(m, 99) == -1); }
 
     // ---- punch, then the plan: roles, session id = room id, player index, path "direct" ----
@@ -284,12 +342,12 @@ int main()
     { FakeServer sv; const uint64_t P = 0x7778; const uint32_t B2 = 0xf1e06d4du;
       auto ch = cfg(true, B); ch.pair = P; ch.release = "0.7.0-test3"; Side h; h.init(sv, 11, ch);
       CHECK(h.rz->poll() == 0);
-      PsnrEvent j; j.kind = PsnrEvent::MemberJoined; j.members = { PsnrMember{ 22, 9, Endpoint{}, make_record(B2, P) } }; h.cl->ev.push_back(j);
+      PsnrEvent j; j.kind = PsnrEvent::MemberJoined; j.members = { PsnrMember{ 22, 9, Endpoint{}, make_record(B2, P), std::string() } }; h.cl->ev.push_back(j);
       PsnrEvent l; l.kind = PsnrEvent::MemberLeft; l.user = 22; h.cl->ev.push_back(l);
       CHECK(h.rz->poll() == -1 && h.rz->version_mismatch() && h.rz->notice1() == "The other player is on 0.7.0-test2; you're on 0.7.0-test3. Both players need the same version for rollback."); }
     // a member of another native room (another pair key) is not "another version": refused as before, no mismatch
     { FakeServer sv; auto ch = cfg(true, B); ch.pair = 0x7779; Side h; h.init(sv, 11, ch); h.rz->poll();
-      PsnrEvent j; j.kind = PsnrEvent::MemberJoined; j.members = { PsnrMember{ 22, 9, Endpoint{}, make_record(B + 1, 0x777a) } }; h.cl->ev.push_back(j);
+      PsnrEvent j; j.kind = PsnrEvent::MemberJoined; j.members = { PsnrMember{ 22, 9, Endpoint{}, make_record(B + 1, 0x777a), std::string() } }; h.cl->ev.push_back(j);
       CHECK(h.rz->poll() == 0 && !h.rz->version_mismatch() && h.rz->rejected_members == 1); }
     // the server does not answer the joiner's one join: it fails with the message after kMismatchJoinMs
     { FakeServer sv; const uint64_t P = 0x777b; auto ch = cfg(true, B + 1); ch.pair = P; auto cc = cfg(false, B); cc.pair = P;
@@ -302,6 +360,87 @@ int main()
       CHECK(h.run_alone(119000) == 0 && h.run_alone(2000) == -1 && !h.rz->version_mismatch());
       CHECK(h.rz->notice1() == "Rollback could not start: the other player probably runs a different version (the main menu shows it), or their online connection failed.");
       CHECK(h.rz->error().rfind("re-psn: the other player probably runs a different version (the main menu shows it), or their online connection failed: start both games", 0) == 0); }
+    // ---- ENHANCEMENT (four players): the mesh with four members ----
+    CHECK(player_label("Bob-rb") == "Bob" && player_label("abcdefghijk-1a2b") == "abcdefghijk..." && player_label("") == "a player" && player_label("Carol") == "Carol");
+    CHECK(name_list({ "A" }) == "A" && name_list({ "A", "B" }) == "A and B" && name_list({ "A", "B", "C" }) == "A, B and C");
+    // all direct: room of 4, every PC 3 direct links, one session id, the owner hosts, player index by member id, the inner layer gets all 4 members
+    { Mesh m(B, false, false); CHECK(m.run(400));
+      CHECK(m.sv.rooms.size() == 1 && m.sv.rooms[0].r.max_members == 4 && m.sv.rooms[0].members.size() == 4);
+      for (int i = 0; i < 4; i++) {
+          CHECK(m.r[i] == 1 && m.s[i].rz->links().size() == 3 && m.s[i].rz->path() == Path::Direct && m.s[i].rz->path_line() == "Rollback on: direct connection");
+          CHECK(m.s[i].rz->plan().session_id == m.s[0].rz->room_id() && m.s[i].rz->plan().host == (i == 0) && m.s[i].rz->local_index() == i && m.s[i].inner_members == 4);
+          for (const auto& l : m.s[i].rz->links()) CHECK(l.path == Path::Direct && !l.name.empty() && l.name.find("-rb") == std::string::npos);
+      }
+      CHECK(m.s[0].clock - 1000 < 3000); }   // no wait for a punch window when every PUNCH is heard
+    // one pair (Carol, Dan) cannot punch: that link goes through the server after the punch window, every other link stays direct
+    { Mesh m(B, true, true); m.sv.cut = { { 13, 14 }, { 14, 13 } }; CHECK(m.run(400));
+      for (int i = 0; i < 4; i++) CHECK(m.r[i] == 1);
+      CHECK(m.s[0].rz->path_line() == "Rollback on: direct connection" && m.s[1].rz->path_line() == "Rollback on: direct connection");
+      CHECK(m.s[2].rz->path_line() == "Rollback on: 1 of 3 links through the server" && m.s[3].rz->path_line() == "Rollback on: 1 of 3 links through the server");
+      for (const auto& l : m.s[2].rz->links()) CHECK(l.path == (l.user == 14 ? Path::Relay : Path::Direct));
+      CHECK(m.s[2].cl->links[14].relay && m.s[3].cl->links[13].relay && !m.s[2].cl->links[11].relay); }
+    // one way only (Dan never hears Carol, Carol hears Dan): Dan relays after the window and Carol follows at once (never a half-direct link)
+    { Mesh m(B, true, true); m.sv.cut = { { 13, 14 } }; CHECK(m.run(400));
+      for (int i = 0; i < 4; i++) CHECK(m.r[i] == 1);
+      CHECK(m.s[2].rz->path_line() == "Rollback on: 1 of 3 links through the server" && m.s[3].rz->path_line() == "Rollback on: 1 of 3 links through the server"); }
+    // Dan cannot be reached by anyone and the relay is not allowed: everyone stops at the link bound (10 s), naming who could not connect
+    { Mesh m(B, false, true); m.sv.cut = { { 11, 14 }, { 12, 14 }, { 13, 14 }, { 14, 11 }, { 14, 12 }, { 14, 13 } }; CHECK(m.run(400));
+      for (int i = 0; i < 4; i++) CHECK(m.r[i] == -1);
+      CHECK(m.s[0].rz->error() == "re-psn: could not connect to Dan within 10 seconds (relay is not allowed in the settings)");
+      CHECK(m.s[0].rz->notice1() == "Rollback could not start: could not connect to Dan." && m.s[0].rz->notice2().find("through the server") != std::string::npos);
+      CHECK(m.s[3].rz->error().find("could not connect to Alice, Bob and Carol within 10 seconds") != std::string::npos);
+      CHECK(m.s[0].clock - 1000 <= 10000 + 1500 && m.s[0].clock - 1000 > 10000); }
+    // the same with the relay allowed but no relay on the server
+    { Mesh m(B, true, false); m.sv.cut = { { 11, 14 }, { 14, 11 } }; CHECK(m.run(400));
+      CHECK(m.r[0] == -1 && m.s[0].rz->error() == "re-psn: could not connect to Dan within 10 seconds (this server offers no relay)"); }
+    // Dan never starts: the room waits the window and then names him (the expected names come from the game's own room)
+    { Mesh m(B, false, false, 3, [](RePsnRendezvous::Config& c) { c.expect_names = { "Alice-rb", "Bob-rb", "Carol-rb", "Dan-rb" }; c.give_up_ms = 20000; });
+      CHECK(m.run(1000));
+      for (int i = 0; i < 3; i++) CHECK(m.r[i] == -1 && m.s[i].rz->error().find("only 3 of 4 players (missing: Dan) in the room within 20 seconds") != std::string::npos);
+      CHECK(!m.s[0].progress.empty() && m.s[0].progress.back().find("3 of 4 players (missing: Dan)") != std::string::npos); }
+    // mixed builds (4-player online: the release's version mismatch rule applies to the mesh too): Dan's record says another build of our native room: no mesh can run,
+    // so every PC fails at once with the version message (no retry), as two players do
+    { Mesh m(B, false, false);
+      m.s[0].rz->poll(); for (int i = 1; i < 4; i++) m.s[i].rz->poll();
+      for (auto& x : m.sv.rooms[0].members) if (x.user == 14) x.data = make_record(B + 1, 0x77, 4);
+      for (auto& c : m.sv.all) for (auto& e : c->ev) for (auto& x : e.members) if (x.user == 14) x.data = make_record(B + 1, 0x77, 4);
+      m.run(40);
+      for (int i = 0; i < 3; i++) CHECK(m.r[i] == -1 && m.s[i].rz->version_mismatch() && m.s[i].rz->notice1().find("Both players need the same version") != std::string::npos);
+      CHECK(m.s[0].rz->error() == "re-psn: the other player runs another version (build a1b2c3d5, yours a1b2c3d4)"); }
+    // a member of another native room (same build, another pair key) got in: the host refuses and kicks it by name, Bob and Carol do not fail, the room waits
+    { Mesh m(B, false, false);
+      m.s[0].rz->poll(); for (int i = 1; i < 4; i++) m.s[i].rz->poll();
+      for (auto& x : m.sv.rooms[0].members) if (x.user == 14) x.data = make_record(B, 0x78, 4);
+      for (auto& c : m.sv.all) for (auto& e : c->ev) for (auto& x : e.members) if (x.user == 14) x.data = make_record(B, 0x78, 4);
+      m.run(40);
+      CHECK(m.r[0] == 0 && m.r[1] == 0 && m.r[2] == 0 && m.s[0].rz->rejected_members == 1 && m.s[0].cl->kicks == 1 && m.sv.rooms[0].members.size() == 3 && !m.s[0].rz->version_mismatch());
+      m.s[0].clock += 20000; m.run(1);
+      CHECK(!m.s[0].progress.empty() && m.s[0].progress.back().find("3 of 4 players (refused, another version: Dan (another room))") != std::string::npos); }
+    // a 3-player record in a 4-player mesh (same build and pair: a stale plan) is not "another version": refused like another room
+    { Mesh m(B, false, false);
+      m.s[0].rz->poll(); for (int i = 1; i < 4; i++) m.s[i].rz->poll();
+      for (auto& x : m.sv.rooms[0].members) if (x.user == 14) x.data = make_record(B, 0x77, 3);
+      for (auto& c : m.sv.all) for (auto& e : c->ev) for (auto& x : e.members) if (x.user == 14) x.data = make_record(B, 0x77, 3);
+      m.run(40);
+      CHECK(m.r[0] == 0 && m.s[0].rz->rejected_members == 1 && !m.s[0].rz->version_mismatch()); }
+    // a client refuses a host whose record differs (per member, as with two players): another room's record (same build) = "does not match"
+    { Mesh m(B, false, false);
+      m.s[0].rz->poll(); m.sv.rooms[0].members[0].data = make_record(B, 0x78, 4); m.run(40);
+      CHECK(m.r[1] == -1 && m.s[1].rz->error().find("does not match") != std::string::npos && !m.s[1].rz->version_mismatch()); }
+    // ENHANCEMENT (4-player online): the host of our native room on another build: the client fails with the version message (the release's rule, now in the mesh too)
+    { Mesh m(B, false, false);
+      m.s[0].rz->poll(); m.sv.rooms[0].members[0].data = make_record(B + 1, 0x77, 4); m.run(40);
+      CHECK(m.r[1] == -1 && m.s[1].rz->version_mismatch()); }
+    // a member that leaves while its link is still down ends it, naming it; without the N-peer layer the mesh refuses to start
+    { Mesh m(B, false, false); m.sv.cut = { { 11, 14 }, { 14, 11 } }; m.run(40);
+      PsnrEvent e; e.kind = PsnrEvent::MemberLeft; e.user = 14; m.s[0].cl->ev.push_back(e);
+      CHECK(m.s[0].rz->poll() == -1 && m.s[0].rz->error() == "re-psn: could not connect to Dan (relay is not allowed in the settings; Dan gave up)"); }
+    { Mesh m(B, false, false); for (auto& x : m.s) x.rz->make_mesh_inner = nullptr; m.run(100);
+      CHECK(m.r[0] == -1 && m.s[0].rz->error() == "re-psn: the 4-player session layer is not available in this build"); }
+    // two players: the room max stays 2 and the "Rollback on" lines are today's
+    { FakeServer sv; Side h, c; h.init(sv, 11, cfg(true, B)); c.init(sv, 22, cfg(false, B)); h.cl->peers[0] = c.cl.get(); c.cl->peers[0] = h.cl.get();
+      int rh, rc; drive(h, c, 400, &rh, &rc);
+      CHECK(rh == 1 && sv.rooms[0].r.max_members == 2 && h.rz->links().empty() && h.rz->path_line() == "Rollback on: direct connection" && h.inner_members == 0); }
 
     // ---- the notice store (jsp_net_game.cpp): every end of the wait leaves it right ----
     { RendezvousNotice n; std::string a, b; const unsigned g0 = n.gen();
