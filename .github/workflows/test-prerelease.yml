@@ -81,6 +81,10 @@ jobs:
           - **Black screen after a match fixed.** Rarely, after a match (often a rematch), one PC stayed on a black screen and then left the room about 30 seconds later. That PC was one button sample short of finishing the match. test6 notices this and supplies an empty pad sample (no buttons pressed), so the screen moves on within about a second. It only does this after a match has ended normally, so it can't change a result.
           - **No more stutter in the first online fights.** New graphics are now prepared in the background during online fights, so a player whose game hasn't seen a character or effect yet no longer pauses both players. In tests with a fresh install on one side: pauses 51 -> 0, slow seconds 32 -> 6-9, audio gaps 66 -> 2-5. An effect may be missing for a moment the first time it appears. The offline warm-up is no longer needed.
           - **Version message knows test4 and test5.** Against an older copy, the room now says "The other player is on 0.7.0-test4" (or test5) instead of a build number.
+          - **A frozen match ends on both PCs.** If a match freezes for good, it now ends on both PCs after about 60 seconds: the other player sees "Opponent disconnected" instead of "Reconnecting..." forever, and the frozen PC usually ends the match too, about 5 seconds later.
+          - **A drop at a KO counts as a disconnect.** If the connection drops just as a fighter goes down and only your PC had seen the KO (it was guessing the other player's input), the match now ends as "Opponent disconnected" instead of "Match over". A KO still ends as "Match over" only if your PC had already confirmed it with both players' real inputs before the disconnect.
+          - **Online is one click.** Setup no longer turns online on by itself. In the settings window's Online tab, click **Use Friends' online test server (TEST BUILD)**: that sets the test server, rollback and Discord. Settings you already have are kept: if you already have online settings, nothing is added, Discord included.
+          - **Free Battle keeps your picks.** An online match that ended by a desync or a disconnect no longer clears your last offline Free Battle characters.
 
           Everything from test4 is still here: warm-up fights are safe (no "Desync detected" at the start), the host freeze recovers by itself, smoother online sound, the version message, and F9 must be held for 1.5 s to cancel.
 
@@ -95,11 +99,11 @@ jobs:
 
           1. Download **jsp-setup.exe** below and run it (or unpack the portable zip outside Program Files and run \`run.cmd\`). Windows SmartScreen may warn about an unsigned program: choose "More info" > "Run anyway".
           2. Setup asks for your own disc folder (US disc) and your own decrypted \`EBOOT.elf\`, then builds the game on your PC (several minutes; longer on an older PC).
-          3. Start the game. An offline warm-up fight is optional: online fights prepare new graphics in the background.
+          3. Turn online on: the game's shortcut opens the settings window. Go to the **Online** tab and click **Use Friends' online test server (TEST BUILD)** at the top. One click; nothing changes before it, and settings you already have are kept. Then click **Start Game**. An offline warm-up fight is optional: online fights prepare new graphics in the background.
           4. Online: Main Menu > Battle Modes > Online Battle > Friendly Match. One player picks **Create a Room**, the other **Search for a Room** and joins it. The host starts the fight.
           5. When the fight starts you see \`Rollback on: direct connection\` (or \`connected through the server\`), and the ping in ms under the timer. After the match both players return to the room and the host starts the next fight.
 
-          Online works out of the box: a public test server (re-psn), a random name (change it in the settings window, Online tab) and rollback are already set. No IP addresses or port forwarding needed. If Windows asks to allow the game through the firewall, click **Allow access**.
+          Online is one click: in the settings window (the game's shortcut), **Online** tab, click **Use Friends' online test server (TEST BUILD)**. That turns on the public test server (re-psn), a random name (change it in the same tab), rollback and Discord Rich Presence. Nothing is set up before that click. No IP addresses or port forwarding needed. If Windows asks to allow the game through the firewall, click **Allow access**.
 
           ## Limits of this build
 
