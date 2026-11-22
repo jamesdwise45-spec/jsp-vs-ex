@@ -84,6 +84,7 @@ static bool clock_diag() { static const bool v = [] { const char* e = std::geten
 #include "jsp_net_native_fight.h"   // ENHANCEMENT (native fight takeover): arm / disarm around the rollback session
 #include "jsp_net_pick_flow.h"      // ENHANCEMENT (post-game / pick, JSP_ROLLBACK_PICK=1): the prompt, the pick round, the pair for the builder (pure, host-tested)
 #include "jsp_net_pick_drive.h"     // ENHANCEMENT (post-game / pick): the pad gate, the notice-box Cross, the joiner's Ready Cross (pure, host-tested)
+#include "jsp_net_pick_own.h"       // FIX (pick7): the planned seats, the predicted fighter map, the match-end rule (pure, host-tested)
 static_assert(jspf::kTagPostgame == jspnet::kLinkTagPostgame && jspf::kTagPick == jspnet::kLinkTagPick, "one set of link tags");
 #include "jsp_session_reader.h"
 #include "jsp_session_manifest.h"
@@ -913,12 +914,12 @@ void end_with(const std::string& text, bool quiet = false)
     // FIX (rematch black screen) + ENHANCEMENT (post-game / pick): ONE test of a normal end (an agreed KO / time-up hand-back, "Match over..."). The watchdog's flag
     // is set BEFORE the disarm below (the disarm consumes it and opens the watchdog's scope); the pick prompt opens AFTER the disarm, on the same test,
     // so every match whose prompt opens also has the watchdog armed for the native exit that runs under the prompt.
-    const bool normal_end = jkr::normal_end(text);   // jsp_net_ko_rule.h: the same test the disconnect / KO end rule's texts are built for
-    if (normal_end) jsp_native_fight_end_normal();
+    const jspo::End er = jspo::end_rule(text);   // FIX (pick7): jkr::normal_end (jsp_net_ko_rule.h) for the flag, the prompt and the re-arm alike
+    if (er.wd_flag) jsp_native_fight_end_normal();
     jsp_native_fight_arm(0);   // ENHANCEMENT (native fight takeover): after the last tick (reset_match below does it again; a no-op when not armed)
     { std::lock_guard<std::mutex> lk(g.pump.mutex()); if (g.host && g.mh) g.mh->end_match(); else if (!g.host && g.mc) g.mc->match_ended(); }
     log("ended", text);
-    if (normal_end) {   // ENHANCEMENT (post-game / pick): a normal end of a native-room link opens the prompt (seq = this match, the same on every PC)
+    if (er.prompt) {   // ENHANCEMENT (post-game / pick): a normal end of a native-room link opens the prompt (seq = this match, the same on every PC)
         std::lock_guard<std::mutex> lk(g.pump.mutex());
         // FIX (pick7): only when every PC has JSP_ROLLBACK_PICK=1 (the switch handshake, jsp_net_pick_flow.h 1b); else both PCs behave as off
         if (g.flow.is_open()) {
@@ -930,7 +931,7 @@ void end_with(const std::string& text, bool quiet = false)
     if (quiet) set_text(""); else show(text);   // quiet: the rendezvous texts are on the main menu's notice (jsp_net_notice); the message line stays empty so it does not clear that layer
     g.ended_ms = GetTickCount64();   // ENHANCEMENT (lobby): the session is stopped kLingerMs from now (boundary)
     // ENHANCEMENT (same-link rematch): a match that ran ended inside its fight; a re-armed match waits until that fight is gone (boundary, fresh_gate)
-    g.last_end_ok = text == "Match ended" || normal_end;
+    g.last_end_ok = er.last_end_ok;
     if (g.started_ms) g.fresh_gate = true;
     reset_match();
 }
@@ -1067,15 +1068,17 @@ void pump_tick(uint64_t t)
         if (g.pick_link) {   // ENHANCEMENT (post-game / pick): 2 players: player index = peer id (host 0, client 1), battle slot of each (its room record index)
             const int me = g.host ? 0 : 1;
             uint8_t slots[jspk::kMaxPlayers] = {};
-            const bool ok = g.plan.total_players == 2 && g.plan.remotes.size() == 1;
-            if (ok) { slots[me] = g.plan.local_first; slots[me ^ 1] = g.plan.remotes[0].first_slot; }
+            const bool two = g.plan.total_players == 2 && g.plan.remotes.size() == 1;
+            if (two) { slots[me] = g.plan.local_first; slots[me ^ 1] = g.plan.remotes[0].first_slot; }
+            // FIX (pick7): the players' battle slots must be exactly the planned rollback seats, the ones every session start maps (jsp_native_fight_map)
+            const bool ok = two && jspo::seats_ok(slots, 2, (int)g.plan.total_players);
             if (ok && g.flow.open(g.plan.session_id, me, 2, slots)) {
                 jspg::Config pc; pc.idle_ms = jspg::idle_ms_from(std::getenv(jspg::kIdleKey));
                 jspk::Config kc; kc.idle_ms = jspk::idle_ms_from(std::getenv(jspk::kIdleKey));
                 g.flow.set_config(pc, kc);
                 std::fprintf(stderr, "[net] postgame: on for this link (2 players, this PC player %d slot %u; prompt idle %u s, pick idle %u s)\n", me,
                              (unsigned)g.plan.local_first, pc.idle_ms / 1000, kc.idle_ms / 1000);
-            } else std::fprintf(stderr, "[net] postgame: off for this link (the plan is not 2 players with one slot each)\n");
+            } else std::fprintf(stderr, "[net] postgame: off for this link (the plan is not 2 players on the planned rollback seats 0 and 1)\n");
         }
         if (g.rrz && g.rrz->room_id()) g.presence_room = g.rrz->room_id();
         log("rendezvous", to_string(g.plan.remotes[0].ep) + (g.rrz ? std::string(" via re-psn, path ") + path_name(g.rrz->path()) + ", room " + std::to_string((unsigned long long)g.rrz->room_id()) : std::string()));
@@ -1451,7 +1454,7 @@ void start_session(ppu_context* c)
         if (why.empty()) {
             char om[600] = {};
             // FIX (review of PR 248): the room's humans and the fighters must be exactly the plan's rollback seats (no missing, extra or stale member)
-            const int ok = jsp_native_fight_map((int)g.plan.local_first, (1u << g.plan.total_players) - 1u, om, sizeof om);
+            const int ok = jsp_native_fight_map((int)g.plan.local_first, jspo::plan_seats((int)g.plan.total_players), om, sizeof om);   // = (1 << total_players) - 1; after a Select character too
             std::fprintf(stderr, "[net] ownership: %s\n", om);
             if (!ok) why = "this PC's fighter is not the one its pad would drive (the game's fighter slots do not match the rollback slots)";
         }

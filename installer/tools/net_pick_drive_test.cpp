@@ -12,6 +12,7 @@
 // glibc's <math.h> declares a function jnf (Bessel); the port's namespace of the same name is renamed for this test only (the math headers are in above)
 #define jnf jsp_native_fight_ns
 #include "../port/jsp/jsp_net_native_fight.h"   // jnf::placement_net_slot: the builder's net slot of a record (swapped-controls fix)
+#include "../port/jsp/jsp_net_pick_own.h"       // FIX (pick7): the planned seats and the fighter map the session start builds (jnf::net_ports)
 
 static int fails = 0;
 #define CHECK(c) do { if (!(c)) { std::printf("FAIL line %d: %s\n", __LINE__, #c); fails++; } } while (0)
@@ -226,15 +227,102 @@ static void test_ownership()
     CHECK(runs == 2000);
 }
 
+// ---- 6. FIX (pick7): ownership after Select character with the fighter map's planned-seat contract ----
+// The session start after a Select character runs jsp_native_fight_map with the plan's seats ((1 << total_players) - 1, jspo::plan_seats), like
+// every session start. Here: two PCs go through the real flow (switch handshake, prompt, Select character, picks, READY), each writes the agreed
+// pair into its copy of the room (team bytes a PC's versus_apply may have swapped), and the map the session start builds from it
+// (jspo::predict_map = the builder's placement + jnf::net_ports with the seats) must be ok, the same on both PCs, and give each PC's pad its own
+// fighter. The plan's seat check at the menu's open, and the refusals the session start keeps, are checked too.
+static void put_rec(uint8_t* img, int rc, uint16_t member, bool com, uint8_t team, uint16_t fighter)
+{
+    uint8_t* p = img + jspk::kOffRecords + jspk::kRecSize * rc;
+    jspk::put_be16(p + jspk::kRecMember, member); p[jspk::kRecCom] = com ? 1 : 0; p[jspk::kRecTeam] = team; jspk::put_be16(p + jspk::kRecFighter, fighter);
+}
+static void test_ownership_mapper()
+{
+    const uint8_t s01[2] = { 0, 1 }, s10[2] = { 1, 0 }, s02[2] = { 0, 2 }, s11[2] = { 1, 1 };
+    CHECK(jspo::plan_seats(2) == 3 && jspo::plan_seats(4) == 15 && jspo::plan_seats(0) == 0 && jspo::plan_seats(5) == 0);
+    CHECK(jspo::seats_ok(s01, 2, 2) && jspo::seats_ok(s10, 2, 2));
+    CHECK(!jspo::seats_ok(s02, 2, 2) && !jspo::seats_ok(s11, 2, 2) && !jspo::seats_ok(s01, 2, 3) && !jspo::seats_ok(s01, 1, 1));
+    std::mt19937 r(20261122u + 7u);
+    int rooms = 0, together = 0, swapped = 0;
+    for (int it = 0; it < 500; it++) {
+        jspf::Flow h, j;
+        CHECK(h.open(5000u + (uint64_t)it, 0, 2, s01) && j.open(5000u + (uint64_t)it, 1, 2, s01));
+        uint64_t t = 0;
+        auto step = [&] {
+            h.pump(t, [&](const uint8_t* d, size_t n) { j.route(0, d, n, t); });
+            j.pump(t, [&](const uint8_t* d, size_t n) { h.route(1, d, n, t); });
+            h.poll(t); j.poll(t); t += 100;
+        };
+        for (int k = 0; k < 30; k++) step();
+        CHECK(h.match_end(1, t) && j.match_end(1, t));
+        CHECK(h.choose(jspg::CHARSELECT, t) && j.choose((r() & 1) ? jspg::REMATCH : jspg::CHARSELECT, t));   // mixed: Select character wins
+        for (int k = 0; k < 10; k++) step();
+        CHECK(h.picking() && j.picking());
+        jspk::Pick ph, pj;
+        ph.fighter = r() % 3 == 0 ? jspk::kRandom : (uint16_t)(r() % 42); pj.fighter = r() % 3 == 0 ? jspk::kRandom : (uint16_t)(r() % 42);
+        ph.mode = (r() & 1) ? jspk::TOGETHER : jspk::VERSUS; pj.mode = (r() & 1) ? jspk::TOGETHER : jspk::VERSUS;   // the host's mode wins
+        CHECK(h.submit(ph, true) && j.submit(pj, true));
+        for (int k = 0; k < 30 && !(h.round().state() == jspk::READY && j.round().state() == jspk::READY); k++) step();
+        jspf::PairOut pa[2];
+        CHECK(h.pair(&pa[0]) && j.pair(&pa[1]));
+        CHECK(jspo::slot_seats(pa[0].slot, pa[0].n) == jspo::plan_seats(2) && pa[0].self_slot == 0 && pa[1].self_slot == 1);
+        // the room after the host's broadcast: host record 0 / member 1, joiner record 1 / member 2, two COMs; per PC team bytes
+        uint8_t img[jspk::kRoomSize];
+        for (uint32_t i = 0; i < jspk::kRoomSize; i++) img[i] = (uint8_t)r();
+        for (int i = 0; i < 4; i++) img[jspk::kOffSlotTeam + i] = (uint8_t)(r() % 3);
+        put_rec(img, 0, 1, false, (uint8_t)(r() % 2), (uint16_t)(r() % 42)); put_rec(img, 1, 2, false, (uint8_t)(r() % 2), (uint16_t)(r() % 42));
+        put_rec(img, 2, 0, true, (uint8_t)(r() % 2), 0x20); put_rec(img, 3, 0, true, (uint8_t)(r() % 2), 0x21);
+        uint8_t pc[2][jspk::kRoomSize];
+        std::memcpy(pc[0], img, sizeof img); std::memcpy(pc[1], img, sizeof img);
+        if (r() & 1) { std::swap(pc[1][jspk::kOffRecords + jspk::kRecSize + jspk::kRecTeam], pc[1][jspk::kOffRecords + jspk::kRecSize * 2 + jspk::kRecTeam]); swapped++; }
+        for (int me = 0; me < 2; me++) CHECK(jspf::apply_pair(pc[me], pa[me]) == jspk::Result::Ok);
+        const jspo::Map m0 = jspo::predict_map(pc[0], jspo::plan_seats(2)), m1 = jspo::predict_map(pc[1], jspo::plan_seats(2));
+        CHECK(m0.err == jnf::MAP_OK && m1.err == jnf::MAP_OK);
+        CHECK(jspo::own_ok(m0, 0) && jspo::own_ok(m1, 1));                                        // each PC's pad -> its own fighter
+        CHECK(!std::memcmp(m0.port, m1.port, sizeof m0.port) && !std::memcmp(m0.net_of_rec, m1.net_of_rec, sizeof m0.net_of_rec));   // one map
+        for (int rc = 0; rc < 2; rc++) CHECK(m0.net_of_rec[rc] >= 0 && m0.port[m0.net_of_rec[rc]] == rc);
+        CHECK(m0.net_of_rec[2] < 0 && m0.net_of_rec[3] < 0);                                     // the COMs get no net slot
+        const bool tog = jspk::agreed_mode(pa[0].pick) == jspk::TOGETHER;
+        const uint8_t t0 = pc[0][jspk::kOffRecords + jspk::kRecTeam], t1 = pc[0][jspk::kOffRecords + jspk::kRecSize + jspk::kRecTeam];
+        CHECK(tog ? t0 == t1 : t0 != t1);
+        together += tog;
+        if (ph.fighter != jspk::kRandom) CHECK(jspk::be16(pc[0] + jspk::kOffRecords + jspk::kRecFighter) == ph.fighter);
+        if (pj.fighter != jspk::kRandom) CHECK(jspk::be16(pc[1] + jspk::kOffRecords + jspk::kRecSize + jspk::kRecFighter) == pj.fighter);
+        // Fight again after it: the same pair is written again and maps the same way
+        h.fight_running(); j.fight_running();
+        CHECK(h.match_end(2, t) && j.match_end(2, t) && h.choose(jspg::REMATCH, t) && j.choose(jspg::REMATCH, t));
+        for (int k = 0; k < 30 && !(h.round().state() == jspk::READY && j.round().state() == jspk::READY); k++) step();
+        jspf::PairOut again; CHECK(h.pair(&again) && again.pick[0] == pa[0].pick[0] && again.pick[1] == pa[0].pick[1]);
+        uint8_t re[jspk::kRoomSize]; std::memcpy(re, img, sizeof img);
+        CHECK(jspf::apply_pair(re, again) == jspk::Result::Ok && !std::memcmp(re + jspk::kOffRecords, pc[0] + jspk::kOffRecords, 4 * jspk::kRecSize));
+        rooms++;
+    }
+    CHECK(rooms == 500 && together > 50 && swapped > 50);
+    // what the session start refuses stays refused: a stale third member (the roster write refuses it, and the native roster maps MAP_EXTRA) ...
+    uint8_t img[jspk::kRoomSize] = {};
+    put_rec(img, 0, 1, false, 0, 3); put_rec(img, 1, 2, false, 1, 4); put_rec(img, 2, 3, false, 0, 5); put_rec(img, 3, 0, true, 1, 6);
+    jspf::PairOut p; p.n = 2; p.slot[0] = 0; p.slot[1] = 1;
+    uint8_t keep[jspk::kRoomSize]; std::memcpy(keep, img, sizeof img);
+    CHECK(jspf::apply_pair(img, p) == jspk::Result::HumansMismatch && !std::memcmp(keep, img, sizeof img));
+    CHECK(jspo::predict_map(img, jspo::plan_seats(2)).err == jnf::MAP_EXTRA && !jspo::own_ok(jspo::predict_map(img, 3), 0));
+    // ... and a joiner on record 2 (not a planned seat): the menu's link would not open (seats_ok) and the map refuses
+    put_rec(img, 1, 0, true, 1, 4); put_rec(img, 2, 2, false, 1, 5);
+    const uint8_t s02b[2] = { 0, 2 };
+    CHECK(!jspo::seats_ok(s02b, 2, 2) && jspo::predict_map(img, jspo::plan_seats(2)).err != jnf::MAP_OK);
+}
+
 int main()
 {
     test_ownership();
+    test_ownership_mapper();
     test_pad_gate();
     test_box_basic();
     test_box_gates();
     test_join_ready();
     test_map1();
     if (fails) { std::printf("net pick drive: %d check(s) FAILED\n", fails); return 1; }
-    std::printf("net pick drive: pad gate (capture, late-pick start block, injected presses), notice-box Cross (timing, cap, gates, loading), joiner's Ready, map1 timelines, ownership after the roster write (2000 rooms) ok\n");
+    std::printf("net pick drive: pad gate (capture, late-pick start block, injected presses), notice-box Cross (timing, cap, gates, loading), joiner's Ready, map1 timelines, ownership after the roster write (2000 rooms), ownership after Select character through the flow and the fighter map's planned seats (500 rooms + refusals) ok\n");
     return 0;
 }

@@ -32,6 +32,7 @@ posix   | installer/tools/net_postgame_test.sh
 posix   | installer/tools/net_pick_test.sh
 posix   | installer/tools/net_pick_flow_test.sh
 posix   | installer/tools/net_pick_drive_test.sh
+posix   | installer/tools/net_pick_match_test.sh
 posix   | installer/tools/net_report_test.sh
 posix   | installer/tools/build_id_test.py {scratch}
 posix   | installer/tools/net_repsn_test.sh {toolkit} {scratch}
@@ -87,6 +88,7 @@ exclude | installer/tools/net_postgame_test.cpp | compiled and run by net_postga
 exclude | installer/tools/net_pick_test.cpp | compiled and run by net_pick_test.sh
 exclude | installer/tools/net_pick_flow_test.cpp | compiled and run by net_pick_flow_test.sh
 exclude | installer/tools/net_pick_drive_test.cpp | compiled and run by net_pick_drive_test.sh
+exclude | installer/tools/net_pick_match_test.cpp | compiled and run by net_pick_match_test.sh
 exclude | installer/tools/net_report_test.cpp | compiled and run by net_report_test.sh
 exclude | installer/tools/net_repsn_test.cpp | compiled and run by net_repsn_test.sh
 exclude | installer/tools/net_repsn_client_test.cpp | compiled and run by net_repsn_test.sh

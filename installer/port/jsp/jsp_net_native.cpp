@@ -74,6 +74,7 @@ extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*);
 #include "jsp_discord.h"
 #include "jsp_net_lobby.h"   // ENHANCEMENT (AUTO_ONLINE post-fight phase): jsp_net_lobby_phase for the over / run conditions
 #include "jsp_net_pick_flow.h"   // ENHANCEMENT (post-game / pick, JSP_ROLLBACK_PICK=1): the agreed pair's roster write (apply_pair)
+#include "jsp_net_pick_own.h"    // FIX (pick7): the fighter map the coming session will build (predict_map, the planned seats)
 extern "C" int jsp_setting_get(const char* key, char* out, int n);
 /* jsp_net_game.cpp (ENHANCEMENT, post-game / pick): the pair the coming build applies, whether one is active, the switch, and the AUTO_ONLINE steps */
 extern "C" int jsp_pick_pair(jspf::PairOut* out);
@@ -265,6 +266,12 @@ void pick_roster_apply(const char* where, bool quiet_if_same)
         NLOG("[online]   rec %d member %u team %u fighter %03X support %03X com %u\n", r, jspk::be16(q + jspk::kRecMember), q[jspk::kRecTeam], jspk::be16(q + jspk::kRecFighter),
              jspk::be16(q + jspk::kRecSupport), q[jspk::kRecCom]);
     }
+    /* FIX (pick7): the fighter map the session start will build from this roster with the planned seats (jsp_native_fight_map refuses the
+     * session when it fails; the roster write never changes which records are human, so the native roster would map the same way) */
+    const uint32_t seats = jspo::slot_seats(p.slot, p.n);
+    const jspo::Map m = jspo::predict_map(img, seats);
+    NLOG("[online] pick roster: fighter map %s (seats 0x%X; net slot -> record %d %d %d %d); this PC's pad drives its own fighter: %s\n", jnf::map_err_text(m.err), seats,
+         m.port[0], m.port[1], m.port[2], m.port[3], jspo::own_ok(m, p.self_slot) ? "yes" : "NO");
 }
 
 void versus_apply()
