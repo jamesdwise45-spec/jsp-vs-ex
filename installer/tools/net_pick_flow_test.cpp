@@ -4,6 +4,7 @@
 // builder), checking that every PC applies the same roster bytes. FIX (pick7): the switch handshake (the prompt opens only when every PC has
 // JSP_ROLLBACK_PICK=1; with one PC on, no prompt and no stall on either). No game, no GPU.
 #include "../port/jsp/jsp_net_pick_flow.h"
+#include "../port/jsp/jsp_stall_rule.h"   // jsr::kFailMs: the frame clock's deadline the menu's freeze owner uses too
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -589,10 +590,80 @@ static void test_switch()
     }
 }
 
+// ---- FIX (pick7): the freeze owner while the menu is up ----
+static_assert(kFreezeMs == jsr::kFailMs, "the menu's freeze deadline is the frame clock's");
+// Two agreed PCs at the prompt of match seq; both games flip until `froze_at` (A only stops flipping then). Returns the time B got its act.
+struct FreezeRun { Act a = Act::None, b = Act::None; uint64_t b_at = 0, a_froze_at = 0; bool a_hold = true, b_hold = true, b_block = true; };
+static FreezeRun freeze_run(int stage, uint64_t froze_at, uint64_t end)
+{
+    // stage 0: nobody chose; 1: A chose Fight again, B not yet; 2: Select character, both picking; 3: READY, B (the host) in the room, A (joiner) not
+    FreezeRun r; uint8_t slots[2] = { 0, 1 };
+    Flow b, a;   // b = player 0 (host), a = player 1 (joiner): the joiner's game freezes
+    jspg::Config pc; jspk::Config kc;   // shipped timeouts: prompt idle 180 s, pick idle 120 s + wait 60 s
+    CHECK(b.open(950, 0, 2, slots) && a.open(950, 1, 2, slots)); b.set_config(pc, kc); a.set_config(pc, kc);
+    uint64_t t = 0;
+    auto tick = [&](bool a_main) {
+        if (t < froze_at) a.game_alive(t);
+        b.game_alive(t);
+        b.pump(t, [&](const uint8_t* d, size_t n) { a.route(0, d, n, t); });
+        a.pump(t, [&](const uint8_t* d, size_t n) { b.route(1, d, n, t); });   // the pump thread runs on, frozen game or not
+        if (a.take_froze() && !r.a_froze_at) r.a_froze_at = t;
+        const Act y = b.poll(t); if (y != Act::None && y != Act::CharSelect && y != Act::Rematch && y != Act::Ready && r.b == Act::None) { r.b = y; r.b_at = t; }   // the first leave-like act
+        if (a_main) a.poll(t);
+        t += 100;
+    };
+    for (; t < 3000;) tick(true);
+    CHECK(a.agreed() && b.agreed() && a.match_end(1, t) && b.match_end(1, t));
+    if (stage == 1) CHECK(a.choose(jspg::REMATCH, t));
+    if (stage >= 2) { CHECK(a.choose(jspg::CHARSELECT, t) && b.choose(jspg::CHARSELECT, t)); for (int k = 0; k < 10; k++) tick(true); }
+    if (stage == 3) {
+        jspk::Pick p; p.fighter = 7;
+        CHECK(a.submit(p, true) && b.submit(p, true));
+        for (int k = 0; k < 20; k++) tick(true);
+        b.in_room(true);
+        for (int k = 0; k < 10; k++) tick(true);
+        CHECK(b.round().state() == jspk::READY && !b.start_ok() && b.block_start());   // the host waits for the joiner's room flag
+    }
+    while (t < end) tick(t < froze_at);   // A's main thread is stuck too (no poll) once its game froze
+    r.a = a.poll(t); r.a_hold = a.hold(); r.b_hold = b.hold(); r.b_block = b.block_start();
+    return r;
+}
+static void test_freeze()
+{
+    for (int stage = 0; stage <= 3; stage++) {
+        const FreezeRun r = freeze_run(stage, 10000, 120000);
+        CHECK(r.a_froze_at >= 10000 + kFreezeMs - 100 && r.a_froze_at <= 10000 + kFreezeMs + 200);   // found by the pump thread, on time
+        CHECK(r.b == Act::PeerFroze || (stage == 0 && r.b == Act::LeaveClose));                    // the other PC closes at once ...
+        CHECK(r.b_at >= r.a_froze_at && r.b_at <= r.a_froze_at + 300);                              // ... not after the idle timeout
+        CHECK(!r.b_hold && !r.b_block);                                                             // no hold, the host's Cross is free
+        CHECK(r.a == Act::Froze && !r.a_hold);                                                      // the frozen PC's main thread, back
+        if (r.b == Act::None) std::printf("  freeze stage %d: no act on the other PC\n", stage);
+    }
+    {   // a game that runs (flips) never trips it: the prompt left alone ends by the idle timeout (180 s) as before
+        const FreezeRun r = freeze_run(0, 1000000, 200000);
+        CHECK(r.a_froze_at == 0 && (r.b == Act::LeaveGiveUp || r.b == Act::LeaveClose) && r.b_at >= 180000);
+    }
+    {   // no flip while the match ran is not counted: the deadline starts at the match end (the prompt), not at the last flip before it
+        Flow a; uint8_t slots[2] = { 0, 1 }; CHECK(a.open(951, 0, 2, slots));
+        a.game_alive(1000);
+        a.match_over(1, 500000);
+        for (uint64_t t = 500000; t < 500000 + kFreezeMs - 100; t += 100) { a.pump(t, [](const uint8_t*, size_t) {}); CHECK(!a.frozen()); }
+        // and a declined match (no menu) is never watched
+        Flow c; CHECK(c.open(952, 0, 2, slots)); c.game_alive(1); CHECK(!c.match_end(1, 1000));
+        for (uint64_t t = 1000; t < 200000; t += 100) { c.pump(t, [](const uint8_t*, size_t) {}); CHECK(!c.frozen() && !c.take_froze()); }
+    }
+    {   // the gone bit on the wire
+        Hello h; h.session = 9; h.gone = true; h.heard = 0xF; uint8_t b[kHelloLen]; hello_encode(h, b);
+        Hello o; CHECK(hello_decode(b, kHelloLen, &o) && o.gone && o.heard == 0xF);
+        b[6] |= 0x20; CHECK(!hello_decode(b, kHelloLen, &o));
+    }
+}
+
 int main()
 {
     test_hello_wire();
     test_switch();
+    test_freeze();
     test_group_wire();
     test_group_states();
     int bad = 0;
@@ -608,6 +679,6 @@ int main()
     int fbad = 0, runs = 0;
     for (int n = 2; n <= 4; n++) for (uint32_t s = 1; s <= 60; s++, runs++) if (!flow_random(s * 7919u + (uint32_t)n * 13u, n)) { if (fbad++ < 3) std::printf("FAIL flow run n=%d seed %u\n", n, s); fails++; }
     if (fails) { std::printf("net pick flow: %d failure(s)\n", fails); return 1; }
-    std::printf("net pick flow: switch handshake (one PC on, a lost last hello, an early decline, old link, forged sender), group choice (900 random runs), 2-player path, routing, spoofed senders, late lock vs the host's start, member map, team bytes, picker texts, leave / silence / idle / lost, %d flow runs of 8 post-games (n = 2..4) ok\n", runs);
+    std::printf("net pick flow: switch handshake (one PC on, a lost last hello, an early decline, old link, forged sender), freeze owner (prompt, chosen, picking, READY; no false trip), group choice (900 random runs), 2-player path, routing, spoofed senders, late lock vs the host's start, member map, team bytes, picker texts, leave / silence / idle / lost, %d flow runs of 8 post-games (n = 2..4) ok\n", runs);
     return 0;
 }

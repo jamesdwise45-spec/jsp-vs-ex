@@ -26,6 +26,13 @@
 //      start before every PC is READY: a PC sends "in the room" only once its round is READY, the host's start waits for every player's flag
 //      (start_ok), and jsp_net_game.cpp swallows the host's own Cross on the room page while a round runs and start_ok is false (block_start).
 //      route() takes the sender's peer id: a message whose player index is not its sender's is refused (counted in spoofed()).
+//      FIX (pick7, the freeze owner while the menu is up): the frame clock's 60 s failure (jsp_stall_rule.h kFailMs) is watched only while a
+//      match runs, and between matches the pump thread kept answering for a game that no longer ran: the prompt's datagrams, the hellos and
+//      the pick messages went on, so the other PC waited in its prompt for the idle timeout, and a host in a READY round with a frozen
+//      joiner never got its start (start_ok) and kept its Cross blocked. Now the pump thread feeds game_alive() with every new flip; with the
+//      menu up and no flip for kFreezeMs (= kFailMs) the pump thread leaves for this PC: Leave when no choice was made, no more pick
+//      messages, and "gone" in every hello. The other PC closes its round at once (Act::PeerFroze); this PC's main thread, if it comes
+//      back, gets Act::Froze and closes the link too.
 //   4. apply_pair(): the roster write on a room image. Player i's room member id is the member id in the record at its battle slot (slot = record
 //      index, the 4-player claim; 2 players: host slot 0, joiner slot 1). TODO-MAPPING (U5): if that record is a COM or has member id 0, the human
 //      records in record order are given to the players in slot order (fallback, logged); both are functions of R and the plan only.
@@ -230,30 +237,31 @@ private:
 // another player declined the same match closes it at once (Act::PeerOff), so a last hello lost at the very end of a match cannot leave one
 // PC in a prompt the other never opened. A PC with the switch off sends nothing (its Flow is closed) and only counts the hellos it drops
 // (off_hellos, logged once by jsp_net_game.cpp). Either way both PCs behave as off for that match and the log says why.
-// Wire (kHelloLen = 11 bytes): [0] 0xBA [1] version 1 [2..5] session tag (u32 LE, never 0) [6] heard (bits 0-3, bits 4-7 zero) [7] player
+// Wire (kHelloLen = 11 bytes): [0] 0xBA [1] version 1 [2..5] session tag (u32 LE, never 0) [6] heard (bits 0-3), bit 4 gone (see 3: the freeze owner), bits 5-7 zero [7] player
 // index 0..3 (bits 2-7 zero) [8..9] declined (u16 LE) [10] check: XOR of bytes 0..9 with 0x69. Its length and magic tell it from the
 // 2-player choice (8 bytes, 0xB7) and the 3..4 player choice (14 bytes, 0xB8).
 inline constexpr uint8_t kHelloMagic = 0xBA, kHelloVersion = 1;
 inline constexpr size_t kHelloLen = 11;
 inline constexpr uint64_t kHelloMs = 1000, kHelloSlowMs = 3000;
-struct Hello { uint32_t session = 0; uint8_t heard = 0, player = 0; uint16_t declined = 0; };
+inline constexpr uint64_t kFreezeMs = 60000;   // FIX (pick7): no flip this long with the menu up: the pump thread leaves for this PC (= jsr::kFailMs)
+struct Hello { uint32_t session = 0; uint8_t heard = 0, player = 0; uint16_t declined = 0; bool gone = false; };
 inline void hello_encode(const Hello& h, uint8_t out[kHelloLen])
 {
     out[0] = kHelloMagic; out[1] = kHelloVersion;
     for (int i = 0; i < 4; i++) out[2 + i] = (uint8_t)(h.session >> (8 * i));
-    out[6] = (uint8_t)(h.heard & 0x0F); out[7] = (uint8_t)(h.player & 3);
+    out[6] = (uint8_t)((h.heard & 0x0F) | (h.gone ? 0x10 : 0)); out[7] = (uint8_t)(h.player & 3);
     out[8] = (uint8_t)h.declined; out[9] = (uint8_t)(h.declined >> 8);
     uint8_t x = 0x69; for (size_t i = 0; i < kHelloLen - 1; i++) x ^= out[i];
     out[10] = x;
 }
 inline bool hello_decode(const uint8_t* p, size_t n, Hello* h)
 {
-    if (!p || !h || n != kHelloLen || p[0] != kHelloMagic || p[1] != kHelloVersion || (p[6] & 0xF0) || (p[7] & 0xFC)) return false;
+    if (!p || !h || n != kHelloLen || p[0] != kHelloMagic || p[1] != kHelloVersion || (p[6] & 0xE0) || (p[7] & 0xFC)) return false;
     uint8_t x = 0x69; for (size_t i = 0; i < kHelloLen - 1; i++) x ^= p[i];
     if (x != p[10]) return false;
     const uint32_t s = (uint32_t)p[2] | (uint32_t)p[3] << 8 | (uint32_t)p[4] << 16 | (uint32_t)p[5] << 24;
     if (!s) return false;
-    h->session = s; h->heard = p[6]; h->player = p[7]; h->declined = (uint16_t)(p[8] | p[9] << 8);
+    h->session = s; h->heard = (uint8_t)(p[6] & 0x0F); h->gone = (p[6] & 0x10) != 0; h->player = p[7]; h->declined = (uint16_t)(p[8] | p[9] << 8);
     return true;
 }
 
@@ -318,7 +326,9 @@ enum class Act : uint8_t {
     CharSelect,    // Select character: back to the room, then this player picks
     Ready,         // every player's pick is locked and every PC holds them all (the host may start)
     Lost,          // the pick round lost a player: like LeaveClose
-    PeerOff        // FIX (pick7): another PC did not open its prompt for this match (no switch agreement there): this prompt closed, the link stays
+    PeerOff,       // FIX (pick7): another PC did not open its prompt for this match (no switch agreement there): this prompt closed, the link stays
+    Froze,         // FIX (pick7): this PC's game made no flip for kFreezeMs with the menu up: the pump thread left for it (see 3); close the link
+    PeerFroze      // FIX (pick7): another PC's game froze with the menu up (its hello says gone): close the link, like LeaveClose
 };
 inline const char* act_name(Act a)
 {
@@ -326,6 +336,7 @@ inline const char* act_name(Act a)
     case Act::None: return "none"; case Act::LeaveGiveUp: return "leave (this player)"; case Act::LeaveClose: return "leave (another player / link)";
     case Act::Rematch: return "fight again"; case Act::CharSelect: return "select character"; case Act::Ready: return "picks agreed"; case Act::Lost: return "pick round lost";
     case Act::PeerOff: return "the other PC's menu is off for this match";
+    case Act::Froze: return "this game froze in the menu"; case Act::PeerFroze: return "the other PC's game froze in the menu";
     }
     return "?";
 }
@@ -370,6 +381,7 @@ public:
             const uint8_t bit = (uint8_t)(1u << peer);
             if (!(hello_heard_ & bit)) { hello_heard_ |= bit; hello_dirty_ = true; }   // answer at once: the other PC learns it was heard
             if (h.heard & (1u << me_)) peer_heard_me_ |= bit;
+            if (h.gone && pg_.on() && !peer_gone_) peer_gone_ = true;   // FIX (pick7): that PC's game froze with the menu up
             if (h.declined) {
                 peer_declined_[peer] = h.declined;
                 if (pg_.on() && pg_.outcome() == jspg::PENDING && h.declined == (uint16_t)(pg_.seq() + 1u)) { pg_.stop(); peer_off_ = true; }
@@ -398,10 +410,17 @@ public:
         if (!is_open()) return;
         uint8_t b[1 + (Postgame::kMaxMsg > jspk::kMsgLen ? Postgame::kMaxMsg : jspk::kMsgLen)];
         static_assert(kHelloLen <= Postgame::kMaxMsg, "the hello fits the send buffer");
+        // FIX (pick7): the freeze owner while the menu is up (see 3 at the top): no flip for kFreezeMs since the later of the last one and the
+        // match end. The prompt's own choice becomes Leave when none was made; the pick round sends nothing more; every hello says gone.
+        if (!frozen_ && pg_.on() && alive_ms_ && t >= alive_ms_ + kFreezeMs) {
+            frozen_ = true; froze_new_ = true; hello_dirty_ = true;
+            if (pg_.outcome() == jspg::PENDING && pg_.mine() == jspg::NONE) pg_.pick(jspg::LEAVE, t);
+            if (pick_on_) pick_.stop();
+        }
         if (hello_dirty_ || t >= hello_next_) {   // FIX (pick7): the switch handshake
-            Hello h; h.session = tag_; h.heard = hello_heard_; h.player = (uint8_t)me_; h.declined = declined_;
+            Hello h; h.session = tag_; h.heard = hello_heard_; h.player = (uint8_t)me_; h.declined = declined_; h.gone = frozen_;
             b[0] = kTagPostgame; hello_encode(h, b + 1); send(b, 1 + kHelloLen); sent_++;
-            hello_dirty_ = false; hello_next_ = t + (agreed() ? kHelloSlowMs : kHelloMs);
+            hello_dirty_ = false; hello_next_ = t + (agreed() && !frozen_ ? kHelloSlowMs : kHelloMs);
         }
         pg_.tick(t);
         if (const size_t n = pg_.take(t, b + 1)) { b[0] = kTagPostgame; send(b, n + 1); sent_++; }
@@ -418,6 +437,7 @@ public:
         if (!is_open()) return;
         pick_.stop(); pick_on_ = false; acted_ = false; ready_said_ = false; rematch_ = false; round_pair_ = false; pg_left_ = false;
         committed_ = false; want_room_ = false; peer_off_ = false; peer_off_said_ = false; decline_why_ = 0;
+        frozen_ = froze_new_ = froze_said_ = peer_gone_ = peer_gone_said_ = false; if (now > alive_ms_) alive_ms_ = now;
         pg_.start(seq, now, pcfg_);
     }
     // FIX (pick7): the match end as the game calls it: the prompt opens only when every PC agreed on the switch (see 1b) and no other PC
@@ -442,10 +462,17 @@ public:
     }
     int decline_why() const { return decline_why_; }
     uint64_t off_hellos() const { return off_hellos_; }
+    // FIX (pick7): the freeze owner. game_alive: the game made a new flip (the pump thread polls the flip count; any thread under the caller's
+    // lock). take_froze: the freeze was found since the last call (the pump thread logs it). frozen: it was found for this match.
+    void game_alive(uint64_t now) { if (now > alive_ms_) alive_ms_ = now; }
+    bool take_froze() { const bool f = froze_new_; froze_new_ = false; return f; }
+    bool frozen() const { return frozen_; }
     // Main thread: the next step to act on (each one once).
     Act poll(uint64_t now)
     {
         if (peer_off_ && !peer_off_said_) { peer_off_said_ = true; return Act::PeerOff; }   // FIX (pick7): another PC declined this match
+        if (frozen_ && !froze_said_) { froze_said_ = true; end_round(); return Act::Froze; }             // FIX (pick7): the freeze owner left for this PC
+        if (peer_gone_ && !peer_gone_said_) { peer_gone_said_ = true; end_round(); return Act::PeerFroze; }
         if (!is_open() || !pg_.on()) return Act::None;
         const jspg::Outcome o = pg_.outcome();
         if (o == jspg::PENDING) return Act::None;
@@ -519,6 +546,8 @@ private:
         for (int i = 0; i < n_; i++) { p.slot[i] = slots_[i]; p.pick[i] = pick_.pick_of(i); }
         return p;
     }
+    // FIX (pick7): the menu of this match is over for this PC without an agreed outcome (a freeze here or there): no hold, no round, no messages.
+    void end_round() { acted_ = true; pg_left_ = true; pick_.stop(); pick_on_ = false; pg_.stop(); want_room_ = false; }
     // READY: the round is committed (once); then this PC's "in the room" flag may go out.
     void on_round_change()
     {
@@ -543,6 +572,9 @@ private:
     uint64_t hello_next_ = 0, off_hellos_ = 0;
     bool hello_dirty_ = true, peer_off_ = false, peer_off_said_ = false;
     int decline_why_ = 0;
+    // FIX (pick7): the freeze owner (3)
+    uint64_t alive_ms_ = 0;
+    bool frozen_ = false, froze_new_ = false, froze_said_ = false, peer_gone_ = false, peer_gone_said_ = false;
 };
 
 // ---- 4. the roster write of an agreed pair on a room image ----

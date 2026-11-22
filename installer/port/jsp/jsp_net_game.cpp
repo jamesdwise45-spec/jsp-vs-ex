@@ -125,6 +125,7 @@ extern volatile int g_ko_track;          // jsp_game.cpp: 1 = find the KO counte
 extern void (*g_cellpad_filter)(uint32_t port_no, uint16_t* buttons, uint16_t* lx, uint16_t* ly);   // patch 6501 (ENHANCEMENT, post-game / pick: the prompt's pad)
 unsigned long long jsp_native_room_seen_ms(void);   // jsp_net_native.cpp (ENHANCEMENT, post-game / pick): when a room-page update last ran (0 = never)
 unsigned long long jsp_native_loading_seen_ms(void);   // jsp_net_native.cpp (FIX, mapping run U4): when the online loading scene last ran (0 = never)
+uint32_t cellGcm_flip_request_count(void);   // toolkit (FIX pick7, the freeze owner while the after-match menu is up): flips the game requested
 }
 
 namespace {
@@ -986,7 +987,13 @@ void pump_tick(uint64_t t)
     // (2 players; the 4-player mesh is not in this build)
     if (g.phase.load() != Phase::Off && g.link && g.flow.is_open()) {
         if (g.phase.load() == Phase::Running) g.flow.fight_running();
+        // FIX (pick7, the freeze owner while the menu is up): every new flip proves the game runs; with the menu up and none for 60 s this
+        // thread leaves the menu for this PC (jsp_net_pick_flow.h 3), as it ends a running match on the frame clock's failure below
+        { static uint32_t last_flip = 0; const uint32_t f = cellGcm_flip_request_count(); if (f != last_flip) { last_flip = f; g.flow.game_alive(t); } }
         g.flow.pump(t, [](const uint8_t* b, size_t n) { g.link->send(g.host ? 1 : 0, b, n); });
+        if (g.flow.take_froze())
+            std::fprintf(stderr, "[net] postgame: the game made no flip for %llu s with the after-match menu up: the pump thread leaves it for this PC (the other PC is told now)\n",
+                         (unsigned long long)(jspf::kFreezeMs / 1000));
     }
     if (g.phase.load() == Phase::Off || g.m2_ended.load()) return;   // once ended nothing more is logged or driven (no 10 lines a second after a refusal)
     // FIX (review of PR 248, the freeze timeout's owner): the frame clock's failure (jsp_stepper_lockstep_failed: no flip for 60 s since the last flip or the
@@ -2338,9 +2345,11 @@ void pick_frame()
     }
     // what happens next (outside the pump mutex: native_close joins the pump thread)
     if (act != jspf::Act::None) std::fprintf(stderr, "[net] postgame: %s (%s)\n", jspf::act_name(act), outcome_text.c_str());
-    if (act == jspf::Act::LeaveGiveUp || act == jspf::Act::LeaveClose || act == jspf::Act::Lost) {
-        const bool self = act == jspf::Act::LeaveGiveUp;
-        u.notice = act == jspf::Act::Lost ? round_status : self ? "Back to the lobby: press Circle in the room to leave it" : outcome_text;
+    if (act == jspf::Act::LeaveGiveUp || act == jspf::Act::LeaveClose || act == jspf::Act::Lost || act == jspf::Act::Froze || act == jspf::Act::PeerFroze) {
+        const bool self = act == jspf::Act::LeaveGiveUp;   // FIX (pick7): a freeze (here or there) closes the link without giving the room up
+        u.notice = act == jspf::Act::Froze ? "This game stopped for a minute: the rollback link was closed"
+                 : act == jspf::Act::PeerFroze ? "The other player's game stopped responding: back to the room"
+                 : act == jspf::Act::Lost ? round_status : self ? "Back to the lobby: press Circle in the room to leave it" : outcome_text;
         u.notice_until = now + 6000;
         pk_drive(PkDrive::Off); g_pk_capture = 0;
         if (g_nat.link) { const uint64_t room = g_nat.room; native_close(self ? "post-game: this player left" : "post-game: the round ended without this link"); if (self) g_nat.given_up = room; }
