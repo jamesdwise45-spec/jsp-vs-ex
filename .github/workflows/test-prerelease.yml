@@ -1,0 +1,116 @@
+name: test-prerelease
+
+# FORK ONLY, never upstream: builds a friends' online TEST build and publishes it as a GitHub PRE-release of this fork.
+# Started by pushing a tag test-<version> (for example test-0.7.0-test1): a tag push runs the workflow file of the tagged
+# commit, so this file only has to be on the test branch, not on the default branch. <version> must equal installer/VERSION
+# of that commit (assemble_payload.py --release checks it); it is baked into release.txt, so the game's main menu, the
+# installer and the portable zip name all show it. The setup, the zip and SHA256SUMS are attached to the pre-release.
+#
+# The installer holds no game data: it builds the game on each player's PC from their own copy. No secrets are used:
+# installer.yml downloads only public, SHA-256-pinned files and the submodule is a public URL.
+
+on:
+  push:
+    tags: ['test-*']
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    if: github.repository != 'Tsamiuy/jsp-vs-ex'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - name: Version from the tag
+        id: v
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG#test-}"
+          # The same characters and length the game's version line accepts (jsp_version_line.h valid_version), as X.Y.Z[-suffix].
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$ ]] || [ "${#version}" -gt 24 ]; then
+            echo "tag '$TAG' does not give a version X.Y.Z or X.Y.Z-suffix (24 characters at most)"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "test build $version"
+
+  build:
+    needs: version
+    permissions:
+      contents: read
+    uses: ./.github/workflows/installer.yml
+    with:
+      portable: true
+      keep_days: 14
+      release_version: ${{ needs.version.outputs.version }}
+
+  prerelease:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write   # create the pre-release
+      actions: read     # download this run's artifact
+    steps:
+      - name: Create the pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # The jsp-installer-<sha> artifact of this run (the GitHub CLI, so no extra action and no checkout are needed).
+          gh run download "$GITHUB_RUN_ID" --name "jsp-installer-$GITHUB_SHA" --dir files
+          ls -l files
+          test -f files/jsp-setup.exe
+          test -f "files/jsp-$VERSION-portable.zip"
+          test -f files/SHA256SUMS
+          cat > notes.md <<EOF
+          Online test build $VERSION of draft PR Tsamiuy/jsp-vs-ex#248 (rollback for Online Battle). Not an official release of the project.
+
+          ## New in test5
+
+          - **No more stutter in the first online fights.** New graphics are now prepared in the background during online fights, so a player whose game has not seen a character or effect yet no longer pauses both players. In tests with a fresh install on one side: pauses 51 -> 0, slow seconds 32 -> 6-9, audio gaps 66 -> 2-5. An effect may be missing for a moment the first time it appears. The offline warm-up is now optional.
+
+          Everything from test4 is still here:
+
+          - **Uninstall test3 first.** Two copies side by side was the top problem in test3: the shortcut started the old one and rollback quietly stayed off. The main menu's lower right corner must say 0.7.0-test4 on both PCs.
+          - **Warm-up fights are safe.** In test3, a player who had already played a fight (for example the offline warm-up) could get "Desync detected" as the online match started. The sync check compared memory addresses that differ between game sessions; it now compares only the fight itself. Play the warm-up and go straight to Online Battle.
+          - **Host freeze fixed.** A host's game could freeze mid-fight and never come back. test4 notices that freeze and recovers within about a second; if it ever cannot, the match ends after a minute instead of hanging.
+          - **Smoother sound.** Online fights keep a bigger sound buffer, never drop sound, and fade over short game stalls instead of cutting out. Fight sound is about 20 ms later; menus and offline are unchanged.
+          - **Version message.** When both players run test4 or later and their versions differ, both see it in the room: "The other player is on 0.7.0-test3; you're on 0.7.0-test4." (Against a test3 copy, the test4 player may only see it after up to 2 minutes.)
+          - **F9 must be held.** A tap of F9 (for example a recording hotkey) no longer cancels rollback; holding F9 for 1.5 s still ends the match. Keep push-to-talk off F9.
+
+          **Is rollback on?** During the fight you see the ping in ms under the timer (for example \`62 ms\`). No ms counter = no rollback: check the version in the main menu corner and make a new room.
+
+          ## Still in this build from test2 and test3
+
+          - Each player controls their own fighter, and the joining player's buttons work on both PCs.
+          - Cheaper rollbacks, an input delay that follows the connection, and rollbacks of at most 6 frames.
+
+          ## Quick start
+
+          1. Download **jsp-setup.exe** below and run it (or unpack the portable zip outside Program Files and run \`run.cmd\`). Windows SmartScreen may warn about an unsigned program: choose "More info" > "Run anyway".
+          2. Setup asks for your own disc folder (US disc) and your own decrypted \`EBOOT.elf\`, then builds the game on your PC (several minutes; longer on an older PC).
+          3. Start the game and play one offline Free Battle (1 Player, 2 vs 2) with the characters you plan to use online. It builds their graphics ahead of time, so online fights do not stall.
+          4. Online: Main Menu > Battle Modes > Online Battle > Friendly Match. One player picks **Create a Room**, the other **Search for a Room** and joins it. The host starts the fight.
+          5. When the fight starts you see \`Rollback on: direct connection\` (or \`connected through the server\`), and the ping in ms under the timer. After the match both players return to the room and the host starts the next fight.
+
+          Online works out of the box: a public test server (re-psn), a random name (change it in the settings window, Online tab) and rollback are already set. No IP addresses or port forwarding needed. If Windows asks to allow the game through the firewall, click **Allow access**.
+
+          ## Limits of this build
+
+          - Online is 2 vs 2; each player has 1 fighter + 1 support and COM fighters fill the rest. The two players are on opposite teams.
+          - Only the host can pick characters (the game's own Friendly Match room); the joiner is on Random Select.
+          - Sudden freezes in the connection itself (100+ ms with no data) can still cause a short hitch.
+
+          If something goes wrong, run \`support-bundle.cmd\` in the install folder and send the file it makes. Everyone in a match must use this same build (the main menu shows $VERSION). SHA256SUMS lists each file's hash. Full guide and troubleshooting: ONLINE-GUIDE.md in the install folder. No game data is included: the game is built on your PC from your own copy.
+          EOF
+          gh release create "$TAG" --prerelease --draft --verify-tag --title "J-Stars Victory VS EX online test $VERSION" \
+            --notes-file notes.md files/jsp-setup.exe "files/jsp-$VERSION-portable.zip" files/SHA256SUMS
