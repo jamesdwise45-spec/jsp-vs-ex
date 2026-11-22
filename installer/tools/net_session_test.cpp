@@ -258,7 +258,9 @@ int main(int argc, char** argv)
         const uint64_t now = (uint64_t)since() + 1;
         const jpdr::Decision d = jpdr::step(ads, adp, now, [&] {
             const SessionStats st = s.stats();
-            jpdr::Reading r; r.ping_avg = st.ping_ms; r.jitter = st.jitter_ms; r.last_ping = st.last_ping_ms; r.rtt_seq = st.rtt_seq; r.cur = st.local_delay;
+            // ENHANCEMENT (worst remote): the worst remote slot's numbers, as jsp_net_game.cpp adapt_delay reads them
+            jpdr::Reading r; r.ping_avg = st.worst_ping_ms; r.jitter = st.worst_jitter_ms; r.last_ping = st.worst_last_ping_ms; r.rtt_seq = st.worst_rtt_seq;
+            r.cur = st.local_delay;
             return r;
         });
         if (d.want < 0 || d.want == d.cur) return;
@@ -383,8 +385,10 @@ int main(int argc, char** argv)
     const double min_rate = atof(arg(argc, argv, "--min-rate", "0")), min_all = atof(arg(argc, argv, "--min-all-rate", "0"));
     const SessionStats st = s.stats();
     if (adapt_on)
-        std::printf("ADAPTED delay=%d changes=%d slow_state=%d slow_n=%d slow_min=%.1f ping=%.1f last_ping=%.1f rtt_seq=%u\n", (int)st.local_delay, adapt_changes,
-                    ads.slow_state, ads.slow_n, ads.slow_min, st.ping_ms, st.last_ping_ms, st.rtt_seq);
+        std::printf("ADAPTED delay=%d changes=%d slow_state=%d slow_n=%d slow_min=%.1f ping=%.1f last_ping=%.1f rtt_seq=%u worst_ping=%.1f worst_last_ping=%.1f "
+                    "worst_rtt_seq=%u worst_slot=%d first_remote=%u taken=%u\n", (int)st.local_delay, adapt_changes, ads.slow_state, ads.slow_n, ads.slow_min,
+                    st.ping_ms, st.last_ping_ms, st.rtt_seq, st.worst_ping_ms, st.worst_last_ping_ms, st.worst_rtt_seq, st.worst_slot,
+                    plan.local_first == 0 ? (unsigned)plan.local_count : 0u, ads.rtt_taken);
     std::printf("SUMMARY role=%s slots=%u..%u/%u maxtick=%u rollbacks=%u maxdepth=%u resim=%llu saves=%llu loads=%llu stalls=%u deferred=%llu desync=%d failed=%s "
                 "ref_ticks=%d ref_bad=%d tail_neutral=%d rate=%.3f all_rate=%.3f iters=%llu paced=%llu paced_ms=%llu keepalive_polls=%llu sent=%llu dropped=%llu skipped=%llu round=%d/%d events:%s\n",
                 role.c_str(), plan.local_first, plan.local_first + plan.local_count - 1, plan.total_players, max_tick, st.rollbacks, st.max_rollback_frames,

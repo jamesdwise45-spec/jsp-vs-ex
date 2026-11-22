@@ -536,6 +536,8 @@ std::string path_word() { const int k = g.path_kind.load(); return k == 1 ? "dir
 // ENHANCEMENT (slow-link start, host simulation net_four_sim): rule 2 starts at 3 ticks, before its first reading at 4 s, when the round trips seen from the sync are
 // all 100 ms or more, measured (JSP_INPUT_DELAY_AUTO_SLOW_START=0 turns it off; _SLOW_START_MS, _SLOW_START_DELAY, _SLOW_START_SAMPLES). Each PC decides for its own
 // delay, as above; see jsp_net_delay_rule.h.
+// ENHANCEMENT (worst remote, 2v2): the rule reads the worst remote slot's round trips (SessionStats::worst_*), not the first remote's: with 4 PCs a far third
+// PC was never seen. With one remote PC nothing changes.
 // FIX (fight-start stall, runs native-rb1/rb2: the first reading of a match said ping 243-416 ms on a 60 ms link and jumped the delay to 4): see the guard above.
 // FIX (ping includes the answer wait): GekkoNet answers a ping at its next poll, once a tick, so the measured round trip carries up to one tick (33 ms) of
 // waiting that is no network time (rb1: 30 ms each way measured 94-100 ms); the rule takes up to half the round trip, capped at one tick, off before halving.
@@ -623,7 +625,9 @@ void adapt_delay(uint64_t now)
     jpdr::note_time(g_ad, now, g.bv.delay);   // ENHANCEMENT (rematch carry): the time at each delay, for jpdr::settled at the match end
     const jpdr::Decision d = jpdr::step(g_ad, g_ad_p, now, [] {
         const SessionStats st = g.sess.stats();
-        jpdr::Reading r; r.ping_avg = st.ping_ms; r.jitter = st.jitter_ms; r.last_ping = st.last_ping_ms; r.rtt_seq = st.rtt_seq; r.cur = st.local_delay;
+        // ENHANCEMENT (worst remote, 2v2): the worst remote slot's numbers (one remote PC: the same as ping_ms .. rtt_seq; see jsp_net_delay_rule.h)
+        jpdr::Reading r; r.ping_avg = st.worst_ping_ms; r.jitter = st.worst_jitter_ms; r.last_ping = st.worst_last_ping_ms; r.rtt_seq = st.worst_rtt_seq;
+        r.cur = st.local_delay;
         r.stretch_us = jpdr::stretch_recent(g_ts_peak_us, g_ts_peak_ms, GetTickCount64());   // FIX (depth trigger vs a slow peer): 0 when over ~1 s old
         return r;
     });

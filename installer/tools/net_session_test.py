@@ -200,6 +200,11 @@ def adapt_check(kind, ho, co):
     for who, out in adapting:
         d, sl = done(out), slow(out)
         if d is None: f.append(f"{who}: no ADAPTED line"); continue
+        # ENHANCEMENT (worst remote): with one remote PC the worst remote is the first one, with the same numbers (rtt_seq tagged with its slot)
+        ws, rs = int(d["worst_rtt_seq"]), int(d["rtt_seq"])
+        if (d["worst_ping"], d["worst_last_ping"]) != (d["ping"], d["last_ping"]) or d["worst_slot"] != d["first_remote"] or ws & 0xFFFFFF != rs or (ws >> 24) != int(d["first_remote"]) + 1:
+            f.append(f"{who}: the worst remote is not the one remote: " + " ".join(f"{k}={d[k]}" for k in ("ping", "worst_ping", "last_ping", "worst_last_ping", "rtt_seq", "worst_rtt_seq", "worst_slot", "first_remote")))
+        if int(d["taken"]) < 5: f.append(f"{who}: only {d['taken']} round trips entered the window")
         if kind in ("adapt_slow", "adapt_one_side"):
             if len(sl) != 1: f.append(f"{who}: {len(sl)} slow-link start lines, expected 1"); continue
             if (sl[0]["from"], sl[0]["to"]) != ("2", "3"): f.append(f"{who}: slow-link start {sl[0]['from']} -> {sl[0]['to']}, expected 2 -> 3")

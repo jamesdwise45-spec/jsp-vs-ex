@@ -283,7 +283,13 @@ struct SessionStats {
     float last_ping_ms = -1;                 // ENHANCEMENT (adaptive input delay, rule 2): GekkoNet's last single round trip to that player (one every 500 ms)
     uint32_t rtt_seq = 0;                    // FIX (RTT sampling): round trips measured so far for that player (GekkoNet's count, +1 per ping answer): a reader
                                              // that sees the same count again has no new round trip, whatever last_ping_ms says
-    int32_t acked_frame = -1;                // ENHANCEMENT (match perf summary): the newest frame of this PC's input that player acknowledged (-1 none)
+    // ENHANCEMENT (worst remote, 2v2): the same four for the WORST remote slot (jpdr::worst_of in jsp_net_delay_rule.h: the largest average + 2 x jitter),
+    // which the adaptive input delay reads: this PC's inputs must reach every other PC in time. worst_rtt_seq carries the slot in its top byte (a count is
+    // per remote). With one remote PC: the numbers above. The fields above stay the first remote's (the ping counter, the perf summary's acks).
+    float worst_ping_ms = -1, worst_jitter_ms = 0, worst_last_ping_ms = -1;
+    uint32_t worst_rtt_seq = 0;
+    int worst_slot = -1;                     // -1: no remote with a known round trip
+    int32_t acked_frame = -1;               // ENHANCEMENT (match perf summary): the newest frame of this PC's input that player acknowledged (-1 none)
     uint8_t local_delay = 0;                  // the input delay this peer's local players run with now
     uint64_t keepalive_polls = 0;            // polls made by the keepalive thread (the game thread was busy)
 };

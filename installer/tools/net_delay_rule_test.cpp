@@ -30,9 +30,11 @@ struct Sim {
     int changes = 0; const char* last_why = "";
     struct Seen { uint64_t t; int cur, want; double ping, spread, need; };
     std::vector<Seen> seen;   // every trip reading (the decision's inputs), for the equivalence check
+    std::function<jpdr::Reading(uint64_t)> reader;   // set: the reading comes from here (several remotes, worst_of), at ms since start
     jpdr::Reading read()
     {
         reads++;
+        if (reader) { jpdr::Reading r = reader(t - t0); r.cur = cur; return r; }
         if (fresh_every_poll) { seq++; last = rtt(t - t0); }
         else if (pings) { const uint32_t k = (uint32_t)((t - t0) / ping_every) + 1; if (k != seq) { seq = k; last = rtt(t - t0); } }
         jpdr::Reading r; r.ping_avg = avg; r.jitter = jit; r.last_ping = last; r.rtt_seq = seq; r.cur = cur; r.stretch_us = stretch; return r;
@@ -284,6 +286,72 @@ int main()
         CHECK(hi == 3);
         m.run(4000);
         CHECK(m.cur == 4);   // (300 - 33.3) / 2 + 16 = 149 -> 5, capped at MAX 4
+    }
+    // ENHANCEMENT (worst remote): worst_of picks the largest average + 2 x jitter of the remotes with a known average and reports that remote's own numbers
+    {
+        jpdr::Remote r[3];
+        r[0].slot = 1; r[0].ping_avg = 60; r[0].jitter = 5; r[0].last_ping = 61; r[0].rtt_count = 9;
+        r[1].slot = 2; r[1].ping_avg = 62; r[1].jitter = 4; r[1].last_ping = 58; r[1].rtt_count = 8;
+        r[2].slot = 3; r[2].ping_avg = 150; r[2].jitter = 6; r[2].last_ping = 155; r[2].rtt_count = 7;
+        jpdr::Reading w = jpdr::worst_of(r, 3, 2);
+        CHECK(w.ping_avg == 150 && w.jitter == 6 && w.last_ping == 155 && w.cur == 2);
+        CHECK(w.rtt_seq == ((4u << 24) | 7u));   // slot 3's own count, tagged with its slot
+        // the jitter counts: 100 +- 30 is worse than 130 +- 2
+        jpdr::Remote j[2]; j[0].slot = 0; j[0].ping_avg = 130; j[0].jitter = 2; j[0].last_ping = 131; j[1].slot = 1; j[1].ping_avg = 100; j[1].jitter = 30; j[1].last_ping = 140;
+        CHECK(jpdr::worst_of(j, 2, 2).last_ping == 140);
+        // a tie keeps the earlier (the slots of one PC share their stats); a remote with no average yet is skipped; none known: no ping, no round trip
+        jpdr::Remote t[3]; t[0].slot = 1; t[0].ping_avg = -1; t[0].last_ping = 300; t[0].rtt_count = 1;
+        t[1].slot = 2; t[1].ping_avg = 90; t[1].last_ping = 91; t[1].rtt_count = 4; t[2] = t[1]; t[2].slot = 3;
+        CHECK((jpdr::worst_of(t, 3, 2).rtt_seq >> 24) == 3u);   // slot 2 (tag 3), not slot 3
+        jpdr::Reading none = jpdr::worst_of(t, 1, 2);
+        CHECK(none.ping_avg < 0 && none.last_ping < 0 && none.rtt_seq == 0);
+        // one remote: rtt_seq moves exactly when its count does (the RTT sampling fix unchanged)
+        jpdr::Remote o; o.slot = 1; o.ping_avg = 100; o.last_ping = 100; o.rtt_count = 5;
+        const uint32_t a = jpdr::worst_of(&o, 1, 2).rtt_seq; o.last_ping = 120;
+        const uint32_t b = jpdr::worst_of(&o, 1, 2).rtt_seq; o.rtt_count = 6;
+        const uint32_t c = jpdr::worst_of(&o, 1, 2).rtt_seq;
+        CHECK(a == b && b != c);
+    }
+    // 2v2 with one far pair: this PC (slot 0) is at 60 ms from slots 1 and 2 but 150 ms from slot 3. The first remote alone (today's reading) settles at 1
+    // tick; the worst remote starts at 3 (slow-link start on the far round trips) and rule 2 keeps 3 ((150 - 33.3) / 2 + 16 = 74 ms)
+    {
+        auto mesh = [](uint64_t t, bool worst) {
+            jpdr::Remote r[3];
+            const double rtt[3] = {60, 62, 150}; const uint64_t off[3] = {0, 170, 340};   // each remote answers every 500 ms, at its own phase
+            for (int i = 0; i < 3; i++) {
+                r[i].slot = i + 1; r[i].ping_avg = rtt[i]; r[i].jitter = 3;
+                r[i].rtt_count = (uint32_t)((t + off[i]) / 500) + 1; r[i].last_ping = rtt[i] + (double)(r[i].rtt_count % 3);
+            }
+            return worst ? jpdr::worst_of(r, 3, 0) : jpdr::worst_of(r, 1, 0);   // the first remote only = today's stats()
+        };
+        Sim w; w.p.clamp(); w.reader = [&](uint64_t t) { return mesh(t, true); };
+        w.run(1500);
+        CHECK(w.cur == 3); CHECK(std::string(w.last_why) == "slow link"); CHECK(w.s.slow_min >= 150.0);
+        w.run(40000);
+        CHECK(w.cur == 3);
+        CHECK(w.s.n == 16); { float v[jpdr::kMaxSamples]; for (int i = 0; i < w.s.n; i++) v[i] = w.s.rtt[i]; CHECK(jpdr::percentile(v, w.s.n, 50) >= 150); }
+        // only the far remote's new answers entered the window: one per 500 ms, although the near remotes answered in between
+        CHECK(w.s.rtt_taken >= 76 && w.s.rtt_taken <= 82);   // the far answers from 2 s (samples kept) to 41.5 s: about 80; all three remotes: about 240
+        Sim f; f.p.clamp(); f.reader = [&](uint64_t t) { return mesh(t, false); };
+        f.run(41500);
+        CHECK(f.cur == 1); CHECK(f.s.slow_min < 80);
+    }
+    // the worst remote changes (a far PC's first answer comes late): its round trips take over the window, each counted once
+    {
+        Sim m; m.p.clamp(); m.cur = 1;
+        m.reader = [](uint64_t t) {
+            jpdr::Remote r[2];
+            r[0].slot = 1; r[0].ping_avg = 40; r[0].jitter = 2; r[0].rtt_count = (uint32_t)(t / 500) + 1; r[0].last_ping = 40;
+            r[1].slot = 2; if (t >= 8000) { r[1].ping_avg = 160; r[1].jitter = 2; r[1].rtt_count = (uint32_t)((t - 8000) / 500) + 1; r[1].last_ping = 160; }
+            return jpdr::worst_of(r, 2, 0);
+        };
+        m.run(7900);
+        CHECK(m.cur == 1);   // 40 ms: no slow-link start, and rule 2 wants 1
+        const uint32_t taken = m.s.rtt_taken;
+        m.run(4100);         // to 12 s: the far PC answered at 8.0, 8.5, .. 11.5 s
+        CHECK(m.s.rtt_taken - taken >= 7 && m.s.rtt_taken - taken <= 9);
+        m.run(20000);
+        CHECK(m.cur >= 3);   // (160 - 33.3) / 2 + 16 = 79 ms -> 3
     }
     // the range: MAX caps every decision
     {

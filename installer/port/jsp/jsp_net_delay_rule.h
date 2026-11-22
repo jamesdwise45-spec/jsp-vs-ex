@@ -44,6 +44,9 @@
 // before 10 s a reading still goes no higher than the manifest's delay + 1. Rule 2 lowers it later as usual (five calm readings) if the link does not need it.
 // Each PC decides from its own round trips and sets only its own delay, as every other decision here: the two PCs need not agree (a PC near 100 ms may stay
 // at 2 while the other goes to 3), and that is the same per-side asymmetry the rule already makes all match long.
+// ENHANCEMENT (worst remote, 2v2): the reading is the worst remote's (worst_of below), not the first remote's. This PC's inputs must reach every other PC
+// in time, and with the first remote only a far third PC was never seen (simulator, not measured: 2v2 at 60 ms with one pair at 150 ms, frames over 40 ms per minute per PC 19.53 -> 3.15 with both changes).
+// Rule 2 and the slow-link start both read it; with one remote PC it is that PC, as before.
 #pragma once
 #include <algorithm>
 #include <cmath>
@@ -109,6 +112,30 @@ struct Params {
 // trips it measured so far (rtt_seq: last_ping is new only when this moved), this peer's delay, and the time sync's stretch of this PC's ticks (us, the
 // largest in about the last second; > 0 only while this PC runs ahead of the other).
 struct Reading { double ping_avg = -1, jitter = 0, last_ping = -1; uint32_t rtt_seq = 0; int cur = 0; uint32_t stretch_us = 0; };
+
+// ENHANCEMENT (worst remote): one remote slot's GekkoNet stats, as NetSession::stats() reads them (gekko_network_stats per remote slot).
+struct Remote { int slot = 0; double ping_avg = -1, jitter = 0, last_ping = -1; uint32_t rtt_count = 0; };
+
+// The worst remote of n: the largest average round trip + 2 x jitter (the 4-player simulation's measure of a link) among the remotes with a known average;
+// a tie keeps the earlier one (the slots of one PC share their stats, and equal links must not flap). Its average, jitter, last single round trip and count
+// are reported together, so rule 2's window holds that one link's round trips. The count is per remote, so rtt_seq carries the slot in its top byte: when the
+// worst remote changes, the new one's last round trip enters as new (it is a measured round trip of the link that now decides), and from then on only its
+// new answers do, as with one remote (the RTT sampling fix). With one remote it changes exactly when that remote's count does, as before.
+// No remote with a known average: no ping and no single round trip (step() takes no sample).
+inline Reading worst_of(const Remote* r, int n, int cur)
+{
+    Reading w; w.cur = cur;
+    int best = -1;
+    for (int i = 0; i < n; i++) {
+        if (r[i].ping_avg <= 0) continue;
+        if (best < 0 || r[i].ping_avg + 2 * r[i].jitter > r[best].ping_avg + 2 * r[best].jitter) best = i;
+    }
+    if (best < 0) return w;
+    const Remote& b = r[best];
+    w.ping_avg = b.ping_avg; w.jitter = b.jitter; w.last_ping = b.last_ping;
+    w.rtt_seq = ((uint32_t)(b.slot + 1) << 24) | (b.rtt_count & 0xFFFFFFu);
+    return w;
+}
 
 struct Decision {
     int want = -1;                // >= 0: set this delay now (differs from Reading::cur)

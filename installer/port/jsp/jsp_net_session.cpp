@@ -1,6 +1,7 @@
 // jsp_net_session.cpp -- see jsp_net_session.h. GekkoNet [src:gekkonet] (BSD-2-Clause, Jamie Meyer) is linked as a static library built
 // WITHOUT its asio adapter (GEKKONET_NO_ASIO): the transport here is our own UdpMux (a decision of this port).
 #include "jsp_net_session.h"
+#include "jsp_net_delay_rule.h"   // ENHANCEMENT (worst remote): jpdr::worst_of, the pick the host simulator runs too
 
 #include <gekkonet.h>
 
@@ -810,12 +811,21 @@ SessionStats NetSession::stats() const
         s.rollbacks = r.total_count; s.max_rollback_frames = r.max_frames; s.stalls = r.total_stalls;
         s.frames_ahead = gekko_frames_ahead((GekkoSession*)gs_);
         s.local_delay = cur_delay_;
-        for (unsigned sl = 0; sl < plan_.total_players; sl++) {
+        jpdr::Remote rem[4]; int nrem = 0;   // ENHANCEMENT (worst remote): every remote slot (at most 4 players, start())
+        for (unsigned sl = 0; sl < plan_.total_players && nrem < 4; sl++) {
             if (sl >= plan_.local_first && sl < (unsigned)plan_.local_first + plan_.local_count) continue;
             GekkoNetworkStats ns{}; gekko_network_stats((GekkoSession*)gs_, (int)sl, &ns);
-            if (ns.avg_ping > 0) { s.ping_ms = ns.avg_ping; s.jitter_ms = ns.jitter; s.last_ping_ms = ns.last_ping; }
-            s.rtt_seq = ns.rtt_count; s.acked_frame = ns.last_acked_frame;
-            break;
+            if (nrem == 0) {   // the first remote, as before
+                if (ns.avg_ping > 0) { s.ping_ms = ns.avg_ping; s.jitter_ms = ns.jitter; s.last_ping_ms = ns.last_ping; }
+                s.rtt_seq = ns.rtt_count; s.acked_frame = ns.last_acked_frame;
+            }
+            jpdr::Remote& r = rem[nrem++];
+            r.slot = (int)sl; r.ping_avg = ns.avg_ping; r.jitter = ns.jitter; r.last_ping = ns.last_ping; r.rtt_count = ns.rtt_count;
+        }
+        const jpdr::Reading w = jpdr::worst_of(rem, nrem, cur_delay_);
+        if (w.ping_avg > 0) {
+            s.worst_ping_ms = (float)w.ping_avg; s.worst_jitter_ms = (float)w.jitter; s.worst_last_ping_ms = (float)w.last_ping; s.worst_rtt_seq = w.rtt_seq;
+            s.worst_slot = (int)(w.rtt_seq >> 24) - 1;
         }
     }
     return s;
