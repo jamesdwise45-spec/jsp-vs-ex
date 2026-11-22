@@ -129,6 +129,8 @@ jobs:
           RELEASE_VERSION: ${{ inputs.release_version }}
         run: |
           $rel = @(); if ($env:RELEASE_VERSION) { $rel = @('--release', $env:RELEASE_VERSION) }
+          # FORK TEST BUILD ONLY (tester-defaults.diff, never upstream): the friends' test service, offered in the settings window's Online tab (one click).
+          if (Test-Path installer/test-online-service.ini) { $rel += @('--online-service', 'installer/test-online-service.ini') }
           python installer\tools\assemble_payload.py @rel
           if ($LASTEXITCODE -ne 0) { exit 1 }
           & $env:ISCC "/DPayload=$PWD\build\installer\payload" "/O$PWD\build\installer\out" "$PWD\installer\jsp.iss"

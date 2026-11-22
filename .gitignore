@@ -157,6 +157,7 @@ __pycache__/
 !/installer/README.md
 !/installer/VERSION
 !/installer/jsp.iss
+!/installer/test-online-service.ini
 !/installer/launcher/
 /installer/launcher/*
 !/installer/launcher/launcher.c
