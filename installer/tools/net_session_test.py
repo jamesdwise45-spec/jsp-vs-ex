@@ -399,18 +399,43 @@ def check(kind, hs, cs, hr, cr, tmp, T):
     return f
 
 
+# CI: the scenarios run in N parts (net_session_test.sh SCRATCH K/N, one host-tests row each), so no row comes near the runner's 600 s limit per
+# test. Round robin over the scenarios in table order; the names in one GROUP (scenarios compared with each other) always run in the same part,
+# under the first name's turn. No part (the default, and --only) runs everything, as before.
+GROUP = {}
+
+
+def parse_part(s):
+    m = re.fullmatch(r"(\d+)/(\d+)", s or "")
+    if not m or not 1 <= int(m.group(1)) <= int(m.group(2)):
+        raise SystemExit(f"--part: expected K/N with 1 <= K <= N, got {s!r}")
+    return int(m.group(1)), int(m.group(2))
+
+
+def in_part(name, names, part):
+    if not part: return True
+    groups = []
+    for x in names:
+        g = GROUP.get(x, x)
+        if g not in groups: groups.append(g)
+    return groups.index(GROUP.get(name, name)) % part[1] == part[0] - 1
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--exe", required=True, help="the net_session_test binary (net_session_test.sh builds it and passes it here)")
     ap.add_argument("--only"); ap.add_argument("--ticks", type=int, default=600)
+    ap.add_argument("--part", help="K/N: only the K-th of N parts of the scenarios (CI runs each part as its own row)")
     ap.add_argument("--deadline", type=float, default=DEADLINE_S, help="seconds per scenario, both processes together (default %(default)s)")
     ap.add_argument("--replay-exe", help="the net_replay_test binary (the record_replay scenario)")
     a = ap.parse_args()
+    part = parse_part(a.part) if a.part else None
+    names = list(SCENARIOS)
     global REPLAY_EXE
     REPLAY_EXE = a.replay_exe
     fails = 0
     for name, (ha, ca, kind) in SCENARIOS.items():
-        if a.only and a.only != name: continue
+        if (a.only and a.only != name) or not in_part(name, names, part): continue
         with tempfile.TemporaryDirectory() as td:
             tmp = pathlib.Path(td)
             ex = ["--ticks", str(a.ticks), "--seed", "5"]
