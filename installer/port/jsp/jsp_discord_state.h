@@ -2,6 +2,7 @@
 // check them (installer/tools/discord_test.sh): the presence text from a given state, the join secret, and the join-request rules.
 #pragma once
 #include "jsp_discord.h"
+#include "jsp_unit_names.h"
 #include <cstdint>
 #include <cstdio>
 #include <string>
@@ -21,25 +22,9 @@ inline AppId app_id_setting(const std::string& v)
 constexpr size_t kSecretMax = 128;   // Discord's limit for a join secret
 constexpr size_t kTextMax = 128;     // and for details / state
 
-inline const char* char_name(int id)
-{
-    static const char* const k[42] = {
-        "Luffy", "Ace", "Hancock", "Akainu", "Naruto", "Sasuke", "Madara", "Goku", "Frieza", "Vegeta",
-        "Yusuke", "Toguro", "Hiei", "Toriko", "Zebra", "Ichigo", "Aizen", "Gon", "Killua", "Jotaro",
-        "Dio", "Dai", "Kenshin", "Shishio", "Seiya", "Kenshiro", "Raoh", "Oga & Baby Beel", "Gintoki Sakata", "Medaka",
-        "Ryotsu", "Arale & Gatchan", "Koro-sensei", "Saiki", "Momotaro", "Bo-bobo", "Tsuna & Reborn", "Luckyman", "Taro", "Jonathan",
-        "Joseph", "Nube"};
-    return id >= 0 && id < 42 ? k[id] : nullptr;
-}
-// The Support characters, ids 200..213 (docs/balance/Support.md; their CharacterName text is id - 200 + 42). 208 (Yoh) is a stub the
-// game never offers (13 Supports in the shop for 14 files); named anyway in case a save or a mod puts it in.
-inline const char* support_name(int id)
-{
-    static const char* const k[14] = {
-        "Neuro", "Kumagawa", "Rukia", "Chitoge", "Hisoka", "Edajima", "Kagura & Sadaharu", "Jaguar", "Yoh", "Kuroko",
-        "SKET Dance", "Lala", "Allen", "Hinata"};
-    return id >= 200 && id < 214 ? k[id - 200] : nullptr;
-}
+// The fighter (0..41) and Support (200..213) names live in jsp_unit_names.h (ENHANCEMENT: shared with the rollback pick, jsp_net_pick_flow.h).
+inline const char* char_name(int id) { return jnames::fighter_name(id); }
+inline const char* support_name(int id) { return jnames::support_name(id); }
 inline const char* stage_name(int i)
 {
     static const char* const k[12] = {

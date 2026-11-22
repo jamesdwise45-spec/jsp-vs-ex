@@ -48,6 +48,9 @@ struct LinkModel {
 };
 
 enum : uint8_t { kTagGekko = 'G', kTagMessage = 'M', kTagSettings = 'S', kTagHeartbeat = 'K' };
+// ENHANCEMENT (post-game / pick, jsp_net_pick_flow.h): the first byte of a message on the rollback link's settings channel ('S'), not a UdpMux tag;
+// the handshake's messages start with 'J' ("JSH1"), so these never collide. jsp_net_game.cpp routes them before the handshake objects.
+enum : uint8_t { kLinkTagPostgame = 'P', kLinkTagPick = 'C' };
 
 uint64_t now_ms();   // monotonic milliseconds (steady clock); timers only, never simulation
 

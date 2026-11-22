@@ -15,6 +15,9 @@
 //                             runs, and a "[net] status:" line every 30 s and at the end (jsp_net_badge.h; docs/ROLLBACK.md)
 //   JSP_ROLLBACK_ALLOW_DEBUG=1  test tooling only (WORKAROUND to replace): the handshake's debug-switch refusal is off (the two-instance test runs the auto-pilot route; both peers need the same fight
 //                             seed until the host's plan seed is applied to the game, see the doc)
+//   JSP_ROLLBACK_PICK=1       ENHANCEMENT (experimental, default 0 until a mapping run proves the game side; see "after the match" below and the TODO-MAPPING
+//                             notes): on a native-room link of 2 players (the 4-player mesh is not in this build), the after-match prompt (Fight again / Select character / Leave),
+//                             the pick round and the roster write at the battle builder (jsp_net_pick_flow.h, jsp_net_native.cpp). Every player needs the same value.
 // Flow: settings handshake on a pump thread (starts at once; survives scene loads) -> Started -> at the first fight tick the session starts: GekkoNet session,
 // stepper (frame base = that tick), snapshot ring as save/load (jsp_snapshot_ext_*), canonical pad table, handover() of the handshake on both sides.
 #include <cstdint>
@@ -37,6 +40,12 @@ extern "C" int jsp_net_notice(char*, int, char*, int) { return 0; }
 extern "C" unsigned jsp_net_notice_gen(void) { return 0; }
 extern "C" int jsp_net_presence(int* players, int* host) { *players = 0; *host = 0; return 0; }
 extern "C" unsigned long long jsp_net_presence_room(char* server, int sn) { if (server && sn > 0) server[0] = 0; return 0; }
+#include "jsp_net_pick_flow.h"   // ENHANCEMENT (post-game / pick): the calls of jsp_net_native.cpp, inert here
+extern "C" int jsp_pick_pair(jspf::PairOut*) { return 0; }
+extern "C" int jsp_pick_active(void) { return 0; }
+extern "C" int jsp_pick_enabled(void) { return 0; }
+extern "C" int jsp_pick_choose(int) { return 0; }
+extern "C" int jsp_pick_submit(unsigned, unsigned, int, int) { return 0; }
 #else
 
 #include <atomic>
@@ -72,6 +81,9 @@ static bool clock_diag() { static const bool v = [] { const char* e = std::geten
 #include "jsp_session_handshake.h"
 #include "jsp_net_match.h"   // ENHANCEMENT (same-link rematch): the match counter's session ids
 #include "jsp_net_native_fight.h"   // ENHANCEMENT (native fight takeover): arm / disarm around the rollback session
+#include "jsp_net_pick_flow.h"      // ENHANCEMENT (post-game / pick, JSP_ROLLBACK_PICK=1): the prompt, the pick round, the pair for the builder (pure, host-tested)
+#include "jsp_net_pick_drive.h"     // ENHANCEMENT (post-game / pick): the pad gate, the notice-box Cross, the joiner's Ready Cross (pure, host-tested)
+static_assert(jspf::kTagPostgame == jspnet::kLinkTagPostgame && jspf::kTagPick == jspnet::kLinkTagPick, "one set of link tags");
 #include "jsp_session_reader.h"
 #include "jsp_session_manifest.h"
 #include "jsp_mods_glue.h"   // rollback_gate, kModsNotAsListed (ENHANCEMENT, mods)
@@ -109,6 +121,9 @@ void jsp_fight_hash_native_online(int on);   // jsp_fight_hash.cpp (FIX, review 
 int jsp_fight_end_state(void);           // jsp_fight_hash.cpp (ENHANCEMENT, time-up): -1 unknown, 0 running, 1 red, 2 blue, 3 time up (winner not written yet)
 int jsp_fight_ko_winner(void);           // jsp_fight_hash.cpp (ENHANCEMENT, online match end): -1 unknown, 0 nobody yet, 1 red won, 2 blue won (guest words: rolled back)
 extern volatile int g_ko_track;          // jsp_game.cpp: 1 = find the KO counters even with the default KO count (a rollback match)
+extern void (*g_cellpad_filter)(uint32_t port_no, uint16_t* buttons, uint16_t* lx, uint16_t* ly);   // patch 6501 (ENHANCEMENT, post-game / pick: the prompt's pad)
+unsigned long long jsp_native_room_seen_ms(void);   // jsp_net_native.cpp (ENHANCEMENT, post-game / pick): when a room-page update last ran (0 = never)
+unsigned long long jsp_native_loading_seen_ms(void);   // jsp_net_native.cpp (FIX, mapping run U4): when the online loading scene last ran (0 = never)
 }
 
 namespace {
@@ -302,6 +317,11 @@ struct State {
     bool fresh_gate = false, last_end_ok = false;
     // FIX (review of PR 248): the pump thread ended this match's session on the frame clock's failure (pump_tick); cleared by start_session
     std::atomic<bool> stall_ended{false};
+    // ENHANCEMENT (post-game / pick, JSP_ROLLBACK_PICK=1): the prompt and the pick round of the open link (jsp_net_pick_flow.h), under the pump mutex. pick_link:
+    // this link was opened for a native room (conn_open; only those get the prompt). pk_*: what the prompt / picker layer draws (main thread, redraw).
+    jspf::Flow flow; bool pick_link = false;
+    struct PickPanel { std::string title; std::vector<std::string> rows; int sel = -1; std::vector<std::string> lines; std::string hint, band; } pk;
+    std::string pk_key;
 } g;
 // FIX (a missed KO): the KO / time-up winner of EVERY saved tick (commit and hash_only, predicted or not), keyed by tick; a re-save after a
 // rollback overwrites its entry and a rollback drops the entries after its target. The boundary ends the match on the earliest recorded winner whose tick is
@@ -356,8 +376,32 @@ uint32_t build_id()
 void redraw()
 {
     const std::string& s = g.shown; const std::string& b = g.badge_shown; const std::string& p = g.ping_shown;
-    if (s.empty() && b.empty() && p.empty()) { jsp_overlay_close(); return; }
+    const State::PickPanel& k = g.pk;
+    if (s.empty() && b.empty() && p.empty() && k.title.empty() && k.band.empty()) { jsp_overlay_close(); return; }
     if (!jsp_overlay_begin(1280, 720)) return;
+    const uint32_t white = JSP_RGBA(255, 255, 255, 255), gold = JSP_RGBA(240, 190, 30, 255);
+    if (!k.title.empty()) {   // ENHANCEMENT (post-game / pick): the prompt / picker panel in the Port Settings page's look (navy panel, gold rules, the menu font's off / on labels)
+        const int rows = (int)k.rows.size(), lines = (int)k.lines.size();
+        const int h = 96 + rows * 56 + lines * 32 + (k.hint.empty() ? 0 : 40), y0 = (720 - h) / 2;
+        jsp_overlay_fill_rect(340, y0, 600, h, JSP_RGBA(16, 20, 40, 235));
+        jsp_overlay_fill_rect(340, y0, 600, 6, gold);
+        jsp_overlay_fill_rect(340, y0 + h - 6, 600, 6, gold);
+        jsp_overlay_text_style(370, (float)(y0 + 28), k.title.c_str(), 1.2f, white, 0);
+        for (int i = 0; i < rows; i++) {
+            const int y = y0 + 92 + i * 56;
+            const bool on = i == k.sel;
+            if (on) jsp_overlay_fill_rect(360, y - 12, 560, 48, JSP_RGBA(255, 255, 255, 235));
+            jsp_overlay_text_style(390, (float)y, k.rows[(size_t)i].c_str(), 1.0f, white, on ? 1 : 0);
+        }
+        for (int i = 0; i < lines; i++) jsp_overlay_text_style(370, (float)(y0 + 92 + rows * 56 + i * 32), k.lines[(size_t)i].c_str(), 0.7f, i == 0 ? white : gold, 0);
+        if (!k.hint.empty()) jsp_overlay_text_style(370, (float)(y0 + h - 40), k.hint.c_str(), 0.55f, white, 0);
+    }
+    if (!k.band.empty()) {   // one line above the message line (the notice band's colours)
+        const float w = jsp_overlay_text_width(k.band.c_str(), 0.8f);
+        jsp_overlay_fill_rect(30, 576, (int)(w > 0 ? w : 700) + 40, 46, JSP_RGBA(16, 20, 40, 225));
+        jsp_overlay_fill_rect(30, 618, (int)(w > 0 ? w : 700) + 40, 4, gold);
+        jsp_overlay_text_style(50, 588, k.band.c_str(), 0.8f, white, 0);
+    }
     if (!b.empty()) {
         const float bw = jsp_overlay_text_width(b.c_str(), jpnb::kScale);
         jsp_overlay_fill_rect(jpnb::kBoxX, jpnb::kBoxY, (int)(bw > 0 ? bw : 360) + 2 * jpnb::kBoxPad, jpnb::kBoxH, JSP_RGBA(0, 0, 0, 160));
@@ -399,6 +443,9 @@ std::string path_word() { const int k = g.path_kind.load(); return k == 1 ? "dir
 // FIX (ping includes the answer wait): GekkoNet answers a ping at its next poll, once a tick, so the measured round trip carries up to one tick (33 ms) of
 // waiting that is no network time (rb1: 30 ms each way measured 94-100 ms); the rule takes up to half the round trip, capped at one tick, off before halving.
 // FIX (delay flapping, two-copy run native-rb1: 2 -> 3 -> 2 every 6-10 s on a steady 30 ms link): lowering needs five calm readings (10 s) in both rules.
+// ENHANCEMENT (post-game / pick): JSP_ROLLBACK_PICK=1 (jspf::key_on), read once; default 0 = no prompt, no pick, no roster write (today's behaviour).
+bool pick_on() { static int v = -1; if (v < 0) { char b[8] = {}; v = jsp_setting_get(jspf::kKey, b, sizeof b) && jspf::key_on(b) ? 1 : 0; } return v == 1; }
+std::atomic<int> g_pick_active{0};   // jsp_pick_active(): a pair is applied at the coming build (read on guest threads; written by pick_frame)
 jpdr::State g_ad;   // per match (reset_match)
 int g_ad_on = -1;   // the switches are read once per process
 jpdr::Params g_ad_p;
@@ -861,14 +908,22 @@ void end_with(const std::string& text, bool quiet = false)
     jsp_stepper_abort();
     jsp_stepper_net_disable();
     jsp_snapshot_ext_session_end();   // FIX (same-link rematch, run native-rm1): the snapshot ring of this session goes; the next match baselines afresh at its tick 1
-    if (jkr::normal_end(text)) jsp_native_fight_end_normal();   // FIX (rematch black screen): a normal end lets the share pad watchdog act on the exit
+    // FIX (rematch black screen) + ENHANCEMENT (post-game / pick): ONE test of a normal end (an agreed KO / time-up hand-back, "Match over..."). The watchdog's flag
+    // is set BEFORE the disarm below (the disarm consumes it and opens the watchdog's scope); the pick prompt opens AFTER the disarm, on the same test,
+    // so every match whose prompt opens also has the watchdog armed for the native exit that runs under the prompt.
+    const bool normal_end = jkr::normal_end(text);   // jsp_net_ko_rule.h: the same test the disconnect / KO end rule's texts are built for
+    if (normal_end) jsp_native_fight_end_normal();
     jsp_native_fight_arm(0);   // ENHANCEMENT (native fight takeover): after the last tick (reset_match below does it again; a no-op when not armed)
     { std::lock_guard<std::mutex> lk(g.pump.mutex()); if (g.host && g.mh) g.mh->end_match(); else if (!g.host && g.mc) g.mc->match_ended(); }
     log("ended", text);
+    if (normal_end) {   // ENHANCEMENT (post-game / pick): a normal end of a native-room link opens the prompt (seq = this match, the same on every PC)
+        std::lock_guard<std::mutex> lk(g.pump.mutex());
+        if (g.flow.is_open()) { g.flow.match_over((uint16_t)g.match_k, now_ms()); std::fprintf(stderr, "[net] postgame: prompt open (match %u, %d players)\n", g.match_k, g.flow.players()); }
+    }
     if (quiet) set_text(""); else show(text);   // quiet: the rendezvous texts are on the main menu's notice (jsp_net_notice); the message line stays empty so it does not clear that layer
     g.ended_ms = GetTickCount64();   // ENHANCEMENT (lobby): the session is stopped kLingerMs from now (boundary)
     // ENHANCEMENT (same-link rematch): a match that ran ended inside its fight; a re-armed match waits until that fight is gone (boundary, fresh_gate)
-    g.last_end_ok = text == "Match ended" || text.rfind("Match over", 0) == 0;
+    g.last_end_ok = text == "Match ended" || normal_end;
     if (g.started_ms) g.fresh_gate = true;
     reset_match();
 }
@@ -921,6 +976,12 @@ uint64_t random_session_id()
 // ---- the pump thread: rendezvous, handshake objects, handshake driving (everything under the pump mutex) ----------------------------------------------------------
 void pump_tick(uint64_t t)
 {
+    // ENHANCEMENT (post-game / pick): before the ended-match return below (the prompt runs after the match); the one remote: peer 1 from the host, peer 0 from the client
+    // (2 players; the 4-player mesh is not in this build)
+    if (g.phase.load() != Phase::Off && g.link && g.flow.is_open()) {
+        if (g.phase.load() == Phase::Running) g.flow.fight_running();
+        g.flow.pump(t, [](const uint8_t* b, size_t n) { g.link->send(g.host ? 1 : 0, b, n); });
+    }
     if (g.phase.load() == Phase::Off || g.m2_ended.load()) return;   // once ended nothing more is logged or driven (no 10 lines a second after a refusal)
     // FIX (review of PR 248, the freeze timeout's owner): the frame clock's failure (jsp_stepper_lockstep_failed: no flip for 60 s since the last flip or the
     // clock's start, or a vblank not taken for 60 s) was consumed only at the tick boundary, on the game thread a stalled guest never gives back, while the
@@ -990,6 +1051,19 @@ void pump_tick(uint64_t t)
             if (g.mc->join(g.plan.session_id, 0, t) != jpsm::Reason::None) { pump_fail("settings handshake: cannot join"); return; }
         }
         g.plan_ready = true;
+        if (g.pick_link) {   // ENHANCEMENT (post-game / pick): 2 players: player index = peer id (host 0, client 1), battle slot of each (its room record index)
+            const int me = g.host ? 0 : 1;
+            uint8_t slots[jspk::kMaxPlayers] = {};
+            const bool ok = g.plan.total_players == 2 && g.plan.remotes.size() == 1;
+            if (ok) { slots[me] = g.plan.local_first; slots[me ^ 1] = g.plan.remotes[0].first_slot; }
+            if (ok && g.flow.open(g.plan.session_id, me, 2, slots)) {
+                jspg::Config pc; pc.idle_ms = jspg::idle_ms_from(std::getenv(jspg::kIdleKey));
+                jspk::Config kc; kc.idle_ms = jspk::idle_ms_from(std::getenv(jspk::kIdleKey));
+                g.flow.set_config(pc, kc);
+                std::fprintf(stderr, "[net] postgame: on for this link (2 players, this PC player %d slot %u; prompt idle %u s, pick idle %u s)\n", me,
+                             (unsigned)g.plan.local_first, pc.idle_ms / 1000, kc.idle_ms / 1000);
+            } else std::fprintf(stderr, "[net] postgame: off for this link (the plan is not 2 players with one slot each)\n");
+        }
         if (g.rrz && g.rrz->room_id()) g.presence_room = g.rrz->room_id();
         log("rendezvous", to_string(g.plan.remotes[0].ep) + (g.rrz ? std::string(" via re-psn, path ") + path_name(g.rrz->path()) + ", room " + std::to_string((unsigned long long)g.rrz->room_id()) : std::string()));
         if (g.rrz) g.path_line = g.rrz->path() == Path::Relay ? std::string("Rollback on: connected through the server") : std::string("Rollback on: ") + path_name(g.rrz->path()) + " connection";   // FIX (player wording): no "re-psn" jargon on screen
@@ -1516,6 +1590,7 @@ void load_diag()
 // ENHANCEMENT (native-room pairing / same-link rematch): main-thread steps of the boundary, defined after the connection code (below conn_close).
 void native_poll();
 void match_poll();
+void pick_frame();   // ENHANCEMENT (post-game / pick)
 // Boundaries in a row without a fight HUD draw (g_hud_calls unchanged): the fight scene is not on screen. Main thread.
 uint32_t g_hud_last = 0, g_hud_idle = 0;
 constexpr uint32_t kHudIdleFrames = 45;   // about 1.5 s: never (re)open a link or let a re-armed match anchor while a fight is drawn
@@ -1537,7 +1612,7 @@ void boundary(ppu_context* c)
     g_toc.store((uint32_t)c->gpr[2], std::memory_order_relaxed);
     const MainStage stage_mark;
     { const uint32_t hc = g_hud_calls; if (hc != g_hud_last) { g_hud_last = hc; g_hud_idle = 0; } else if (g_hud_idle < 0x7FFFFFFFu) g_hud_idle++; }
-    if (!g.bench) { native_poll(); match_poll(); }   // may open, close or re-arm the link: the phase is read below
+    if (!g.bench) { native_poll(); match_poll(); pick_frame(); }   // may open, close or re-arm the link: the phase is read below
     JspTickState ts; jsp_fight_hash_get_state(&ts);
     g.ctx = c; g.done_now = ts.done;
     g_wp_tick.store(ts.done);
@@ -1792,6 +1867,7 @@ uint32_t g_net_build = 0;     // build_id() with the mod set folded in (jsp_net_
 bool g_installed = false;     // install_process_wide ran: a rollback-capable process (not the bench), so jsp_net_lobby_open may run
 std::string g_lobby_why;      // jsp_net_lobby_reason (main thread)
 
+void pick_pad_install();   // ENHANCEMENT (post-game / pick), below
 void install_process_wide()
 {
     if (g_installed) return;
@@ -1807,6 +1883,7 @@ void install_process_wide()
     { char pb[16] = {}; g.ping_on = !jsp_setting_get(jpnb::kPingKey, pb, sizeof pb) || jpnb::ping_key_on(pb); }   // default on
     jsp_session_text_hook = session_text;
     jsp_native_fight_install();   // ENHANCEMENT (native fight takeover): the hooks, all pass-through until start_session arms them in an online fight
+    pick_pad_install();           // ENHANCEMENT (post-game / pick): only with JSP_ROLLBACK_PICK=1
     install_all(std::make_integer_sequence<int, sizeof k_ents / sizeof k_ents[0]>());   // inert while the phase is Off (boundary returns, the phase hooks run the original)
     task_diag_install();
 }
@@ -1890,12 +1967,14 @@ bool conn_open(const Conn& c, std::string* why, jpno::Refusal* code)
         g.rp->start(c.relay);
     } else g.rz.reset(g.host ? new DirectRendezvous(g.mux, *g.hub, 1, random_session_id()) : new DirectRendezvous(g.mux, *g.hub, 1, g.join));
     g.link.reset(new M2LinkT<jpsm::Transport>(g.mux));
+    g.flow.close(); g.pick_link = c.pair && pick_on();   // ENHANCEMENT (post-game / pick): native-room links only (the prompt drives the game's own room)
     g.phase = Phase::Handshake;
     if (c.repsn) std::fprintf(stderr, "[net] re-psn: %s a room on %s:%u as %s (relay %s), local UDP port %u%s\n", g.host ? "creating" : "joining", rid.host.c_str(), (unsigned)rid.port, rid.name.c_str(), c.relay ? "allowed" : "not allowed", (unsigned)g.mux.local_port(),
                               c.pair ? (" (paired with the game's room " + std::to_string((unsigned long long)c.pair) + ", comm id " + rid.comm_id + ")").c_str() : "");
     else std::fprintf(stderr, "[net] listening/joining: %s, local UDP port %u\n", g.host ? "host" : to_string(g.join).c_str(), (unsigned)g.mux.local_port());
     g.pump.start(g.mux, *g.link,
         [](uint8_t peer, const uint8_t* d, size_t n, uint64_t ms) {   // runs on the pump thread under its mutex
+            if (g.flow.route(peer, d, n, ms)) return;   // ENHANCEMENT (post-game / pick): a 'P' / 'C' message of that peer (before match_peek: it belongs to the match that ended)
             if (g.plan_ready) {   // ENHANCEMENT (same-link rematch): which match of this link the datagram belongs to (jsp_net_match.h)
                 uint32_t to = 0;
                 const MatchMsg mm = match_peek(g.plan.session_id, g.match_k, d, n, &to);
@@ -1934,6 +2013,7 @@ void conn_close()
     g.ev_first = g.ev_next = g.wait_next = 0; g.hs_last = -2;
     g.listen_port = 0; g.join = Endpoint{};
     g.match_k = 0; g.match_jump = 0; g.beacon_next = 0; g.fresh_gate = false;   // ENHANCEMENT (same-link rematch): the counter belongs to the link
+    g.flow.close(); g.pick_link = false; g_pick_active = 0;   // ENHANCEMENT (post-game / pick): a new link never reuses a pair (the pump thread is stopped)
     g.phase = Phase::Off;
     show(""); badge(""); ping_hide();
 }
@@ -1998,6 +2078,8 @@ void native_maintain(uint64_t now)
         else g_nat.retry_at = now + 5000;
         return;
     }
+    // ENHANCEMENT (post-game / pick): the next match is not armed while the prompt is open or the pick round runs (pick_frame acts on the outcome)
+    { std::lock_guard<std::mutex> lk(g.pump.mutex()); if (g.flow.hold()) { g_nat.rearm_at = 0; return; } }
     if (!g_nat.rearm_at) { if (g.last_end_ok) g_nat.fails = 0; else g_nat.fails++; g_nat.rearm_at = now + (g.last_end_ok ? 300 : 2000); return; }
     if (now < g_nat.rearm_at) return;
     g_nat.rearm_at = 0;
@@ -2046,6 +2128,288 @@ void match_poll()
     if (ph == Phase::Ended && g_nat.away_since) return;   // leaving the native room: native_poll closes the link
     log("rematch", "the other player is at match " + std::to_string(j) + " (this side " + std::to_string(g.match_k) + "): following");
     if (match_arm(j)) g_nat.rearm_at = 0;
+}
+
+// ---- ENHANCEMENT (post-game / pick, JSP_ROLLBACK_PICK=1, default 0): after the match --------------------------------------------------------------------------------
+// After a normal match end on a native-room link (end_with -> Flow::match_over) every PC shows the prompt over the game's end screen: Fight again, Select
+// character, Circle = Leave (the 2-player choice is jspg::Agreement; 3..4 players jspf::GroupAgreement). The game reads an empty pad while it is up. Then:
+//   Fight again / Select character: the port presses Cross locally (every 700 ms, the player's own presses pass through) until the room page is seen for 1 s
+//     (an update target of the room scene ran in the last 500 ms and no fight HUD for 1.5 s; jsp_net_native.cpp); then "in the room" goes out with the pick.
+//     Select character: each player picks on its own PC in the port's picker (fighter / support / the host's team mode); JSP_PICK_NATIVE_PAGE=1 lets the host
+//     use the game's own Battle settings page instead (an injected Square; the pick is read from its own pick block R+0x08 / +0x0C when the room is back).
+//     When every pick is agreed and every player is in the room, the host's port presses Cross ("Go to battle") every 2.5 s until the fight HUD runs (60 s).
+//     The joiners press their Ready Cross once (JSP_PICK_JOIN_READY: 0 never, 1 once, 2 every 5 s until the fight).
+//   Leave (or no choice in time): the link closes; the leaver's room is given up (no new link in it), the others keep theirs (native pairing re-plans).
+// The roster write itself runs at the battle builder (jsp_net_native.cpp, jsp_pick_build_enter) from jsp_pick_pair below.
+// TODO-MAPPING (U3, U4, U7: the owner gate of Square, the screens between the fight and the room, the joiner's Ready): every press here is a guess until the
+// mapping run; JSP_PICK_SKIP=0 turns the auto-skip off (the players press through by hand), JSP_PICK_HOST_START=0 the host's start presses.
+std::atomic<int> g_pk_capture{0};            // 1: the prompt / picker holds port 0 (the game reads an empty pad)
+std::atomic<uint32_t> g_pk_edges{0};         // buttons newly pressed while captured (taken by pick_frame)
+std::atomic<uint32_t> g_pk_press{0};         // an injected press, OR-ed into port 0 ...
+std::atomic<uint64_t> g_pk_press_until{0};   // ... until this GetTickCount64()
+std::atomic<int> g_pk_block{0};              // 1: the host's Cross is swallowed (room page, a pick round runs, the start is not safe yet: Flow::block_start)
+std::atomic<uint64_t> g_pk_square_t{0};      // FIX (mapping run U4): when the player last pressed Square, or Circle on a free pad (GetTickCount64)
+void (*g_pk_prev_pad)(uint32_t, uint16_t*, uint16_t*, uint16_t*) = nullptr;
+constexpr uint16_t kBtnCross = jspd::kBtnCross, kBtnCircle = jspd::kBtnCircle, kBtnSquare = jspd::kBtnSquare, kBtnUp = jspd::kBtnUp, kBtnDown = jspd::kBtnDown,
+                   kBtnLeft = jspd::kBtnLeft, kBtnRight = jspd::kBtnRight;
+// The pad filter (patch 6501, port 0): never while a match runs (the rollback owns the fight's input).
+void pick_pad(uint32_t port, uint16_t* b, uint16_t* lx, uint16_t* ly)
+{
+    if (port == 0 && g.phase.load() != Phase::Running) {
+        // capture: the prompt / picker holds the pad; block: no "Go to battle" before every PC committed the picks (by hand, AUTO_ONLINE or a press),
+        // and no injected press either; else the injected press (jspd::pad_gate, host-tested)
+        static uint16_t prev = 0;
+        const uint64_t now = GetTickCount64();
+        const jspd::PadOut o = jspd::pad_gate(*b, &prev, g_pk_capture.load() != 0, g_pk_block.load() != 0, (uint16_t)g_pk_press.load(), now < g_pk_press_until.load());
+        if (o.edges & kBtnSquare) g_pk_square_t = now;   // FIX (mapping run U4): the player's own Square (Battle settings): no notice-box Cross for a while
+        // FIX (desk review, pick6): the player's own Circle on a free pad (leaving the room opens the game's own confirmation over the room page): no
+        // notice-box Cross for a while either, so the port never answers that box for the player. Circle inside the prompt (captured) is the prompt's.
+        if (!o.centre && (o.edges & kBtnCircle)) g_pk_square_t = now;
+        if (o.centre) { if (o.edges) g_pk_edges.fetch_or(o.edges); *lx = 128; *ly = 128; }
+        *b = o.buttons;
+    }
+    if (g_pk_prev_pad) g_pk_prev_pad(port, b, lx, ly);
+}
+void pick_pad_install()
+{
+    if (!pick_on()) return;
+    g_pk_prev_pad = g_cellpad_filter; g_cellpad_filter = pick_pad;
+    std::fprintf(stderr, "[net] postgame: on (JSP_ROLLBACK_PICK=1, EXPERIMENTAL): after a native-room match the prompt, the pick and the roster write run\n");
+}
+int pk_setting(const char* key, int def) { char b[16] = {}; return jsp_setting_get(key, b, sizeof b) && b[0] >= '0' && b[0] <= '9' ? std::atoi(b) : def; }
+void pk_press(uint16_t btn, uint64_t now, uint64_t hold) { g_pk_press = btn; g_pk_press_until = now + hold; }
+
+enum class PkDrive { Off, Prompt, ToRoom, Room, Start, Manual };
+struct PkUi {
+    PkDrive drive = PkDrive::Off;
+    int sel = 0, prow = 0, page = 0;   // prompt row; picker row; native-page step (JSP_PICK_NATIVE_PAGE)
+    bool leave_ask = false, joined = false, start_failed = false;
+    uint64_t since = 0, press_t = 0, room_since = 0, page_t = 0, page_back = 0, start_t = 0;
+    jspd::BoxCross box;                        // FIX (mapping run U4): the room page reached, then hidden (a notice box over it): since when, Crosses sent, loading seen
+    size_t fi = 0, si = 0; bool together = false;   // the picker's values
+    std::vector<uint16_t> fighters, supports;       // Random first, then the stock fighter list (0x00756C64); supports: Random, ids only with JSP_PICK_SUPPORT_IDS=1
+    std::string notice; uint64_t notice_until = 0;
+} g_pk;
+const char* pk_drive_name(PkDrive d)
+{
+    return d == PkDrive::Off ? "off" : d == PkDrive::Prompt ? "prompt" : d == PkDrive::ToRoom ? "to the room" : d == PkDrive::Room ? "in the room" : d == PkDrive::Start ? "starting" : "by hand";
+}
+void pk_drive(PkDrive d) { if (g_pk.drive == d) return; std::fprintf(stderr, "[net] postgame: %s -> %s\n", pk_drive_name(g_pk.drive), pk_drive_name(d)); g_pk.drive = d; g_pk.since = GetTickCount64(); g_pk.press_t = 0; }
+void pk_lists(PkUi& u)
+{
+    if (!u.fighters.empty()) return;
+    uint32_t stock[64]; size_t ns = 0;
+    for (; ns < 64; ns++) {   // the select screen's stock list: 32-bit ids ending in -1 (jsp_roster.cpp), in the select screen's order
+        stock[ns] = vm_read32(0x00756C64u + 4u * (uint32_t)ns);
+        if (stock[ns] == 0xFFFFFFFFu) break;
+    }
+    uint16_t ids[80];
+    u.fighters.assign(ids, ids + jspf::picker_fighters(stock, ns, ids, 80));   // Random, then the named ids only
+    // TODO-MAPPING (U1b): the support's units in the room records (an id 200+ or an index); until the mapping run only Random (the room's own support) is offered
+    if (pk_setting("JSP_PICK_SUPPORT_IDS", 0) == 1) u.supports.assign(ids, ids + jspf::picker_supports(ids, 80));
+    else u.supports.assign(1, jspk::kRandom);
+}
+// A text cut to w pixels at this scale in the menu font (printable ASCII; "..." when cut)
+std::string pk_fit(const std::string& s, float w, float scale) { return jspf::fit_text(s, w, [scale](const std::string& t) { return jsp_overlay_text_width(t.c_str(), scale); }); }
+size_t pk_index(const std::vector<uint16_t>& v, uint16_t id) { for (size_t i = 0; i < v.size(); i++) if (v[i] == id) return i; return 0; }
+jspk::Pick pk_current(const PkUi& u)
+{
+    jspk::Pick p; p.fighter = u.fighters.empty() ? jspk::kRandom : u.fighters[u.fi]; p.support = u.supports.empty() ? jspk::kRandom : u.supports[u.si];
+    p.mode = u.together ? jspk::TOGETHER : jspk::VERSUS; return p;
+}
+bool pk_plausible(uint32_t a) { return a >= 0x10000u && a < 0xF0000000u && !(a & 3); }
+
+void pick_frame()
+{
+    if (!pick_on()) return;
+    PkUi& u = g_pk;
+    if (g.phase.load() == Phase::Running) {   // the match owns the frame: no pump-mutex lock here, nothing drawn, nothing pressed
+        if (u.drive != PkDrive::Off) pk_drive(PkDrive::Off);
+        g_pk_capture = 0; g_pk_press_until = 0; g_pk_block = 0;
+        if (!g.pk_key.empty()) { g.pk_key.clear(); g.pk = State::PickPanel(); redraw(); }
+        return;
+    }
+    const uint64_t now = GetTickCount64(), nm = now_ms();
+    const uint32_t edges = g_pk_edges.exchange(0);
+    const unsigned long long rs = jsp_native_room_seen_ms();
+    const bool fight_now = g_hud_idle < 5, room_now = rs && now - rs < 500 && g_hud_idle >= kHudIdleFrames;
+    static const int skip = pk_setting("JSP_PICK_SKIP", 1), host_start = pk_setting("JSP_PICK_HOST_START", 1), join_ready = pk_setting("JSP_PICK_JOIN_READY", 1),
+                     native_page = pk_setting("JSP_PICK_NATIVE_PAGE", 0);
+    jspf::Act act = jspf::Act::None;
+    bool open = false, host = false, picking = false, start_ok = false, rematch = false, capture = false, block = false; int nplayers = 2;
+    std::string outcome_text, round_status; jspg::View v; int lock_secs = -1;
+    std::vector<std::string> who;   // one line per player's pick (Select character), for everyone to see
+    State::PickPanel pn;
+    {
+        std::lock_guard<std::mutex> lk(g.pump.mutex());
+        jspf::Flow& f = g.flow;
+        open = f.is_open();
+        if (open) {
+            act = f.poll(nm);
+            host = f.host(); rematch = f.rematch_round();
+            const bool pg_open = f.postgame().on() && f.postgame().outcome() == jspg::PENDING;
+            if (pg_open && u.drive != PkDrive::Prompt) { pk_drive(PkDrive::Prompt); u.sel = 0; u.leave_ask = false; }
+            if (act == jspf::Act::Rematch || act == jspf::Act::CharSelect) {
+                pk_drive(PkDrive::ToRoom); u.room_since = 0; u.page = 0; u.joined = false; u.start_failed = false; u.prow = 0;
+                pk_lists(u);
+                const jspk::Pick m = f.round().mine();
+                u.fi = pk_index(u.fighters, m.fighter); u.si = pk_index(u.supports, m.support); u.together = m.mode == jspk::TOGETHER;
+            }
+            outcome_text = f.postgame().outcome_text();
+            // the prompt's input
+            if (u.drive == PkDrive::Prompt && pg_open) {
+                const jspg::View pv = f.postgame().view(u.sel, nm);
+                if (!pv.locked) {
+                    if (u.leave_ask) { if (edges & kBtnCross) f.choose(jspg::LEAVE, nm); else if (edges & kBtnCircle) u.leave_ask = false; }
+                    else {
+                        if (edges & kBtnUp) u.sel = 0;
+                        if (edges & kBtnDown) u.sel = 1;
+                        if (edges & kBtnCross) f.choose(u.sel == 0 ? jspg::REMATCH : jspg::CHARSELECT, nm);
+                        if (edges & kBtnCircle) u.leave_ask = true;
+                    }
+                }
+                capture = true;
+            }
+            // to the room, then in the room
+            if (u.drive == PkDrive::ToRoom || u.drive == PkDrive::Manual) {
+                if (room_now) { if (!u.room_since) u.room_since = now; if (now - u.room_since >= 1000) { pk_drive(PkDrive::Room); f.in_room(true); } }
+                else u.room_since = 0;
+            }
+            picking = f.picking() && !rematch;
+            if (u.drive == PkDrive::Room && picking) {
+                if (native_page == 1 && host && u.page != 9) {
+                    // TODO-MAPPING (U3/U4): does Square on the room page open Battle settings for the owner, and does the room page's update stop while it is open?
+                    // If the room page never goes away within 5 s, the port picker takes over (page 9).
+                    if (u.page == 0 && now - u.room_since >= 1500) { pk_press(kBtnSquare, now, 150); u.page = 1; u.page_t = now; std::fprintf(stderr, "[net] postgame: Square for the Battle settings page\n"); }
+                    else if (u.page == 1) { if (!room_now) u.page = 2; else if (now - u.page_t > 5000) { u.page = 9; std::fprintf(stderr, "[net] postgame: the Battle settings page did not open: the port picker instead\n"); } }
+                    else if (u.page == 2) {
+                        if (!room_now) u.page_back = 0;
+                        else if (!u.page_back) u.page_back = now;
+                        else if (now - u.page_back >= 1000) {   // back in the room: the host's own pick block (U1a: u32 BE at R+0x08 / +0x0C)
+                            const uint32_t R = vm_read32(0x0095839Cu);
+                            jspk::Pick p;
+                            if (pk_plausible(R)) { const uint32_t pf = vm_read32(R + jspk::kOffSelfFighter), ps = vm_read32(R + jspk::kOffSelfSupport); if (pf <= 0xFFFF) p.fighter = (uint16_t)pf; if (ps <= 0xFFFF) p.support = (uint16_t)ps; }
+                            char t[16] = {}; p.mode = jsp_setting_get("JSP_ONLINE_TEAMS", t, sizeof t) && !std::strcmp(t, "together") ? jspk::TOGETHER : jspk::VERSUS;
+                            f.submit(p, true); u.page = 3;
+                            std::fprintf(stderr, "[net] postgame: host's pick from the Battle settings page: fighter %03X support %03X (%s)\n", p.fighter, p.support, p.mode ? "together" : "versus");
+                        }
+                    }
+                } else {   // the port picker: Up / Down row, Left / Right value, Cross locks (Ready)
+                    const int rows = host ? 3 : 2;
+                    bool changed = false;
+                    if (edges & kBtnUp) u.prow = (u.prow + rows - 1) % rows;
+                    if (edges & kBtnDown) u.prow = (u.prow + 1) % rows;
+                    const int dir = (edges & kBtnRight) ? 1 : (edges & kBtnLeft) ? -1 : 0;
+                    if (dir) {
+                        auto step = [dir](size_t i, size_t n) { return n ? (i + (dir > 0 ? 1 : n - 1)) % n : 0; };
+                        if (u.prow == 0) u.fi = step(u.fi, u.fighters.size());
+                        else if (u.prow == 1) u.si = step(u.si, u.supports.size());
+                        else if (u.prow == 2) u.together = !u.together;
+                        changed = true;
+                    }
+                    if (changed) f.submit(pk_current(u), false);
+                    if (edges & kBtnCross) { const jspk::Pick p = pk_current(u); f.submit(p, true); std::fprintf(stderr, "[net] postgame: pick locked: fighter %03X support %03X (%s)\n", p.fighter, p.support, p.mode ? "together" : "versus"); }
+                    capture = f.picking();
+                    lock_secs = f.round().seconds_left(nm);
+                }
+            }
+            if (f.pick_on() && !rematch)
+                for (int p = 0; p < f.players(); p++) who.push_back(jspf::pick_line(p, f.me(), f.round().pick_of(p), f.round().locked_of(p)));
+            start_ok = f.start_ok(); nplayers = f.players();
+            // FIX (review): the host's own Cross on the room page cannot start the fight before every PC committed the round (by hand, in the
+            // by-hand drive, with JSP_PICK_HOST_START=0); outside the room it stays free (the auto-skip and the player go through the screens with it).
+            // TODO-MAPPING (U4): relies on the room-page targets (JSP_PICK_ROOM_TG) being seen while the room page is up.
+            block = f.block_start() && (room_now || u.drive == PkDrive::Room || u.drive == PkDrive::Start);
+            round_status = f.pick_on() ? f.round().status() : "";
+            if (u.drive == PkDrive::Prompt) v = f.postgame().view(u.sel, nm);
+            g_pick_active = f.active() ? 1 : 0;
+        } else g_pick_active = 0;
+    }
+    // what happens next (outside the pump mutex: native_close joins the pump thread)
+    if (act != jspf::Act::None) std::fprintf(stderr, "[net] postgame: %s (%s)\n", jspf::act_name(act), outcome_text.c_str());
+    if (act == jspf::Act::LeaveGiveUp || act == jspf::Act::LeaveClose || act == jspf::Act::Lost) {
+        const bool self = act == jspf::Act::LeaveGiveUp;
+        u.notice = act == jspf::Act::Lost ? round_status : self ? "Back to the lobby: press Circle in the room to leave it" : outcome_text;
+        u.notice_until = now + 6000;
+        pk_drive(PkDrive::Off); g_pk_capture = 0;
+        if (g_nat.link) { const uint64_t room = g_nat.room; native_close(self ? "post-game: this player left" : "post-game: the round ended without this link"); if (self) g_nat.given_up = room; }
+        open = false;
+    }
+    if (!open && u.drive != PkDrive::Off) pk_drive(PkDrive::Off);
+    if (act == jspf::Act::Rematch || act == jspf::Act::CharSelect) { u.notice = outcome_text; u.notice_until = now + 3000; }
+    // presses
+    if (u.drive == PkDrive::ToRoom && skip && !room_now && now - u.press_t >= 700) { pk_press(kBtnCross, now, 120); u.press_t = now; }
+    if (u.drive == PkDrive::ToRoom && now - u.since > 45000) {   // TODO-MAPPING (U4): no room page seen: the player goes on by hand
+        pk_drive(PkDrive::Manual); u.notice = "Press Cross to go back to the room"; u.notice_until = now + 15000;
+    }
+    if (u.drive == PkDrive::Room && host && start_ok && host_start && !u.start_failed) { pk_drive(PkDrive::Start); u.start_t = now; }
+    if (jspd::join_ready(join_ready, u.drive == PkDrive::Room, host, picking, room_now, &u.joined, now, u.press_t)) { pk_press(kBtnCross, now, 150); u.press_t = now; }   // TODO-MAPPING (U7)
+    if (u.drive == PkDrive::Start) {
+        if (now - u.start_t > 60000) { u.start_failed = true; pk_drive(PkDrive::Manual); u.notice = "Could not start the next fight: press Cross in the room to start it"; u.notice_until = now + 15000; }
+        else if (room_now && now - u.press_t >= 2500) { pk_press(kBtnCross, now, 150); u.press_t = now; }
+    }
+    // FIX (mapping run U4, map1): after a match the game opens notice boxes over the room ("You got a new title.", "You got a new player icon.", one OK
+    // button) a moment AFTER the room page is up. While one is open the room page's update targets do not run (room_now false) and the game waits for
+    // Cross: the host's start presses (room_now only) never came and the box stayed for the whole 60 s (both copies, matches 2 and 3). So once the room
+    // was reached, a room page hidden for 2.5 s with no fight drawn gets one Cross a second (at most 8 in a row; again after the room shows). Not after
+    // the player's own Square in the last 30 s (their Battle settings page), not while the picker holds the pad, not on the host's native-page steps.
+    // The fight's own loading (the host's "Go to battle" worked) also hides the room page: once the online loading scene ran after the room was reached,
+    // no more Crosses this round (BoxCross::loading; a Cross there could skip a screen on one PC only).
+    {   // jspd::BoxCross (host-tested)
+        jspd::BoxIn bi;
+        bi.reached = u.drive == PkDrive::Room || u.drive == PkDrive::Start || u.drive == PkDrive::Manual;
+        bi.room_now = room_now; bi.fight_now = fight_now; bi.capture = capture; bi.blocked = block && open; bi.room_since = u.room_since; bi.loading_seen = jsp_native_loading_seen_ms();
+        bi.own_page = (native_page == 1 && host && (u.page == 1 || u.page == 2)) || now - g_pk_square_t.load() < 30000;
+        int back_n = 0;
+        const jspd::BoxCross::Out bo = u.box.step(bi, now, u.press_t, &back_n);
+        if (bo == jspd::BoxCross::BACK) std::fprintf(stderr, "[net] postgame: room page back after %d Cross(es) on a box over it\n", back_n);
+        else if (bo == jspd::BoxCross::PRESS) {
+            pk_press(kBtnCross, now, 120); u.press_t = now;
+            if (u.box.away_n == 1) std::fprintf(stderr, "[net] postgame: the room page is hidden (a notice box over it?): Cross to close it\n");
+        }
+    }
+    // the next fight is drawn: only once the room was reached (the ended fight's HUD may still be drawn behind the prompt and the first presses)
+    if (fight_now && (u.drive == PkDrive::Room || u.drive == PkDrive::Start)) pk_drive(PkDrive::Off);
+    g_pk_capture = capture && u.drive != PkDrive::Off ? 1 : 0;
+    g_pk_block = block && open ? 1 : 0;
+    // the drawing
+    if (u.drive == PkDrive::Prompt) {
+        if (u.leave_ask && !v.locked && v.outcome == jspg::PENDING) {
+            pn.title = "Leave?"; pn.rows = { "Leave the rollback match" }; pn.sel = 0;
+            pn.lines = { "Rollback ends for you; then press Circle in the room to leave it." }; pn.hint = "Cross: leave    Circle: back";
+        } else {
+            pn.title = "Match over"; pn.rows = { "Fight again", "Select character" }; pn.sel = v.sel <= 1 ? v.sel : -1;
+            pn.lines.push_back(v.status);
+            if (!v.peer_line.empty()) pn.lines.push_back(v.peer_line);
+            if (!v.countdown.empty()) pn.lines.push_back(v.countdown);
+            if (!v.locked && v.outcome == jspg::PENDING) pn.hint = "Up/Down: choose    Cross: confirm    Circle: leave";
+        }
+    } else if (u.drive == PkDrive::Room && capture) {
+        pn.title = "Select character"; pn.sel = u.prow;
+        pn.rows = { pk_fit("Fighter: < " + jspf::fighter_text(pk_current(u).fighter) + " >", 520, 1.0f), pk_fit("Support: < " + jspf::support_text(pk_current(u).support) + " >", 520, 1.0f) };
+        if (host) {   // what jspk::roster_apply makes of the mode (humans in join order): 2 players: 1 + 1 or 2 against the COMs; 3: 2 + 1 (with a COM); 4: 2 + 2
+            const char* t = nplayers == 2 ? (u.together ? "both of us vs 2 COMs" : "versus, each with a COM")
+                          : nplayers == 3 ? (u.together ? "1st + 2nd to join vs 3rd + COM" : "1st + 3rd to join vs 2nd + COM")
+                          : (u.together ? "1st + 2nd vs 3rd + 4th to join" : "1st + 3rd vs 2nd + 4th to join");
+            pn.rows.push_back(pk_fit(std::string("Teams: ") + t, 520, 1.0f));
+        }
+        pn.lines.push_back(round_status);
+        if (!host) pn.lines.push_back("Teams: the host decides");
+        for (const std::string& l : who) pn.lines.push_back(pk_fit(l, 560, 0.7f));
+        if (lock_secs >= 0 && lock_secs <= 30) pn.lines.push_back("Your pick locks in " + std::to_string(lock_secs) + " s");
+        pn.hint = "Up/Down: row    Left/Right: change    Cross: ready";
+    } else if (u.drive == PkDrive::Room && !who.empty() && !(native_page == 1 && host && picking && u.page != 9)) {   // locked: everyone's picks until the fight
+        pn.title = "Select character";
+        pn.lines.push_back(round_status);
+        for (const std::string& l : who) pn.lines.push_back(pk_fit(l, 560, 0.7f));
+    } else if (u.drive == PkDrive::ToRoom) pn.band = rematch ? "Fight again: back to the room..." : "Select character: back to the room...";
+    else if (u.drive == PkDrive::Room) pn.band = native_page == 1 && host && picking && u.page != 9 ? "Choose on the Battle settings page, then come back to the room" : round_status;
+    else if (u.drive == PkDrive::Start) pn.band = "Starting the next fight...";
+    if (now < u.notice_until && (pn.band.empty() || u.drive == PkDrive::Off || u.drive == PkDrive::Manual)) pn.band = u.notice;
+    std::string key = pn.title + '\x1f' + pn.band + '\x1f' + pn.hint + '\x1f' + std::to_string(pn.sel);
+    for (const std::string& r : pn.rows) key += '\x1e' + r;
+    for (const std::string& l : pn.lines) key += '\x1d' + l;
+    if (key != g.pk_key || ((!pn.title.empty() || !pn.band.empty()) && !jsp_overlay_active())) { g.pk_key = key; g.pk = pn; redraw(); }
 }
 
 }  // namespace
@@ -2188,6 +2552,33 @@ extern "C" void jsp_net_match_end(void)
     log("match ended", "before it started (jsp_net_match_end); the link stays");
 }
 extern "C" unsigned jsp_net_match_index(void) { return g.match_k; }
+
+// ---- ENHANCEMENT (post-game / pick, JSP_ROLLBACK_PICK=1): for jsp_net_native.cpp (the builder hook, versus_apply, the AUTO_ONLINE steps) --------------------------------
+extern "C" int jsp_pick_enabled(void) { return pick_on() ? 1 : 0; }
+// The pair the coming build applies (jspf::Flow::pair); 0 = none (the native roster stands). Any thread (the builder runs on a guest thread).
+extern "C" int jsp_pick_pair(jspf::PairOut* out)
+{
+    if (!pick_on() || !out) return 0;
+    std::lock_guard<std::mutex> lk(g.pump.mutex());
+    return g.flow.pair(out) ? 1 : 0;
+}
+// 1 while a pair is active (versus_apply stays out of the teams then). A plain atomic read: versus_apply runs on every room / loading scene update.
+extern "C" int jsp_pick_active(void) { return g_pick_active.load(); }
+// AUTO_ONLINE steps (test tooling): the prompt's choice (1 Fight again, 2 Select character, 3 Leave) and the pick (ids, 1 = together, 1 = lock). 1 = taken.
+extern "C" int jsp_pick_choose(int choice)
+{
+    if (!pick_on() || choice < jspg::REMATCH || choice > jspg::LEAVE) return 0;
+    std::lock_guard<std::mutex> lk(g.pump.mutex());
+    return g.flow.choose((jspg::Choice)choice, now_ms()) ? 1 : 0;
+}
+extern "C" int jsp_pick_submit(unsigned fighter, unsigned support, int together, int lock)
+{
+    if (!pick_on() || fighter > 0xFFFF || support > 0xFFFF) return 0;
+    std::lock_guard<std::mutex> lk(g.pump.mutex());
+    if (!g.flow.picking()) return 0;
+    jspk::Pick p; p.fighter = (uint16_t)fighter; p.support = (uint16_t)support; p.mode = together ? jspk::TOGETHER : jspk::VERSUS;
+    return g.flow.submit(p, lock != 0) ? 1 : 0;
+}
 
 // Called by jsp_online.cpp's boot when the online files and --psnr have been applied; EnvInit reports through the same rendezvous.
 extern "C" void jsp_net_env_part(int part) { g_rv.arrive(part, decide_env); }
