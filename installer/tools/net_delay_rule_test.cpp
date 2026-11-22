@@ -1,7 +1,8 @@
 // net_delay_rule_test.cpp -- host test of the adaptive input delay decision (installer/port/jsp/jsp_net_delay_rule.h): rule 1 is the
 // 2026-11-21 formula unchanged, rule 2's percentile trip, high-ping margin, fight-start guard, depth trigger, hold and one-tick lowering, and the RTT
 // sampling fix (only a round trip whose GekkoNet count is new enters the window). test10: the start at 3, the deadband against 2 <-> 3 flapping, no
-// depth trigger while the time sync stretches for a slow peer, and the rematch carry (carry_keep / carry_start).
+// depth trigger while the time sync stretches for a slow peer, and the rematch carry (carry_keep / carry_start). feature/4p8: the slow-link start (3 ticks
+// from the sync at 100 ms or more; jpdr::Params has it on, the game reads it off by default in test11) and the worst remote (jpdr::worst_of).
 // A fake clock and fake stats; no GekkoNet. Run by net_delay_rule_test.sh.
 #include "jsp_net_delay_rule.h"
 
@@ -69,7 +70,7 @@ int main()
     }
     // rule 2 defaults: 99 ms steady (+ 16 ms answer wait in the samples): one way (115 - 33.3) / 2 = 40.8, spread 0, margin 16 -> 2 ticks
     {
-        Sim m; m.p.clamp(); m.rtt = [](uint64_t) { return 115.0; };
+        Sim m; m.p.slow_ms = 0; m.p.clamp(); m.rtt = [](uint64_t) { return 115.0; };   // the readings alone (the slow-link start: below)
         CHECK(m.run(30000) == 2);
         CHECK(m.changes == 0);
     }
@@ -145,7 +146,7 @@ int main()
         m.rtt = [&k](uint64_t) { k = k * 1103515245u + 12345u; return 115.0 + ((double)((k >> 8) % 1001) / 1000.0 * 100.0 - 50.0); };
         m.run(4100);
         CHECK(m.cur == 3);
-        Sim n; n.p.guard_spread = 0; n.p.clamp(); unsigned k2 = 7;
+        Sim n; n.p.guard_spread = 0; n.p.slow_ms = 0; n.p.clamp(); unsigned k2 = 7;   // the guard alone (no slow-link start)
         n.rtt = [&k2](uint64_t) { k2 = k2 * 1103515245u + 12345u; return 115.0 + ((double)((k2 >> 8) % 1001) / 1000.0 * 100.0 - 50.0); };
         n.run(4100);
         CHECK(n.cur == 2);   // the median alone: (115 - 33.3) / 2 + 16 = 56.9 -> 2
@@ -168,7 +169,7 @@ int main()
         for (const Sim::Seen& e : m.seen) if (e.t >= 12000) { if (p0 < 0) { p0 = e.ping; s0 = e.spread; } else if (e.ping != p0 || e.spread != s0) same = false; }
         CHECK(p0 > 0 && same);
         // the old fake (every read a new measurement) filled the window with copies of the last answer: the bug. With the count, the same reads add nothing.
-        Sim b; b.p.clamp(); b.pings = false; b.rtt = [](uint64_t) { return 100.0; };
+        Sim b; b.p.slow_ms = 0; b.p.clamp(); b.pings = false; b.rtt = [](uint64_t) { return 100.0; };   // the window alone (the slow-link start: below)
         b.seq = 1; b.last = 300;   // one answer before the match: count 1
         b.run(30000);
         CHECK(b.s.n == 1); CHECK(b.s.rtt_taken == 1);
@@ -204,6 +205,85 @@ int main()
         std::sort(va, va + a.s.n); std::sort(vb, vb + b.s.n);
         CHECK(std::equal(va, va + a.s.n, vb));
         CHECK(jpdr::percentile(va, a.s.n, 90) == jpdr::percentile(vb, b.s.n, 90));
+    }
+    // ENHANCEMENT (slow-link start): 1v1 at 100 ms measured starts at 3 ticks, decided from the first round trips (three answers: about 1 s), long before
+    // the first reading at 4 s; the guard's base stays the manifest's 2
+    {
+        Sim m; m.p.clamp(); m.avg = 100; m.rtt = [](uint64_t) { return 100.0; };
+        CHECK(m.p.slow_ms == 100 && m.p.slow_delay == 3 && m.p.slow_samples == 3);   // on by default, 100 ms measured, 3 round trips
+        m.run(1500);
+        CHECK(m.cur == 3); CHECK(m.changes == 1); CHECK(std::string(m.last_why) == "slow link");
+        CHECK(m.s.slow_state == 1); CHECK(m.s.slow_n == 3); CHECK(m.s.start_delay == 2);
+        CHECK(m.seen.empty());   // no rule-2 reading yet
+        m.run(2400);
+        CHECK(m.cur == 3);       // still before the first reading
+        // the first readings (median 100: (100 - 33.3) / 2 + 16 = 49.4 -> 2) lower it again, one tick after five calm readings: the link does not need 3
+        m.run(30000);
+        CHECK(m.cur == 2); CHECK(m.changes == 2);
+    }
+    // 1v1 at 40 ms stays at 2: the slow-link start decides once and does not raise
+    {
+        Sim m; m.p.clamp(); m.avg = 40; m.rtt = [](uint64_t) { return 40.0; };
+        m.run(3900);
+        CHECK(m.cur == 2); CHECK(m.changes == 0); CHECK(m.s.slow_state == 1); CHECK(m.s.slow_min == 40.0);
+        // a 60 ms link stays at 2, also with the answer wait on top (60 network + up to a tick: measured 60 .. 93)
+        Sim s; s.p.clamp(); s.avg = 60; s.rtt = [](uint64_t) { return 60.0; }; s.run(3900);
+        Sim w; w.p.clamp(); w.avg = 93; w.rtt = [](uint64_t) { return 93.0; }; w.run(3900);
+        CHECK(s.cur == 2); CHECK(s.changes == 0); CHECK(w.cur == 2); CHECK(w.changes == 0);
+        // just under and just over the line: each PC decides on its own round trips (the two PCs of a 99 / 101 ms link may differ, as every other
+        // decision of the rule may: each sets only its own delay)
+        Sim a; a.p.clamp(); a.avg = 99; a.rtt = [](uint64_t) { return 99.0; }; a.run(2000);
+        Sim b; b.p.clamp(); b.avg = 101; b.rtt = [](uint64_t) { return 101.0; }; b.run(2000);
+        CHECK(a.cur == 2); CHECK(b.cur == 3);
+        Sim e; e.p.clamp(); e.avg = 100; e.rtt = [](uint64_t) { return 100.0; }; e.run(2000);
+        CHECK(e.cur == 3);   // 100 ms or more
+        Sim o; o.p.slow_ms = 80; o.p.clamp(); o.avg = 85; o.rtt = [](uint64_t) { return 85.0; }; o.run(2000);
+        CHECK(o.cur == 3);   // JSP_INPUT_DELAY_AUTO_SLOW_START_MS=80 moves the line
+    }
+    // the switch: JSP_INPUT_DELAY_AUTO_SLOW_START=0 (slow_ms 0) keeps today's start
+    {
+        Sim m; m.p.slow_ms = 0; m.p.clamp(); m.avg = 100; m.rtt = [](uint64_t) { return 100.0; };
+        m.run(3900);
+        CHECK(m.cur == 2); CHECK(m.changes == 0); CHECK(m.s.slow_state == 0); CHECK(m.s.slow_n == 0);
+    }
+    // the fight-start stall only makes answers late: late answers among the first three (and a stalled average) do not raise; the smallest decides
+    {
+        Sim m; m.p.clamp(); m.avg = 200; m.rtt = [](uint64_t t) { return t < 600 ? 400.0 : 50.0; };
+        m.run(2100);
+        CHECK(m.cur == 2); CHECK(m.s.slow_state == 1); CHECK(m.s.slow_min == 50.0);
+    }
+    // the round trip GekkoNet measured before the sync counts as the first; with no later answer it decides alone at 2 s
+    {
+        Sim m; m.p.clamp(); m.pings = false; m.seq = 4; m.last = 120; m.avg = 115;
+        m.run(1900);
+        CHECK(m.cur == 2); CHECK(m.s.slow_n == 1);
+        m.run(300);
+        CHECK(m.cur == 3); CHECK(m.s.slow_min == 115.0);   // the smaller of the single round trip and GekkoNet's average
+    }
+    // no round trip at all before the first reading: no decision, rule 2 alone
+    {
+        Sim m; m.p.clamp(); m.pings = false;
+        m.run(4100);
+        CHECK(m.cur == 2); CHECK(m.s.slow_state == 2); CHECK(m.changes == 0);
+    }
+    // it never lowers (a manifest start of 4 stays), and MAX caps it
+    {
+        Sim m; m.p.clamp(); m.cur = 4; m.avg = 150; m.rtt = [](uint64_t) { return 150.0; };
+        m.run(3900);
+        CHECK(m.cur == 4); CHECK(m.changes == 0);
+        Sim n; n.p.hi = 2; n.p.clamp(); n.avg = 150; n.rtt = [](uint64_t) { return 150.0; };
+        n.run(3900);
+        CHECK(n.cur == 2); CHECK(n.changes == 0);
+    }
+    // the guard keeps its base: a 300 ms link starts at 3 (slow-link start), and before 10 s no reading goes above the manifest's 2 + 1; after 10 s it may
+    {
+        Sim m; m.p.clamp(); m.avg = 300; m.rtt = [](uint64_t) { return 300.0; };
+        m.run(1500);
+        CHECK(m.cur == 3);
+        int hi = 0; for (int i = 0; i < 8; i++) { m.run(1000); hi = std::max(hi, m.cur); }
+        CHECK(hi == 3);
+        m.run(4000);
+        CHECK(m.cur == 4);   // (300 - 33.3) / 2 + 16 = 149 -> 5, capped at MAX 4
     }
     // the range: MAX caps every decision
     {

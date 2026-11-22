@@ -177,8 +177,41 @@ SCENARIOS = {
     "ko_disconnect_gap": (["--local", "2", "--idle-from", "150", "--mute-at", "200", "--timeout-ms", "1500", "--max-ms", "8000"],
                           ["--local", "2", "--ko-from", "206", "--timeout-ms", "1500", "--gap-at", "200,2000"], "ko_gap"),
     "ko_scan_agree": (["--local", "2", "--ko-from", "300", "--ko-every", "7"] + ADV, ["--local", "2", "--ko-from", "300", "--ko-every", "7"] + ADV, "ko_agree"),
+    # ENHANCEMENT (slow-link start, jsp_net_delay_rule.h): --adapt 1 runs the game's delay rule on the session's own stats, start delay 2 (the manifest's).
+    # The line is 100 ms MEASURED (the answer wait is on top of the link). 1v1 at 60 ms each way (measured about 125 ms): both copies go to 3 within 2 s of
+    # the sync; 30 ms each way (measured about 65-75) stays at 2. one_side_2x2: two local players each, only the host adapts (3, on both its slots), the
+    # client keeps 2, as two PCs on either side of the line would: the per-side asymmetry the rule already makes. Every row must agree tick by tick.
+    # 5 ms loops keep the three rows short (the suite's 600 s limit); 40 ms, the off switch and the rest are in net_delay_rule_test.
+    "slow_start_1v1_120ms": (["--local", "1", "--delays", "2", "--adapt", "1", "--delay", "60", "--loss", "5", "--tick-ms", "5"], ["--local", "1", "--delays", "2", "--adapt", "1", "--delay", "60", "--loss", "5", "--tick-ms", "5"], "adapt_slow"),
+    "slow_start_1v1_60ms": (["--local", "1", "--delays", "2", "--adapt", "1", "--delay", "30", "--loss", "5", "--tick-ms", "5"], ["--local", "1", "--delays", "2", "--adapt", "1", "--delay", "30", "--loss", "5", "--tick-ms", "5"], "adapt_fast"),
+    "slow_start_one_side_2x2": (["--local", "2", "--delays", "2,2", "--adapt", "1", "--delay", "60", "--tick-ms", "5"], ["--local", "2", "--delays", "2,2", "--delay", "60", "--tick-ms", "5"], "adapt_one_side"),
 }
 KO_KINDS = ("ko_predicted", "ko_confirmed", "ko_agree", "ko_gap")
+ADAPT_KINDS = ("adapt_slow", "adapt_fast", "adapt_one_side")
+
+
+def adapt_check(kind, ho, co):
+    """ENHANCEMENT (slow-link start): the "ADAPT" / "ADAPTED" lines of net_session_test --adapt 1 (the hashes are checked as "agree")."""
+    f = []
+    kv = lambda line: dict(x.split("=", 1) for x in line.split()[1:] if "=" in x)
+    slow = lambda out: [kv(l) for l in out.splitlines() if l.startswith("ADAPT ") and "why=slow" in l]
+    done = lambda out: next((kv(l) for l in out.splitlines() if l.startswith("ADAPTED ")), None)
+    adapting = (("host", ho), ("client", co)) if kind != "adapt_one_side" else (("host", ho),)
+    for who, out in adapting:
+        d, sl = done(out), slow(out)
+        if d is None: f.append(f"{who}: no ADAPTED line"); continue
+        if kind in ("adapt_slow", "adapt_one_side"):
+            if len(sl) != 1: f.append(f"{who}: {len(sl)} slow-link start lines, expected 1"); continue
+            if (sl[0]["from"], sl[0]["to"]) != ("2", "3"): f.append(f"{who}: slow-link start {sl[0]['from']} -> {sl[0]['to']}, expected 2 -> 3")
+            if int(sl[0]["at"]) > 2100: f.append(f"{who}: slow-link start {sl[0]['at']} ms after the sync, expected by 2 s")
+            if d["slow_state"] != "1" or float(d["slow_min"]) < 100: f.append(f"{who}: slow_state={d['slow_state']} slow_min={d['slow_min']}, expected 1 and >= 100")
+        elif kind == "adapt_fast":
+            if sl: f.append(f"{who}: a slow-link start on a fast link: {sl}")
+            if d["slow_state"] != "1" or not (0 < float(d["slow_min"]) < 100): f.append(f"{who}: slow_state={d['slow_state']} slow_min={d['slow_min']}, expected 1 and under 100")
+            if d["delay"] != "2": f.append(f"{who}: delay {d['delay']} at the end, expected 2 (the start value)")
+    if kind == "adapt_one_side":
+        if "ADAPT" in co: f.append("client: adapted without --adapt")
+    return f
 
 
 def owner_check(ho, co, hs, cs, tmp, T):
@@ -264,6 +297,7 @@ def once_per_handle(s, who, remotes, kinds=("connected",)):
 
 
 def check(kind, hs, cs, hr, cr, tmp, T):
+    if kind in ADAPT_KINDS: return check("agree", hs, cs, hr, cr, tmp, T)   # the ADAPT lines: adapt_check (main)
     f = []
     if kind in LOG_KINDS:
         f += [f"{who}: tick log {log} missing or empty (each process writes it at the end of its run; the hash checks need both)"
@@ -382,6 +416,7 @@ def main():
             fl = problems or check(kind, hs, cs, hr, cr, tmp, a.ticks)
             if not problems and kind == "agree_rounds": fl += rounds_check(name, ho, co, a.ticks)
             if not problems and kind in KO_KINDS: fl += ko_check(kind, ho, co)
+            if not problems and kind in ADAPT_KINDS: fl += adapt_check(kind, ho, co)
             if not problems and kind == "stall_owner": fl += owner_check(ho, co, hs, cs, tmp, a.ticks)
             if not fl and name.startswith("skip_final"):   # the switch must have skipped saves on both peers, or the scenario tested nothing
                 for n_, s_ in (("host", hs), ("client", cs)):

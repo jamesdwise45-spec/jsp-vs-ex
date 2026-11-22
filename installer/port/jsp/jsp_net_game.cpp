@@ -533,6 +533,9 @@ std::string path_word() { const int k = g.path_kind.load(); return k == 1 ? "dir
 // at end_with with a key of the link and its peer (link_key), and the next session on the SAME link starts there instead of the manifest's value
 // (start_session); conn_open and conn_close clear it, so it never crosses a link, a room or a peer. Per peer like every delay change: only which frame this
 // PC's own inputs land on moves.
+// ENHANCEMENT (slow-link start, host simulation net_four_sim): rule 2 starts at 3 ticks, before its first reading at 4 s, when the round trips seen from the sync are
+// all 100 ms or more, measured (JSP_INPUT_DELAY_AUTO_SLOW_START=0 turns it off; _SLOW_START_MS, _SLOW_START_DELAY, _SLOW_START_SAMPLES). Each PC decides for its own
+// delay, as above; see jsp_net_delay_rule.h.
 // FIX (fight-start stall, runs native-rb1/rb2: the first reading of a match said ping 243-416 ms on a 60 ms link and jumped the delay to 4): see the guard above.
 // FIX (ping includes the answer wait): GekkoNet answers a ping at its next poll, once a tick, so the measured round trip carries up to one tick (33 ms) of
 // waiting that is no network time (rb1: 30 ms each way measured 94-100 ms); the rule takes up to half the round trip, capped at one tick, off before halving.
@@ -582,6 +585,13 @@ void adapt_settings()
     num("JSP_INPUT_DELAY_AUTO_DEEP_WINDOW_MS", p.deep_window_ms); num("JSP_INPUT_DELAY_AUTO_HOLD_MS", p.hold_ms);
     num("JSP_INPUT_DELAY_AUTO_DEADBAND_MS", p.deadband_ms); num("JSP_INPUT_DELAY_AUTO_DEEP_STRETCH_US", p.deep_stretch_us);
     num("JSP_INPUT_DELAY_AUTO_CARRY", g_ad_carry_on);
+    // ENHANCEMENT (slow-link start, jsp_net_delay_rule.h): see below for its default in this build
+    num("JSP_INPUT_DELAY_AUTO_SLOW_START_MS", p.slow_ms); num("JSP_INPUT_DELAY_AUTO_SLOW_START_DELAY", p.slow_delay);
+    num("JSP_INPUT_DELAY_AUTO_SLOW_START_SAMPLES", p.slow_samples);
+    // test11 (4-player merge): OFF by default here. test10 starts every match at 3 (JSP_INPUT_DELAY's default, 9c628fe), so this start only differed when a
+    // match starts lower (a host's JSP_INPUT_DELAY=2, or the rematch carry settled at 2), and keeping it off keeps 2-player play as test10 had it.
+    // JSP_INPUT_DELAY_AUTO_SLOW_START=1 turns it on (=0 off, as before).
+    { b[0] = 0; const bool set = jsp_setting_get("JSP_INPUT_DELAY_AUTO_SLOW_START", b, sizeof b) && b[0]; if (!set || b[0] == '0') p.slow_ms = 0; }
     num("JSP_ROLLBACK_PREDICTION", g_ad_pred);
     num("JSP_TIMESYNC_GAIN_US", g_ts_gain_us); num("JSP_TIMESYNC_MAX_US", g_ts_max_us); num("JSP_TEST_SLOW_MS", g_test_slow_ms);
     g_ts_gain_us = std::min(std::max(g_ts_gain_us, 0), 20000); g_ts_max_us = std::min(std::max(g_ts_max_us, 0), 50000); g_test_slow_ms = std::min(std::max(g_test_slow_ms, 0), 100);
@@ -596,6 +606,11 @@ void adapt_settings()
                       "depth trigger %d rollbacks > %d ticks in %d ms, not while stretching > %d us; deadband %d ms; rematch carry %s; JSP_INPUT_DELAY_AUTO=0 turns it off)\n",
                       p.lo, p.hi, p.margin_ms, p.pct, p.samples, p.high_margin_ms, p.high_ping_ms, p.first_ms, p.deep_count, p.deep_ticks, p.deep_window_ms,
                       p.deep_stretch_us, p.deadband_ms, g_ad_carry_on ? "on" : "off");
+    if (g_ad_on && p.rule == 2) {
+        if (p.slow_ms > 0) std::fprintf(stderr, "[net] slow-link start on: %d ticks from the sync when the round trip is %d ms or more (JSP_INPUT_DELAY_AUTO_SLOW_START=0 turns it off)\n",
+                                        std::min(p.slow_delay, p.hi), p.slow_ms);
+        else std::fprintf(stderr, "[net] slow-link start off (the default; JSP_INPUT_DELAY_AUTO_SLOW_START=1 turns it on)\n");
+    }
 }
 // A rollback of `depth` ticks (the glue's rollback, main thread): rule 2's depth trigger.
 void adapt_note_rollback(int64_t depth) { if (g_ad_on > 0 && !g.bench) jpdr::note_rollback(g_ad, g_ad_p, GetTickCount64(), depth); }
@@ -612,13 +627,15 @@ void adapt_delay(uint64_t now)
         r.stretch_us = jpdr::stretch_recent(g_ts_peak_us, g_ts_peak_ms, GetTickCount64());   // FIX (depth trigger vs a slow peer): 0 when over ~1 s old
         return r;
     });
-    if (d.why[0] == 's' && (g_ad.deep_skips == 1 || g_ad.deep_skips % 20 == 0))   // FIX (depth trigger vs a slow peer): the first skip of a match, then every 20th
+    if (std::strcmp(d.why, "slow peer") == 0 && (g_ad.deep_skips == 1 || g_ad.deep_skips % 20 == 0))   // FIX (depth trigger vs a slow peer): the first skip of a match, then every 20th
         std::fprintf(stderr, "[net] input delay %d kept: %d rollbacks deeper than %d ticks, but this PC stretches its ticks %u us for a slower peer (%u skipped this match)\n",
                      d.cur, g_ad_p.deep_count, g_ad_p.deep_ticks, g_ad.stretch_us, g_ad.deep_skips);
     if (d.want < 0 || d.want == d.cur) return;
     g.sess.set_local_delay((uint8_t)d.want); g.bv.delay = d.want;
     // The line starts as before ("input delay A -> B ticks (ping P ms, jitter J ms"): GekkoNet's averages, whatever the rule.
     if (g_ad_p.rule == 1) std::fprintf(stderr, "[net] input delay %d -> %d ticks (ping %.1f ms, jitter %.1f ms)\n", d.cur, d.want, d.ping_avg, d.jitter_avg);
+    else if (std::strcmp(d.why, "slow link") == 0) std::fprintf(stderr, "[net] input delay %d -> %d ticks (ping %.1f ms, jitter %.1f ms; slow-link start: round trip %.1f ms >= %d ms)\n",
+                                           d.cur, d.want, d.ping_avg, d.jitter_avg, d.ping, g_ad_p.slow_ms);
     else if (d.why[0] == 'r') std::fprintf(stderr, "[net] input delay %d -> %d ticks (ping %.1f ms, jitter %.1f ms; %d rollbacks deeper than %d ticks within %d ms)\n",
                                            d.cur, d.want, d.ping_avg, d.jitter_avg, g_ad_p.deep_count, g_ad_p.deep_ticks, g_ad_p.deep_window_ms);
     else std::fprintf(stderr, "[net] input delay %d -> %d ticks (ping %.1f ms, jitter %.1f ms; round trip median %.1f ms, p%d +%.1f ms, need %.1f ms)\n",

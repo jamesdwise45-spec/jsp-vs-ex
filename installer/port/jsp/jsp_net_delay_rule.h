@@ -33,6 +33,17 @@
 // stretches its ticks for a slower peer (Reading::stretch_us, the time sync's largest stretch in about the last second) by more than
 // JSP_INPUT_DELAY_AUTO_DEEP_STRETCH_US (3000) us, the trigger raises nothing and holds nothing (its events are dropped, counted in deep_skips): the time
 // sync, not this PC's input delay, is what answers a slow peer. 0 = never skip.
+// ENHANCEMENT (slow-link start, rule 2, JSP_INPUT_DELAY_AUTO_SLOW_START=0 turns it off; host simulation net_four_sim): the manifest's start delay
+// (2) holds until the first reading at 4 s, and at about 100 ms that start held most of a match's rollbacks (simulator, not measured: the four-PC simulator, 30 seeds, whole match from the sync; hitches = frames over 40 ms per minute per PC:
+// 1v1 at 100 ms +-10, 2.07 before and 1.48 after; with one remote PC the worst-remote reading below changes nothing, so that is this start alone). From the sync until the first reading, every new round trip is noted (the one GekkoNet measured before the sync, in the session's
+// handshake time, counts as the first); once JSP_INPUT_DELAY_AUTO_SLOW_START_SAMPLES (3) are in, or 2 s after the sync with at least one, the smallest of
+// them (and of GekkoNet's average) decides once: JSP_INPUT_DELAY_AUTO_SLOW_START_MS (100) or more raises the delay to 3 (JSP_INPUT_DELAY_AUTO_SLOW_START_DELAY,
+// capped at MAX; never lowers). The smallest, because the fight-start stall only makes answers late. The line is a MEASURED round trip, which carries up to
+// a tick or two of answer wait (GekkoNet answers at the next poll: a 60 ms link measured 94-100 ms in a two-copy test on one PC), hence 100 and not 80: in the simulator 80
+// started about half of the 60 ms links at 3. The guard's base stays the delay before this raise, so
+// before 10 s a reading still goes no higher than the manifest's delay + 1. Rule 2 lowers it later as usual (five calm readings) if the link does not need it.
+// Each PC decides from its own round trips and sets only its own delay, as every other decision here: the two PCs need not agree (a PC near 100 ms may stay
+// at 2 while the other goes to 3), and that is the same per-side asymmetry the rule already makes all match long.
 #pragma once
 #include <algorithm>
 #include <cmath>
@@ -71,6 +82,11 @@ struct Params {
     int hold_ms = 20000;          // JSP_INPUT_DELAY_AUTO_HOLD_MS
     int deadband_ms = 4;          // JSP_INPUT_DELAY_AUTO_DEADBAND_MS (rule 2's trip; 0 = none)
     int deep_stretch_us = 3000;   // JSP_INPUT_DELAY_AUTO_DEEP_STRETCH_US: no depth trigger while the time sync stretches more than this (0 = never skip)
+    // slow-link start (rule 2; see the top)
+    int slow_ms = 100;            // JSP_INPUT_DELAY_AUTO_SLOW_START_MS (a measured round trip); 0 = off (JSP_INPUT_DELAY_AUTO_SLOW_START=0)
+    int slow_delay = 3;           // JSP_INPUT_DELAY_AUTO_SLOW_START_DELAY
+    int slow_samples = 3;         // JSP_INPUT_DELAY_AUTO_SLOW_START_SAMPLES: decide once this many round trips are in
+    int slow_by_ms = 2000;        // ... or this long after the sync, with at least one
 
     void clamp()
     {
@@ -84,6 +100,8 @@ struct Params {
         deep_ticks = std::max(deep_ticks, 1); deep_count = std::min(std::max(deep_count, 0), kMaxDeep);
         deep_window_ms = std::max(deep_window_ms, 1000); hold_ms = std::max(hold_ms, 0);
         deadband_ms = std::min(std::max(deadband_ms, 0), 16); deep_stretch_us = std::max(deep_stretch_us, 0);
+        slow_ms = std::max(slow_ms, 0); slow_delay = std::min(std::max(slow_delay, 0), 8);
+        slow_samples = std::min(std::max(slow_samples, 1), 8); slow_by_ms = std::min(std::max(slow_by_ms, 0), first_ms);
     }
 };
 
@@ -95,7 +113,8 @@ struct Reading { double ping_avg = -1, jitter = 0, last_ping = -1; uint32_t rtt_
 struct Decision {
     int want = -1;                // >= 0: set this delay now (differs from Reading::cur)
     int cur = 0;
-    const char* why = "";         // "trip" (a reading), "rollbacks" (the depth trigger) or "slow peer" (the depth trigger skipped: want stays -1)
+    const char* why = "";         // "trip" (a reading), "rollbacks" (the depth trigger), "slow peer" (the depth trigger skipped: want stays -1) or "slow link"
+                                  // (the slow-link start; ping = the round trip it used)
     double ping = 0, jitter = 0;  // rule 1: GekkoNet's average and jitter; rule 2: median RTT and spread (percentile - median)
     double need_ms = 0;
     double ping_avg = -1, jitter_avg = 0;   // GekkoNet's average and jitter at this reading (the log line)
@@ -114,6 +133,8 @@ struct State {
     uint32_t deep_skips = 0;      // depth triggers skipped while this PC stretched its ticks for a slower peer
     uint32_t stretch_us = 0;      // the stretch of the skipped trigger (the log line)
     uint64_t at_ms[9] = {}; uint64_t last_t = 0;   // time spent at each delay (note_time), for settled()
+    // slow-link start: 0 = still looking, 1 = decided (raised or not), 2 = no decision before the first reading (rule 2 alone)
+    int slow_state = 0; int slow_n = 0; uint32_t slow_seq = 0; double slow_min = -1; uint64_t slow_next = 0;
 };
 
 // Time at the current delay: call once per live tick with the delay in effect (cheap, no stats).
@@ -191,7 +212,30 @@ Decision step(State& s, const Params& p, uint64_t now, Read&& read)
         d.want = want;
         return d;
     }
-    // rule 2: the depth trigger first
+    // rule 2: the slow-link start, from the sync until it decided or the first reading (see the top)
+    if (p.slow_ms > 0 && s.slow_state == 0) {
+        if (now >= s.start + (uint64_t)p.first_ms) s.slow_state = 2;   // no decision before the first reading: rule 2 alone
+        else if (now >= s.slow_next) {
+            s.slow_next = now + (uint64_t)p.sample_ms;
+            const Reading r = read();
+            if (r.last_ping > 0 && (s.slow_n == 0 || r.rtt_seq != s.slow_seq)) {   // a round trip not noted yet
+                s.slow_seq = r.rtt_seq; s.slow_n++;
+                if (s.slow_min < 0 || r.last_ping < s.slow_min) s.slow_min = r.last_ping;
+                if (r.ping_avg > 0 && r.ping_avg < s.slow_min) s.slow_min = r.ping_avg;
+            }
+            if (s.slow_n >= p.slow_samples || (s.slow_n > 0 && now >= s.start + (uint64_t)p.slow_by_ms)) {
+                s.slow_state = 1;
+                d.cur = r.cur; d.ping = s.slow_min; d.ping_avg = r.ping_avg; d.jitter_avg = r.jitter; d.why = "slow link";
+                const int want = std::min(p.slow_delay, p.hi);
+                if (s.slow_min >= p.slow_ms && want > r.cur) {
+                    if (s.start_delay < 0) s.start_delay = r.cur;   // the guard's base stays the delay before this raise
+                    d.want = want;
+                }
+                return d;
+            }
+        }
+    }
+    // the depth trigger
     if (p.deep_count > 0 && s.deep_n >= p.deep_count) {
         int k = 0; for (int i = 0; i < s.deep_n; i++) if (now - s.deep_t[i] <= (uint64_t)p.deep_window_ms) s.deep_t[k++] = s.deep_t[i];
         s.deep_n = k;

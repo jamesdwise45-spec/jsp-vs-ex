@@ -14,12 +14,16 @@
 // beside it); otherwise the live watermark takes the final frame and, with --ko-scan 1 (default), a covered winner ends it ("KO end: ..." line).
 // --mute-at TICK: this copy stops sending at that tick (all its datagrams dropped from then on), so the peer predicts and then times out.
 // --gap-at TICK,MS: once, the loop sleeps MS between taking the events (with their final frame, one lock) and using that frame ("GAP ..." line).
+// ENHANCEMENT (slow-link start): --adapt 1 runs the game's adaptive input delay (jsp_net_delay_rule.h, rule 2 with its defaults) on this session's
+// stats once per loop while synced, as jsp_net_game.cpp adapt_delay does, and sets this copy's own delay ("ADAPT ..." line per change, "ADAPTED ..." at
+// the end); --slow-start 0 turns the slow-link start off.
 // Output: FILE gets "tick hash" per tick (last simulation of that tick), stdout one SUMMARY line.
 // Exit: 0 ran to the end (or left on request), 2 rendezvous failed, 3 settings mismatch, 4 session failed, 5 reference mismatch, 6 start refused, 7 live-tick rate below --min-rate.
 #include "jsp_net_session.h"
 #include "jsp_stepper.h"
 #include "jsp_net_glue.h"
 #include "jsp_net_ko_rule.h"
+#include "jsp_net_delay_rule.h"
 
 #include <chrono>
 #include <cstdio>
@@ -244,9 +248,29 @@ int main(int argc, char** argv)
         seen_run = true;
     };
     uint64_t upd_prev = 0, paced_n = 0, paced_ms = 0;
+    // ENHANCEMENT (slow-link start): --adapt 1, the game's adapt_delay on this session (see the header). Each copy sets only its own delay.
+    const bool adapt_on = atoi(arg(argc, argv, "--adapt", "0")) != 0;
+    jpdr::Params adp; if (!atoi(arg(argc, argv, "--slow-start", "1"))) adp.slow_ms = 0;
+    adp.clamp();
+    jpdr::State ads; int adapt_changes = 0;
+    auto adapt = [&] {
+        if (!adapt_on || s.failed() || !s.synced()) return;
+        const uint64_t now = (uint64_t)since() + 1;
+        const jpdr::Decision d = jpdr::step(ads, adp, now, [&] {
+            const SessionStats st = s.stats();
+            jpdr::Reading r; r.ping_avg = st.ping_ms; r.jitter = st.jitter_ms; r.last_ping = st.last_ping_ms; r.rtt_seq = st.rtt_seq; r.cur = st.local_delay;
+            return r;
+        });
+        if (d.want < 0 || d.want == d.cur) return;
+        s.set_local_delay((uint8_t)d.want); adapt_changes++;
+        std::printf("ADAPT at=%llu tick=%u from=%d to=%d why=%s ping=%.1f\n", (unsigned long long)(now - ads.start), max_tick, d.cur, d.want,
+                    d.why[0] == 's' ? "slow" : d.why[0] == 'r' ? "rollbacks" : "trip", d.ping);
+        std::fflush(stdout);
+    };
     while (true) {
         hub.pump();
         if (!s.failed()) one_iteration();
+        adapt();
         bool lost_now = false;
         int events_ff = -1;   // as the boundary: the final frame read with the events, under the session lock
         const std::vector<SessionEvent> evs = s.take_events(&events_ff);
@@ -358,6 +382,9 @@ int main(int argc, char** argv)
     const double all_rate = iters_after_first_run ? (double)runs_after_first / (double)iters_after_first_run : 0.0;
     const double min_rate = atof(arg(argc, argv, "--min-rate", "0")), min_all = atof(arg(argc, argv, "--min-all-rate", "0"));
     const SessionStats st = s.stats();
+    if (adapt_on)
+        std::printf("ADAPTED delay=%d changes=%d slow_state=%d slow_n=%d slow_min=%.1f ping=%.1f last_ping=%.1f rtt_seq=%u\n", (int)st.local_delay, adapt_changes,
+                    ads.slow_state, ads.slow_n, ads.slow_min, st.ping_ms, st.last_ping_ms, st.rtt_seq);
     std::printf("SUMMARY role=%s slots=%u..%u/%u maxtick=%u rollbacks=%u maxdepth=%u resim=%llu saves=%llu loads=%llu stalls=%u deferred=%llu desync=%d failed=%s "
                 "ref_ticks=%d ref_bad=%d tail_neutral=%d rate=%.3f all_rate=%.3f iters=%llu paced=%llu paced_ms=%llu keepalive_polls=%llu sent=%llu dropped=%llu skipped=%llu round=%d/%d events:%s\n",
                 role.c_str(), plan.local_first, plan.local_first + plan.local_count - 1, plan.total_players, max_tick, st.rollbacks, st.max_rollback_frames,

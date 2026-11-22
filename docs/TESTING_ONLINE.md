@@ -104,6 +104,7 @@ with "Online Battle + rollback (2 vs 2)". You can change your online name there.
 - Two players per room, one per PC, 2 vs 2. Friendly Match only; Rank Match is not tested. 3 vs 3 is offline only.
 - Only the host picks characters.
 - A sudden gap in the connection itself (a tenth of a second or more with no data) can still cause a short hitch.
+- On a slow link (a ping counter of about 100 ms or more), buttons react about 1/30 s later from the first second of a fight: the input delay starts one step higher there to avoid short hitches, and comes back down by itself if the link allows it.
 - Gameplay mods turn the game's own online off for the session.
 - A public test server may be down or restarted, and your online name is not reserved. Each game also opens a hidden connection named `<your online name>-rb`, which may show up in the server's logs.
 - Matches through the server (`connected through the server`) have more delay than direct ones.
