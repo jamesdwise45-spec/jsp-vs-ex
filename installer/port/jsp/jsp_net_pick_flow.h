@@ -220,6 +220,43 @@ private:
     bool kept_ok_[kMax] = {};
 };
 
+// ---- 1b. FIX (pick7): the switch handshake ----
+// JSP_ROLLBACK_PICK is read on each PC and is not one of the session handshake's values. With it on one PC only, that PC opened the prompt with
+// the pad captured, never got an answer and sat in it until the idle + silence timeout (about 188 s) while the other PC was back in its room.
+// Now every PC with the switch on sends a hello on its link (tag 'P', kHelloLen bytes) every kHelloMs until it agrees, then every kHelloSlowMs:
+// heard = the players whose hello it holds; declined = the match (seq + 1) whose prompt it did not open (0 = none). A PC agrees once it holds
+// every other player's hello AND every other player's hello says it heard this PC's. The prompt of a match opens only on agreement
+// (Flow::match_end); a PC without agreement declines that match and says so in its hellos. A PC that opened its prompt and then hears that
+// another player declined the same match closes it at once (Act::PeerOff), so a last hello lost at the very end of a match cannot leave one
+// PC in a prompt the other never opened. A PC with the switch off sends nothing (its Flow is closed) and only counts the hellos it drops
+// (off_hellos, logged once by jsp_net_game.cpp). Either way both PCs behave as off for that match and the log says why.
+// Wire (kHelloLen = 11 bytes): [0] 0xBA [1] version 1 [2..5] session tag (u32 LE, never 0) [6] heard (bits 0-3, bits 4-7 zero) [7] player
+// index 0..3 (bits 2-7 zero) [8..9] declined (u16 LE) [10] check: XOR of bytes 0..9 with 0x69. Its length and magic tell it from the
+// 2-player choice (8 bytes, 0xB7) and the 3..4 player choice (14 bytes, 0xB8).
+inline constexpr uint8_t kHelloMagic = 0xBA, kHelloVersion = 1;
+inline constexpr size_t kHelloLen = 11;
+inline constexpr uint64_t kHelloMs = 1000, kHelloSlowMs = 3000;
+struct Hello { uint32_t session = 0; uint8_t heard = 0, player = 0; uint16_t declined = 0; };
+inline void hello_encode(const Hello& h, uint8_t out[kHelloLen])
+{
+    out[0] = kHelloMagic; out[1] = kHelloVersion;
+    for (int i = 0; i < 4; i++) out[2 + i] = (uint8_t)(h.session >> (8 * i));
+    out[6] = (uint8_t)(h.heard & 0x0F); out[7] = (uint8_t)(h.player & 3);
+    out[8] = (uint8_t)h.declined; out[9] = (uint8_t)(h.declined >> 8);
+    uint8_t x = 0x69; for (size_t i = 0; i < kHelloLen - 1; i++) x ^= out[i];
+    out[10] = x;
+}
+inline bool hello_decode(const uint8_t* p, size_t n, Hello* h)
+{
+    if (!p || !h || n != kHelloLen || p[0] != kHelloMagic || p[1] != kHelloVersion || (p[6] & 0xF0) || (p[7] & 0xFC)) return false;
+    uint8_t x = 0x69; for (size_t i = 0; i < kHelloLen - 1; i++) x ^= p[i];
+    if (x != p[10]) return false;
+    const uint32_t s = (uint32_t)p[2] | (uint32_t)p[3] << 8 | (uint32_t)p[4] << 16 | (uint32_t)p[5] << 24;
+    if (!s) return false;
+    h->session = s; h->heard = p[6]; h->player = p[7]; h->declined = (uint16_t)(p[8] | p[9] << 8);
+    return true;
+}
+
 // ---- 2. one interface for 2 and 3..4 players ----
 class Postgame {
 public:
@@ -280,13 +317,15 @@ enum class Act : uint8_t {
     Rematch,       // Fight again: back to the room (auto-skip), the round only carries "in the room"
     CharSelect,    // Select character: back to the room, then this player picks
     Ready,         // every player's pick is locked and every PC holds them all (the host may start)
-    Lost           // the pick round lost a player: like LeaveClose
+    Lost,          // the pick round lost a player: like LeaveClose
+    PeerOff        // FIX (pick7): another PC did not open its prompt for this match (no switch agreement there): this prompt closed, the link stays
 };
 inline const char* act_name(Act a)
 {
     switch (a) {
     case Act::None: return "none"; case Act::LeaveGiveUp: return "leave (this player)"; case Act::LeaveClose: return "leave (another player / link)";
     case Act::Rematch: return "fight again"; case Act::CharSelect: return "select character"; case Act::Ready: return "picks agreed"; case Act::Lost: return "pick round lost";
+    case Act::PeerOff: return "the other PC's menu is off for this match";
     }
     return "?";
 }
@@ -320,8 +359,23 @@ public:
         if (!d || !len) return false;
         if (d[0] != kTagPostgame && d[0] != kTagPick) { if (is_open()) pg_.link_alive(ms); return false; }
         routed_++;
-        if (!is_open()) return true;
+        Hello h;
+        const bool hello = d[0] == kTagPostgame && hello_decode(d + 1, len - 1, &h);
+        if (!is_open()) { if (hello) off_hellos_++; return true; }   // FIX (pick7): this PC runs no prompt; the other PC's hello is counted
         if (peer < 0 || peer >= n_ || peer == me_) { spoofed_++; return true; }
+        if (hello) {
+            if (h.player != peer) { spoofed_++; return true; }
+            if (h.session != tag_) return true;   // an older link's
+            pg_.link_alive(ms);
+            const uint8_t bit = (uint8_t)(1u << peer);
+            if (!(hello_heard_ & bit)) { hello_heard_ |= bit; hello_dirty_ = true; }   // answer at once: the other PC learns it was heard
+            if (h.heard & (1u << me_)) peer_heard_me_ |= bit;
+            if (h.declined) {
+                peer_declined_[peer] = h.declined;
+                if (pg_.on() && pg_.outcome() == jspg::PENDING && h.declined == (uint16_t)(pg_.seq() + 1u)) { pg_.stop(); peer_off_ = true; }
+            }
+            return true;
+        }
         pg_.link_alive(ms);
         if (d[0] == kTagPick) {
             jspk::Msg m;
@@ -343,6 +397,12 @@ public:
     {
         if (!is_open()) return;
         uint8_t b[1 + (Postgame::kMaxMsg > jspk::kMsgLen ? Postgame::kMaxMsg : jspk::kMsgLen)];
+        static_assert(kHelloLen <= Postgame::kMaxMsg, "the hello fits the send buffer");
+        if (hello_dirty_ || t >= hello_next_) {   // FIX (pick7): the switch handshake
+            Hello h; h.session = tag_; h.heard = hello_heard_; h.player = (uint8_t)me_; h.declined = declined_;
+            b[0] = kTagPostgame; hello_encode(h, b + 1); send(b, 1 + kHelloLen); sent_++;
+            hello_dirty_ = false; hello_next_ = t + (agreed() ? kHelloSlowMs : kHelloMs);
+        }
         pg_.tick(t);
         if (const size_t n = pg_.take(t, b + 1)) { b[0] = kTagPostgame; send(b, n + 1); sent_++; }
         if (pick_on_) {
@@ -357,12 +417,35 @@ public:
     {
         if (!is_open()) return;
         pick_.stop(); pick_on_ = false; acted_ = false; ready_said_ = false; rematch_ = false; round_pair_ = false; pg_left_ = false;
-        committed_ = false; want_room_ = false;
+        committed_ = false; want_room_ = false; peer_off_ = false; peer_off_said_ = false; decline_why_ = 0;
         pg_.start(seq, now, pcfg_);
     }
+    // FIX (pick7): the match end as the game calls it: the prompt opens only when every PC agreed on the switch (see 1b) and no other PC
+    // declined this match already. Else this match is declined (said in the next hello, at once) and false is returned: no prompt, no hold,
+    // the game goes on as with the switch off. decline_why(): 1 = no agreement, 2 = another PC declined this match first.
+    bool match_end(uint16_t seq, uint64_t now)
+    {
+        if (!is_open()) return false;
+        int why = agreed() ? 0 : 1;
+        for (int i = 0; i < n_ && !why; i++) if (i != me_ && peer_declined_[i] == (uint16_t)(seq + 1u)) why = 2;
+        match_over(seq, now);
+        if (!why) return true;
+        pg_.stop(); decline_why_ = why; declined_ = (uint16_t)(seq + 1u); hello_dirty_ = true;
+        return false;
+    }
+    // FIX (pick7): every other player's hello is held and says it heard this PC's.
+    bool agreed() const
+    {
+        if (!is_open()) return false;
+        for (int i = 0; i < n_; i++) if (i != me_ && (!(hello_heard_ & (1u << i)) || !(peer_heard_me_ & (1u << i)))) return false;
+        return true;
+    }
+    int decline_why() const { return decline_why_; }
+    uint64_t off_hellos() const { return off_hellos_; }
     // Main thread: the next step to act on (each one once).
     Act poll(uint64_t now)
     {
+        if (peer_off_ && !peer_off_said_) { peer_off_said_ = true; return Act::PeerOff; }   // FIX (pick7): another PC declined this match
         if (!is_open() || !pg_.on()) return Act::None;
         const jspg::Outcome o = pg_.outcome();
         if (o == jspg::PENDING) return Act::None;
@@ -454,6 +537,12 @@ private:
     bool pick_on_ = false, acted_ = false, ready_said_ = false, rematch_ = false, round_pair_ = false, pg_left_ = false, committed_ = false, want_room_ = false;
     PairOut pair_;
     uint64_t routed_ = 0, sent_ = 0, spoofed_ = 0;
+    // FIX (pick7): the switch handshake (1b)
+    uint8_t hello_heard_ = 0, peer_heard_me_ = 0;
+    uint16_t declined_ = 0, peer_declined_[jspk::kMaxPlayers] = {};
+    uint64_t hello_next_ = 0, off_hellos_ = 0;
+    bool hello_dirty_ = true, peer_off_ = false, peer_off_said_ = false;
+    int decline_why_ = 0;
 };
 
 // ---- 4. the roster write of an agreed pair on a room image ----

@@ -1,7 +1,8 @@
 // Host test of the post-game / pick wiring (installer/port/jsp/jsp_net_pick_flow.h): the 3..4 player choice (wire, states, timeouts, random
 // loss / reordering / duplication), the 2-player path through the same interface, the message routing of the link's 'P' / 'C' tags, and the
 // whole state flow of N = 2..4 PCs (prompt -> Fight again / Select character -> pick round -> the host's start -> the roster write at the
-// builder), checking that every PC applies the same roster bytes. No game, no GPU.
+// builder), checking that every PC applies the same roster bytes. FIX (pick7): the switch handshake (the prompt opens only when every PC has
+// JSP_ROLLBACK_PICK=1; with one PC on, no prompt and no stall on either). No game, no GPU.
 #include "../port/jsp/jsp_net_pick_flow.h"
 #include <algorithm>
 #include <cstdio>
@@ -185,7 +186,11 @@ static bool flow_round(std::mt19937& r, Net& net, Pc* pc, int n, uint16_t seq, j
         if (t % 100 == 0) for (int i = 0; i < n; i++) pc[i].f.pump(t, [&](const uint8_t* b, size_t len) { net.send(i, n, b, len, t); });
         for (int i = 0; i < n; i++) {
             Pc& p = pc[i];
-            if (!p.over) { if (t < p.over_at) continue; p.over = true; p.f.match_over(seq, t); }   // the PCs end the match at different times
+            if (!p.over) {   // the PCs end the match at different times; the switch handshake agreed before the first match (flow_random)
+                if (t < p.over_at) continue;
+                p.over = true;
+                if (!p.f.match_end(seq, t)) { std::printf("FAIL: PC %d declined match %u (why %d)\n", i, seq, p.f.decline_why()); return false; }
+            }
             if (!p.chose && t >= p.choose_at) { p.chose = true; if (!p.f.choose(p.want, t)) { std::printf("FAIL: choose refused\n"); return false; } }
             if (!p.f.hold() && p.last == Act::None && p.f.postgame().outcome() == jspg::PENDING) { std::printf("FAIL: no hold while the prompt is open\n"); return false; }
             const Act a = p.f.poll(t);
@@ -249,6 +254,15 @@ static bool flow_random(uint32_t seed, int n)
     jspg::Config pcf; pcf.idle_ms = 3600000; jspk::Config kcf; kcf.idle_ms = 600000;
     for (int i = 0; i < n; i++) { if (!pc[i].f.open(sid, i, n, slots)) return false; pc[i].f.set_config(pcf, kcf); }
     uint64_t t = 1000; bool had_pair = false;
+    {   // FIX (pick7): the first match runs (here 30 s) while the switch handshake agrees over the same lossy link
+        uint64_t t0 = 0;
+        for (; t0 < 30000; t0 += 10) {
+            net.deliver(t0, [&](int to, int from, const uint8_t* d, size_t len) { pc[to].f.route(from, d, len, t0); });
+            if (t0 % 100 == 0) for (int i = 0; i < n; i++) pc[i].f.pump(t0, [&](const uint8_t* b, size_t len) { net.send(i, n, b, len, t0); });
+        }
+        for (int i = 0; i < n; i++) if (!pc[i].f.agreed()) { std::printf("FAIL: PC %d of %d not agreed after 30 s\n", i, n); return false; }
+        t = t0;
+    }
     // match 1 ends: Fight again without an earlier pick (the native roster stands), then random rounds, then a forced Select character and two Fight agains
     if (!flow_round(r, net, pc, n, 1, jspg::REMATCH, slots, members, &t, &had_pair, false)) return false;
     for (uint16_t s = 2; s < 5; s++) if (!flow_round(r, net, pc, n, s, jspg::NONE, slots, members, &t, &had_pair, false)) return false;
@@ -490,8 +504,95 @@ static void test_apply_teams()
     }
 }
 
+// ---- FIX (pick7): the switch handshake (JSP_ROLLBACK_PICK on one PC only must not leave it in a prompt) ----
+static void test_hello_wire()
+{
+    Hello h; h.session = 0x12345678u; h.heard = 0x5; h.player = 2; h.declined = 0x1234;
+    uint8_t b[kHelloLen]; hello_encode(h, b);
+    Hello o; CHECK(hello_decode(b, kHelloLen, &o) && o.session == h.session && o.heard == 5 && o.player == 2 && o.declined == 0x1234);
+    for (size_t i = 0; i < kHelloLen; i++) for (int bit = 0; bit < 8; bit++) { uint8_t c[kHelloLen]; std::memcpy(c, b, sizeof c); c[i] ^= (uint8_t)(1u << bit); CHECK(!hello_decode(c, kHelloLen, &o)); }
+    CHECK(!hello_decode(b, kHelloLen - 1, &o) && !hello_decode(nullptr, kHelloLen, &o));
+    Hello z; z.session = 0; uint8_t zb[kHelloLen]; hello_encode(z, zb); CHECK(!hello_decode(zb, kHelloLen, &o));   // session tag 0 never
+    // a hello is never a choice message, and the choice messages are never hellos (length and magic)
+    jspg::Msg pm; CHECK(!jspg::decode(b, kHelloLen, &pm));
+    GroupMsg gm; CHECK(!group_decode(b, kHelloLen, &gm));
+    uint8_t p8[jspg::kMsgLen]; pm.seq = 1; pm.rev = 2; jspg::encode(pm, p8); CHECK(!hello_decode(p8, jspg::kMsgLen, &o));
+    uint8_t g14[kGroupMsgLen]; gm.session = 7; group_encode(gm, g14); CHECK(!hello_decode(g14, kGroupMsgLen, &o));
+}
+// a and b are players 0 and 1 of one link; a_to_b / b_to_a: whether this tick's messages arrive
+static void pump2(Flow& a, Flow& b, uint64_t t, bool a_to_b = true, bool b_to_a = true)
+{
+    a.pump(t, [&](const uint8_t* d, size_t n) { if (a_to_b) b.route(0, d, n, t); });
+    b.pump(t, [&](const uint8_t* d, size_t n) { if (b_to_a) a.route(1, d, n, t); });
+}
+static void test_switch()
+{
+    uint8_t slots[2] = { 0, 1 };
+    jspg::Config pc; jspk::Config kc;   // the shipped timeouts (prompt idle 180 s)
+    {   // only A has JSP_ROLLBACK_PICK=1: B's Flow stays closed (jsp_net_game.cpp opens it only with the switch on)
+        Flow a, b; CHECK(a.open(900, 0, 2, slots)); a.set_config(pc, kc);
+        for (uint64_t t = 0; t < 30000; t += 100) pump2(a, b, t);
+        CHECK(!a.agreed() && !b.is_open() && b.off_hellos() >= 25);   // B saw A's hellos (logged once there) and sent nothing
+        CHECK(!a.match_end(1, 30000) && a.decline_why() == 1);           // no prompt on A: both behave as off
+        CHECK(!a.hold() && !a.postgame().on() && a.poll(30000) == Act::None && !a.active());
+        for (uint64_t t = 30000; t < 300000; t += 100) { pump2(a, b, t); CHECK(a.poll(t) == Act::None); }
+        CHECK(!a.hold());
+        // before pick7 the same match end opened the prompt on A and held it for the idle timeout (the stall): the link is alive (B's other
+        // traffic), so only idle_ms ends it
+        Flow old; CHECK(old.open(900, 0, 2, slots)); old.set_config(pc, kc);
+        old.match_over(1, 0);
+        const uint8_t hs[] = { 'J', 'S', 'H', '1', 0 };
+        uint64_t left_at = 0;
+        for (uint64_t t = 0; t < 300000 && !left_at; t += 100) { old.route(1, hs, sizeof hs, t); old.pump(t, [](const uint8_t*, size_t) {}); if (old.poll(t) != Act::None) left_at = t; }
+        CHECK(left_at >= 179000);
+    }
+    {   // both on, a clean link: agreed within 2 s, the prompt opens on both
+        Flow a, b; CHECK(a.open(901, 0, 2, slots) && b.open(901, 1, 2, slots)); a.set_config(pc, kc); b.set_config(pc, kc);
+        uint64_t t = 0;
+        for (; t < 10000 && !(a.agreed() && b.agreed()); t += 100) pump2(a, b, t);
+        CHECK(a.agreed() && b.agreed() && t <= 2000);
+        CHECK(a.match_end(1, t) && b.match_end(1, t) && a.hold() && b.hold());
+        CHECK(a.choose(jspg::REMATCH, t) && b.choose(jspg::REMATCH, t));
+        Act aa = Act::None, ab = Act::None;
+        for (uint64_t e = t + 2000; t < e; t += 100) { pump2(a, b, t); const Act x = a.poll(t), y = b.poll(t); if (x != Act::None && aa == Act::None) aa = x; if (y != Act::None && ab == Act::None) ab = y; }
+        CHECK(aa == Act::Rematch && ab == Act::Rematch);
+    }
+    {   // both on, but B never got A's hello that says A heard B (lost at the end of the match): A agreed, B did not
+        Flow a, b; CHECK(a.open(902, 0, 2, slots) && b.open(902, 1, 2, slots)); a.set_config(pc, kc); b.set_config(pc, kc);
+        pump2(a, b, 0, true, false);   // A's first hello (heard nothing) reaches B; B's first reaches nobody
+        for (uint64_t t = 100; t < 5000; t += 100) pump2(a, b, t, false, true);   // from here only B -> A
+        CHECK(a.agreed() && !b.agreed());
+        CHECK(a.match_end(1, 5000) && a.hold());                                  // A opens its prompt ...
+        CHECK(!b.match_end(1, 5000) && b.decline_why() == 1 && !b.hold());        // ... B declines it (its next hello says so at once)
+        uint64_t off_at = 0;
+        for (uint64_t t = 5000; t < 8000 && !off_at; t += 100) { pump2(a, b, t); if (a.poll(t) == Act::PeerOff) off_at = t; b.poll(t); }
+        CHECK(off_at && off_at <= 5200 && !a.hold() && !a.postgame().on());       // A's prompt closed within one hello
+        for (uint64_t t = 8000; t < 9000; t += 100) { pump2(a, b, t); CHECK(a.poll(t) == Act::None); }   // once
+        CHECK(a.agreed() && b.agreed());                                          // the next match has the menu on both
+        CHECK(a.match_end(2, 9000) && b.match_end(2, 9000) && a.hold() && b.hold());
+    }
+    {   // B's decline reaches A before A's own match end: A does not open its prompt at all
+        Flow a, b; CHECK(a.open(903, 0, 2, slots) && b.open(903, 1, 2, slots)); a.set_config(pc, kc); b.set_config(pc, kc);
+        pump2(a, b, 0, true, false);
+        for (uint64_t t = 100; t < 5000; t += 100) pump2(a, b, t, false, true);
+        CHECK(!b.match_end(4, 5000));
+        for (uint64_t t = 5000; t < 5300; t += 100) pump2(a, b, t, false, true);
+        CHECK(!a.match_end(4, 5300) && a.decline_why() == 2 && !a.hold() && a.poll(5300) == Act::None);
+    }
+    {   // an older link's hello and a forged sender change nothing
+        Flow a, b, old; CHECK(a.open(904, 0, 2, slots) && b.open(904, 1, 2, slots) && old.open(903, 1, 2, slots));
+        for (uint64_t t = 0; t < 5000; t += 100) old.pump(t, [&](const uint8_t* d, size_t n) { a.route(1, d, n, t); });
+        CHECK(!a.agreed());
+        Hello h; h.session = jspk::session_tag(904); h.player = 0; h.heard = 3; uint8_t hb[1 + kHelloLen]; hb[0] = kTagPostgame; hello_encode(h, hb + 1);
+        const uint64_t sp = a.spoofed();
+        CHECK(a.route(1, hb, sizeof hb, 10) && a.spoofed() == sp + 1 && !a.agreed());   // claims player 0 from peer 1
+    }
+}
+
 int main()
 {
+    test_hello_wire();
+    test_switch();
     test_group_wire();
     test_group_states();
     int bad = 0;
@@ -507,6 +608,6 @@ int main()
     int fbad = 0, runs = 0;
     for (int n = 2; n <= 4; n++) for (uint32_t s = 1; s <= 60; s++, runs++) if (!flow_random(s * 7919u + (uint32_t)n * 13u, n)) { if (fbad++ < 3) std::printf("FAIL flow run n=%d seed %u\n", n, s); fails++; }
     if (fails) { std::printf("net pick flow: %d failure(s)\n", fails); return 1; }
-    std::printf("net pick flow: group choice (900 random runs), 2-player path, routing, spoofed senders, late lock vs the host's start, member map, team bytes, picker texts, leave / silence / idle / lost, %d flow runs of 8 post-games (n = 2..4) ok\n", runs);
+    std::printf("net pick flow: switch handshake (one PC on, a lost last hello, an early decline, old link, forged sender), group choice (900 random runs), 2-player path, routing, spoofed senders, late lock vs the host's start, member map, team bytes, picker texts, leave / silence / idle / lost, %d flow runs of 8 post-games (n = 2..4) ok\n", runs);
     return 0;
 }

@@ -17,7 +17,8 @@
 //                             seed until the host's plan seed is applied to the game, see the doc)
 //   JSP_ROLLBACK_PICK=1       ENHANCEMENT (experimental, default 0 until a mapping run proves the game side; see "after the match" below and the TODO-MAPPING
 //                             notes): on a native-room link of 2 players (the 4-player mesh is not in this build), the after-match prompt (Fight again / Select character / Leave),
-//                             the pick round and the roster write at the battle builder (jsp_net_pick_flow.h, jsp_net_native.cpp). Every player needs the same value.
+//                             the pick round and the roster write at the battle builder (jsp_net_pick_flow.h, jsp_net_native.cpp). Every player needs it: the PCs agree
+//                             on it over the link (FIX pick7, the switch handshake), and with it off on one PC the menu stays off on both (logged).
 // Flow: settings handshake on a pump thread (starts at once; survives scene loads) -> Started -> at the first fight tick the session starts: GekkoNet session,
 // stepper (frame base = that tick), snapshot ring as save/load (jsp_snapshot_ext_*), canonical pad table, handover() of the handshake on both sides.
 #include <cstdint>
@@ -918,7 +919,12 @@ void end_with(const std::string& text, bool quiet = false)
     log("ended", text);
     if (normal_end) {   // ENHANCEMENT (post-game / pick): a normal end of a native-room link opens the prompt (seq = this match, the same on every PC)
         std::lock_guard<std::mutex> lk(g.pump.mutex());
-        if (g.flow.is_open()) { g.flow.match_over((uint16_t)g.match_k, now_ms()); std::fprintf(stderr, "[net] postgame: prompt open (match %u, %d players)\n", g.match_k, g.flow.players()); }
+        // FIX (pick7): only when every PC has JSP_ROLLBACK_PICK=1 (the switch handshake, jsp_net_pick_flow.h 1b); else both PCs behave as off
+        if (g.flow.is_open()) {
+            if (g.flow.match_end((uint16_t)g.match_k, now_ms())) std::fprintf(stderr, "[net] postgame: prompt open (match %u, %d players)\n", g.match_k, g.flow.players());
+            else std::fprintf(stderr, "[net] postgame: off for match %u on both PCs: %s\n", g.match_k, g.flow.decline_why() == 2 ? "the other PC did not open its menu for this match"
+                              : "the other PC has not confirmed JSP_ROLLBACK_PICK=1 (every PC needs it)");
+        }
     }
     if (quiet) set_text(""); else show(text);   // quiet: the rendezvous texts are on the main menu's notice (jsp_net_notice); the message line stays empty so it does not clear that layer
     g.ended_ms = GetTickCount64();   // ENHANCEMENT (lobby): the session is stopped kLingerMs from now (boundary)
@@ -1974,7 +1980,12 @@ bool conn_open(const Conn& c, std::string* why, jpno::Refusal* code)
     else std::fprintf(stderr, "[net] listening/joining: %s, local UDP port %u\n", g.host ? "host" : to_string(g.join).c_str(), (unsigned)g.mux.local_port());
     g.pump.start(g.mux, *g.link,
         [](uint8_t peer, const uint8_t* d, size_t n, uint64_t ms) {   // runs on the pump thread under its mutex
-            if (g.flow.route(peer, d, n, ms)) return;   // ENHANCEMENT (post-game / pick): a 'P' / 'C' message of that peer (before match_peek: it belongs to the match that ended)
+            if (g.flow.route(peer, d, n, ms)) {   // ENHANCEMENT (post-game / pick): a 'P' / 'C' message of that peer (before match_peek: it belongs to the match that ended)
+                if (!g.flow.is_open() && g.flow.off_hellos() == 1)   // FIX (pick7): the other PC asks for the menu, this one runs none (once per link)
+                    std::fprintf(stderr, "[net] postgame: the other PC has JSP_ROLLBACK_PICK=1, %s: the after-match menu stays off on both PCs for this link\n",
+                                 pick_on() ? "but this link runs no menu here (not a 2-player native-room link)" : "this PC has not");
+                return;
+            }
             if (g.plan_ready) {   // ENHANCEMENT (same-link rematch): which match of this link the datagram belongs to (jsp_net_match.h)
                 uint32_t to = 0;
                 const MatchMsg mm = match_peek(g.plan.session_id, g.match_k, d, n, &to);
@@ -2334,6 +2345,10 @@ void pick_frame()
         pk_drive(PkDrive::Off); g_pk_capture = 0;
         if (g_nat.link) { const uint64_t room = g_nat.room; native_close(self ? "post-game: this player left" : "post-game: the round ended without this link"); if (self) g_nat.given_up = room; }
         open = false;
+    }
+    if (act == jspf::Act::PeerOff) {   // FIX (pick7): the other PC opened no prompt for this match: the game goes on as with the switch off
+        u.notice = "The other player's after-match menu is off: continue in the game"; u.notice_until = now + 6000;
+        pk_drive(PkDrive::Off); g_pk_capture = 0; capture = false;
     }
     if (!open && u.drive != PkDrive::Off) pk_drive(PkDrive::Off);
     if (act == jspf::Act::Rematch || act == jspf::Act::CharSelect) { u.notice = outcome_text; u.notice_until = now + 3000; }
