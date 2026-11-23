@@ -36,7 +36,12 @@
  *   "[net] ended: Match over"), runN (N rollback matches have started running). Token
  *   p1reset forgets p1 (so ?p1 waits for the NEXT fight's Player 1). While a rollback match runs (jsp_net_lobby_phase RUNNING) the
  *   autopilot never writes the pad (the steps still advance): the rollback owns the fight's input.
+ *   ENHANCEMENT (post-game / pick, JSP_ROLLBACK_PICK=1): pg:again | pg:select | pg:leave (the after-match prompt's choice, taken once the prompt is
+ *   open) and pick:FIGHTER,SUPPORT[,together] (hex ids, 133 = Random; locked once the pick round runs).
  *   Each step logs "[auto-online] step N ..." and a stall line every 30 s on one step.
+ * JSP_ROLLBACK_PICK=1 (ENHANCEMENT, default 0; jsp_net_game.cpp runs the prompt): the agreed roster is written at the battle builder's entry (lift hook
+ *   jsp_pick_build_enter), versus_apply stays out while a pair is active, and the room page's update is timed for the auto-skip. Mapping-run switches:
+ *   JSP_PICK_TRACE=1 (R dumped at the builder's enter / leave), JSP_PICK_SCENE_APPLY=1 (also write on every loading-scene update), JSP_PICK_ROOM_TG=hex,...
  * JSP_DISCORD_AUTO_NAV (ENHANCEMENT, on unless 0; only with the game's own online on and JSP_DISCORD not 0): a Discord Join
  *   (jsp_discord_take_join) runs "home battle row4 X~sub4@7000 w2500 D w1000 X w4000 D w1000 J end" for the player: home = Circle back to the
  *   main menu list, J = Cross every 5 s until jsp_discord_join_state says joined (one more search on a failure, then it gives up).
@@ -68,6 +73,15 @@ extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*);
 #include "jsp_hook_chain.h"
 #include "jsp_discord.h"
 #include "jsp_net_lobby.h"   // ENHANCEMENT (AUTO_ONLINE post-fight phase): jsp_net_lobby_phase for the over / run conditions
+#include "jsp_net_pick_flow.h"   // ENHANCEMENT (post-game / pick, JSP_ROLLBACK_PICK=1): the agreed pair's roster write (apply_pair)
+#include "jsp_net_pick_own.h"    // FIX (pick7): the fighter map the coming session will build (predict_map, the planned seats)
+extern "C" int jsp_setting_get(const char* key, char* out, int n);
+/* jsp_net_game.cpp (ENHANCEMENT, post-game / pick): the pair the coming build applies, whether one is active, the switch, and the AUTO_ONLINE steps */
+extern "C" int jsp_pick_pair(jspf::PairOut* out);
+extern "C" int jsp_pick_active(void);
+extern "C" int jsp_pick_enabled(void);
+extern "C" int jsp_pick_choose(int choice);
+extern "C" int jsp_pick_submit(unsigned fighter, unsigned support, int together, int lock);
 
 extern "C" int (*g_ppu_icall_hook)(uint32_t target, uint64_t* gpr);                                  /* 0500 */
 extern "C" void (*g_cellpad_filter)(uint32_t port_no, uint16_t* buttons, uint16_t* lx, uint16_t* ly); /* 6501 */
@@ -157,6 +171,7 @@ void (*g_prev_pad)(uint32_t, uint16_t*, uint16_t*, uint16_t*) = nullptr;
 
 std::mutex g_mu;
 std::unordered_map<uint32_t, uint32_t> g_hist;     /* per second, net targets */
+std::unordered_map<uint32_t, uint32_t> g_ui_hist;  /* TEST (mapping run U4, JSP_PICK_TRACE=1): per second, menu-code targets outside fights */
 std::unordered_set<uint32_t> g_seen_targets;      /* every target seen (for the "new target" log) */
 std::atomic<bool> g_menu_seen{false};
 unsigned g_new_logged = 0;
@@ -206,8 +221,62 @@ uint32_t share_pad_obj();
  * game did in the two-copy test), nothing is written. Both copies apply the same rule to their own R, on every call of the
  * room / loading scene updates. */
 bool g_versus = false;
+/* ENHANCEMENT (post-game / pick, JSP_ROLLBACK_PICK=1): the room-page targets (when the after-match auto-skip has reached the room), the switches of the
+ * roster write, and the write itself. g_pick: the switch is on and the game's own online is on. */
+bool g_pick = false;
+int g_pick_trace = 0, g_pick_scene = 0;
+uint32_t g_room_tg[4] = { 0x00292090u, 0x00290FF4u, 0, 0 };
+std::atomic<unsigned long long> g_room_ms{0};
+std::atomic<unsigned long long> g_load_ms{0};   /* FIX (mapping run U4): when the online loading scene's update 0x002ECD30 last ran */
+void room_dump(const char* tag, uint32_t R)
+{
+    NLOG("[online] %s room data %08X:\n", tag, R);
+    if (!plausible_obj(R)) return;
+    for (uint32_t o = 0; o < 0x14C; o += 0x20) {
+        char line[200]; int p = std::snprintf(line, sizeof line, "[online]   +%03X:", o);
+        for (uint32_t k = 0; k < 0x20 && o + k < 0x14C; k += 4) p += std::snprintf(line + p, sizeof line - p, " %08X", vm_read32(R + o + k));
+        NLOG("%s\n", line);
+    }
+}
+/* The agreed pair (jsp_pick_pair) written into the room data R, the same code on every PC: at the battle builder's entry 0x002EEE90 (lift hook
+ * jsp_pick_build_enter) and, with JSP_PICK_SCENE_APPLY=1, on every loading-scene update too (idempotent; TODO-MAPPING U6b: needed only if the loading
+ * scene's record upsert 0x002EE96C runs after the builder's entry). Only the bytes that change are written. A refusal leaves the native roster. */
+void pick_roster_apply(const char* where, bool quiet_if_same)
+{
+    jspf::PairOut p;
+    if (!jsp_pick_pair(&p)) return;
+    const uint32_t R = vm_read32(0x0095839Cu);
+    if (!plausible_obj(R)) { NLOG("[online] pick roster (%s): no room data\n", where); return; }
+    uint8_t img[jspk::kRoomSize], before[jspk::kRoomSize];
+    for (uint32_t i = 0; i < jspk::kRoomSize; i++) img[i] = before[i] = vm_read8(R + i);
+    jspk::ApplyInfo ai; jspf::MemberMap how = jspf::MemberMap::None;
+    const jspk::Result res = jspf::apply_pair(img, p, &ai, &how);
+    if (res != jspk::Result::Ok) {
+        static int said = 0;
+        if (!quiet_if_same || said++ < 4) NLOG("[online] pick roster (%s) refused: %s (the native roster stands; members %s)\n", where, jspk::result_text(res), jspf::member_map_text(how));
+        return;
+    }
+    int written = 0;
+    for (uint32_t i = 0; i < jspk::kRoomSize; i++) if (img[i] != before[i]) { vm_write8(R + i, img[i]); written++; }
+    if (quiet_if_same && !written) return;
+    NLOG("[online] pick roster (%s): %d players, %s, members %s, %d record(s) moved, %d byte(s) written\n", where, p.n, p.mode() == jspk::TOGETHER ? "together" : "versus",
+         jspf::member_map_text(how), ai.moved, written);
+    for (int r = 0; r < 4; r++) {
+        const uint8_t* q = img + jspk::kOffRecords + jspk::kRecSize * (uint32_t)r;
+        NLOG("[online]   rec %d member %u team %u fighter %03X support %03X com %u\n", r, jspk::be16(q + jspk::kRecMember), q[jspk::kRecTeam], jspk::be16(q + jspk::kRecFighter),
+             jspk::be16(q + jspk::kRecSupport), q[jspk::kRecCom]);
+    }
+    /* FIX (pick7): the fighter map the session start will build from this roster with the planned seats (jsp_native_fight_map refuses the
+     * session when it fails; the roster write never changes which records are human, so the native roster would map the same way) */
+    const uint32_t seats = jspo::slot_seats(p.slot, p.n);
+    const jspo::Map m = jspo::predict_map(img, seats);
+    NLOG("[online] pick roster: fighter map %s (seats 0x%X; net slot -> record %d %d %d %d); this PC's pad drives its own fighter: %s\n", jnf::map_err_text(m.err), seats,
+         m.port[0], m.port[1], m.port[2], m.port[3], jspo::own_ok(m, p.self_slot) ? "yes" : "NO");
+}
+
 void versus_apply()
 {
+    if (g_pick && jsp_pick_active()) return;   // ENHANCEMENT (post-game / pick): an agreed pair owns the teams (pick_roster_apply at the builder)
     const uint32_t R = vm_read32(0x0095839Cu);
     if (!plausible_obj(R)) return;
     const uint32_t mp = vm_read32(0x008D3888u + 0x59B8u);
@@ -288,6 +357,11 @@ int icall(uint32_t target, uint64_t* gpr)
     const uint32_t r3 = (uint32_t)gpr[3];
     const unsigned long long t = now_ms();
     if (g_versus && (target == 0x002ECD30u || target == 0x00292090u)) versus_apply();   /* loading / room scene updates */
+    if (g_pick) {   /* ENHANCEMENT (post-game / pick): the room page's update ran (jsp_native_room_seen_ms); the loading-scene re-apply (JSP_PICK_SCENE_APPLY=1) */
+        for (uint32_t k : g_room_tg) if (k && target == k) g_room_ms = t;
+        if (target == 0x002ECD30u) g_load_ms = t;   /* FIX (mapping run U4): the online loading scene runs: the next fight is on its way */
+        if (g_pick_scene && target == 0x002ECD30u) pick_roster_apply("loading scene", true);
+    }
     if (target == 0x001DE098u) { g_main_obj = r3; g_main_ms = t; if (!g_menu_seen && plausible_obj(r3) && vm_read32(r3) == 0x0087D600u) g_menu_seen = true; }
     else if (target == 0x00085CECu) {
         const unsigned long long prev = g_hud_ms.exchange(t);
@@ -322,6 +396,10 @@ int icall(uint32_t target, uint64_t* gpr)
     }
     if (g_trace) {
         const bool net = net_target(target);
+        if (g_pick_trace && g_rb_phase != JSP_LOBBY_RUNNING && target >= 0x001C0000u && target < 0x00300000u && t - g_hud_ms > 1500) {   /* TEST (mapping run U4): menu-code targets per second */
+            std::lock_guard<std::mutex> lk(g_mu);
+            g_ui_hist[target]++;
+        }
         if (net || g_menu_seen) {
             std::lock_guard<std::mutex> lk(g_mu);
             if (net) g_hist[target]++;
@@ -385,6 +463,16 @@ void per_second_and_scene()
           NLOG("[ntrace] f=%u t=%.1f sec: pad take 0x0F7234 calls %u returns%s | stall check 0x0F7704 calls %u with sync==2 %u | mode %08X vt %08X\n",
                flips(), secs(), tk, rl, st, st2, g_mode_obj.load(), g_mode_obj ? vm_read32(g_mode_obj) : 0u);
       } }
+    {   /* TEST (mapping run U4, JSP_PICK_TRACE=1): the menu-code targets of the last second (outside fights), sorted by address */
+        std::vector<std::pair<uint32_t, uint32_t>> u;
+        { std::lock_guard<std::mutex> lk(g_mu); u.assign(g_ui_hist.begin(), g_ui_hist.end()); g_ui_hist.clear(); }
+        if (!u.empty()) {
+            std::sort(u.begin(), u.end());
+            std::string line; char b[24];
+            for (const auto& e : u) { std::snprintf(b, sizeof b, " %X:%u", e.first, e.second); line += b; }
+            NLOG("[ptrace] f=%u t=%.1f ui%s\n", flips(), secs(), line.c_str());
+        }
+    }
     const uint32_t sn = g_snd_n.exchange(0), sb = g_snd_b.exchange(0), rn = g_rcv_n.exchange(0), rb = g_rcv_b.exchange(0);
     const uint32_t on = g_osnd_n.exchange(0), orr = g_orcv_n.exchange(0), se = g_snd_err.exchange(0);
     std::vector<std::pair<uint32_t, uint32_t>> h;
@@ -572,6 +660,15 @@ void auto_pad(uint16_t* b, uint16_t* lx, uint16_t* ly)
     } else if (s == "p1reset") {   /* ENHANCEMENT (post-fight phase): ?p1 waits for the next fight's Player 1 */
         g_p1_moved = false;
         next_step(now);
+    } else if (s.compare(0, 3, "pg:") == 0) {   /* ENHANCEMENT (post-game / pick): the prompt's choice pg:again | pg:select | pg:leave, once the prompt is open */
+        const int c = s == "pg:again" ? 1 : s == "pg:select" ? 2 : s == "pg:leave" ? 3 : 0;
+        if (!c) { NLOG("[auto-online] unknown step '%s', skipped\n", s.c_str()); next_step(now); }
+        else if (jsp_pick_choose(c)) { NLOG("[auto-online] post-game choice %s taken\n", s.c_str() + 3); next_step(now); }
+    } else if (s.compare(0, 5, "pick:") == 0) {   /* pick:FIGHTER,SUPPORT[,together] (hex ids; 133 = Random), locked once the pick round runs */
+        unsigned f = 0, sp = 0; char mode[16] = {};
+        const int n = std::sscanf(s.c_str() + 5, "%x,%x,%15s", &f, &sp, mode);
+        if (n < 2) { NLOG("[auto-online] bad step '%s', skipped\n", s.c_str()); next_step(now); }
+        else if (jsp_pick_submit(f, sp, !std::strcmp(mode, "together"), 1)) { NLOG("[auto-online] pick %03X / %03X%s locked\n", f, sp, mode[0] ? " together" : ""); next_step(now); }
     } else if (s == "room") {   /* log the Friendly Match room data (0x14C bytes at *(0x0095839C)) */
         const uint32_t R = vm_read32(0x0095839Cu);
         NLOG("[auto-online] room data %08X:\n", R);
@@ -658,6 +755,25 @@ void pad(uint32_t port, uint16_t* b, uint16_t* lx, uint16_t* ly)
 
 }  // namespace
 
+/* ENHANCEMENT (post-game / pick): when the room page's update last ran (GetTickCount64; 0 = never or the switch is off). Any thread. */
+extern "C" unsigned long long jsp_native_room_seen_ms(void) { return g_pick ? g_room_ms.load() : 0ull; }
+/* FIX (mapping run U4): when the online loading scene (0x002ECD30) last ran (GetTickCount64; 0 = never or the switch is off). Any thread. */
+extern "C" unsigned long long jsp_native_loading_seen_ms(void) { return g_pick ? g_load_ms.load() : 0ull; }
+/* Lift hooks on the battle builder 0x002EEE90..0x002EF788 (lift_game_hooks.json; every PC builds the fight from its own room data R). Enter: the agreed
+ * pair's roster write (nothing without JSP_ROLLBACK_PICK=1 or without a pair). JSP_PICK_TRACE=1 dumps R at enter (before and after the write) and at
+ * leave, for the mapping run (TODO-MAPPING U6: the records and +0x44 / +0x48 / +0x56.. byte-equal on every PC at the entry; U6b: unchanged at the leave). */
+extern "C" void jsp_pick_build_enter(ppu_context*)
+{
+    if (!g_pick) return;
+    if (g_pick_trace) room_dump("builder enter, before the pick write:", vm_read32(0x0095839Cu));
+    pick_roster_apply("builder", false);
+    if (g_pick_trace) room_dump("builder enter, after the pick write:", vm_read32(0x0095839Cu));
+}
+extern "C" void jsp_pick_build_leave(ppu_context*)
+{
+    if (g_pick && g_pick_trace) room_dump("builder leave:", vm_read32(0x0095839Cu));
+}
+
 /* Called from stubs.cpp after the other pad filters and the icall hook are set (it chains behind them). */
 extern "C" void jsp_register_native_online(void)
 {
@@ -678,7 +794,22 @@ extern "C" void jsp_register_native_online(void)
         g_versus = !(vd && vd[0] == '0') && std::getenv("PS3_NET_ONLINE") != nullptr;
         if (g_versus) NLOG("[online] versus safeguard on: 2 humans in a Friendly Match fight each other, each with a COM partner (JSP_ONLINE_VERSUS_DEFAULT=0 turns it off)\n");
     }
-    if (!g_trace && !g_role && !g_discord_nav && !g_versus) return;
+    {   /* ENHANCEMENT (post-game / pick, JSP_ROLLBACK_PICK=1, default 0): only with the game's own online on (a native room) */
+        g_pick = jsp_pick_enabled() && std::getenv("PS3_NET_ONLINE") != nullptr;
+        if (g_pick) {
+            char b[64] = {};
+            g_pick_trace = jsp_setting_get("JSP_PICK_TRACE", b, sizeof b) && b[0] == '1';
+            g_pick_scene = jsp_setting_get("JSP_PICK_SCENE_APPLY", b, sizeof b) && b[0] == '1';
+            if (jsp_setting_get("JSP_PICK_ROOM_TG", b, sizeof b) && b[0]) {   /* TODO-MAPPING (U4): the room page's update targets, hex, comma-separated (at most 4) */
+                int k = 0; const char* q = b;
+                for (uint32_t& x : g_room_tg) x = 0;
+                while (*q && k < 4) { char* e = nullptr; const unsigned long v = std::strtoul(q, &e, 16); if (e == q) break; if (v) g_room_tg[k++] = (uint32_t)v; q = *e == ',' ? e + 1 : e; }
+            }
+            NLOG("[online] post-game / pick on (JSP_ROLLBACK_PICK=1): room page targets %X %X %X %X, loading-scene re-apply %s, trace %s\n", g_room_tg[0], g_room_tg[1], g_room_tg[2], g_room_tg[3],
+                 g_pick_scene ? "on" : "off", g_pick_trace ? "on" : "off");
+        }
+    }
+    if (!g_trace && !g_role && !g_discord_nav && !g_versus && !g_pick) return;
     g_t0 = now_ms();
     if (g_trace) {
         if (std::getenv("PS3_NET_ONLINE")) {

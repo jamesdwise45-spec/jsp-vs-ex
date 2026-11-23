@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "note": "Impossible AI (Free Battle): entry/leave hooks around three game functions, the KO bar logic and its sound call (4/5 KOs to win), the two-page main menu (feat_menu_pages.cpp), 3v3 Free Battle (feat_3v3.cpp), callbacks in port/jsp_game.cpp and the feature files. Lifted together with lift_lod_hooks.json and only for the program it names (same check as the LOD hooks).",
+  "note": "Impossible AI (Free Battle): entry/leave hooks around three game functions, the KO bar logic and its sound call (4/5 KOs to win), the two-page main menu (feat_menu_pages.cpp), 3v3 Free Battle (feat_3v3.cpp), the rollback pick's roster write at the battle builder (jsp_net_native.cpp, a no-op unless JSP_ROLLBACK_PICK=1), callbacks in port/jsp_game.cpp and the feature files. Lifted together with lift_lod_hooks.json and only for the program it names (same check as the LOD hooks).",
   "hooks": [
     {"addr": "0x00022AC0", "end": "0x00022C64", "enter": "jsp_imp_word_enter", "leave": "jsp_imp_word_leave"},
     {"addr": "0x00082464", "end": "0x000825C0", "enter": "jsp_imp_def_enter", "leave": "jsp_imp_def_leave"},
@@ -83,6 +83,7 @@
     {"addr": "0x002F1148", "end": "0x002F1208", "enter": "jsp_vsc_part_dtor_enter", "leave": "jsp_six_noop"},
     {"addr": "0x002F107C", "end": "0x002F1148", "enter": "jsp_vsc_part_dtor_enter", "leave": "jsp_six_noop"},
     {"addr": "0x0032D288", "end": "0x0032D2F4", "enter": "jsp_vsc_remove_enter", "leave": "jsp_vsc_remove_leave"},
-    {"addr": "0x00333FCC", "end": "0x00333FE0", "enter": "jsp_vsc_setpic_enter", "leave": "jsp_six_noop"}
+    {"addr": "0x00333FCC", "end": "0x00333FE0", "enter": "jsp_vsc_setpic_enter", "leave": "jsp_six_noop"},
+    {"addr": "0x002EEE90", "end": "0x002EF788", "enter": "jsp_pick_build_enter", "leave": "jsp_pick_build_leave"}
   ]
 }

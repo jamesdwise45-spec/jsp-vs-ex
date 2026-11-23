@@ -206,6 +206,14 @@ __pycache__/
 !/installer/tools/net_online_test.sh
 !/installer/tools/net_postgame_test.cpp
 !/installer/tools/net_postgame_test.sh
+!/installer/tools/net_pick_test.cpp
+!/installer/tools/net_pick_test.sh
+!/installer/tools/net_pick_flow_test.cpp
+!/installer/tools/net_pick_flow_test.sh
+!/installer/tools/net_pick_drive_test.cpp
+!/installer/tools/net_pick_drive_test.sh
+!/installer/tools/net_pick_match_test.cpp
+!/installer/tools/net_pick_match_test.sh
 !/installer/tools/net_report_test.cpp
 !/installer/tools/net_report_test.sh
 !/installer/tools/net_repsn_test.cpp
