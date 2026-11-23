@@ -642,11 +642,20 @@ int main(int argc, char** argv)
      * 12% of blocks silent -> 0%). Set in the environment to override; CRI_LEAD=0 keeps CRI's own lead. */
     if (!getenv("AUDIO_NBLOCK")) _putenv("AUDIO_NBLOCK=16");
     if (!getenv("CRI_LEAD")) _putenv("CRI_LEAD=12");
+    /* FIX (testers, test6 "choppy sound all fight"): the tick-locked fight audio (patches 3007/3008) hides the game's own ~76 ms hitches only with a
+     * deeper reserve and a faster refill: a 200 ms device, a 90 ms cushion and up to 3.1% rate control (measured on a real device: 1 of 11 typical
+     * hitches concealed instead of 11 of 11, about 30 ms more audio delay in online fights; menus and offline keep PS3_AUDIO_BUF_MS). Set to override. */
+    if (!getenv("AUDIO_LOCK_BUF_MS")) _putenv("AUDIO_LOCK_BUF_MS=200");
+    if (!getenv("AUDIO_LOCK_CUSHION_MS")) _putenv("AUDIO_LOCK_CUSHION_MS=90");
+    if (!getenv("AUDIO_LOCK_DRC")) _putenv("AUDIO_LOCK_DRC=8");
     /* the opening movie: J-Stars asks the decoder for alpha 0 (cellVdec VDEC_ALPHA; =-1 keeps the game's 0) */
     if (!getenv("VDEC_ALPHA")) _putenv("VDEC_ALPHA=255");
 #else
     setenv("AUDIO_NBLOCK", "16", 0);
     setenv("CRI_LEAD", "12", 0);
+    setenv("AUDIO_LOCK_BUF_MS", "200", 0);
+    setenv("AUDIO_LOCK_CUSHION_MS", "90", 0);
+    setenv("AUDIO_LOCK_DRC", "8", 0);
     setenv("VDEC_ALPHA", "255", 0);
 #endif
 
