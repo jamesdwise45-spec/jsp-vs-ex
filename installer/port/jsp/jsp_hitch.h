@@ -11,9 +11,10 @@
 //                an iteration that ran a re-run tick is "replay".
 //   frame clock  (lockstep clock, jsp_stepper.cpp) how late the guest's flip became ready against its 30 Hz deadline, how late it was taken, the longest
 //                FIFO drain call (draws, texture uploads, a pipeline built on the drawing thread), the longest stretch outside the clock pass
-//                (main.cpp's present, drain and window pump), and once per late flip a sample of where the main thread was (boundary stage, or the
-//                guest's HLE call and call site).
-// Cost: a few QueryPerformanceCounter reads per boundary and per clock pass, one thread census per flip that is 8 ms late, one line per hitch.
+//                (main.cpp's present, drain and window pump), and for the first late flip two samples of where the main thread was (boundary
+//                stage, or the guest's HLE call and call site).
+// Cost: a few QueryPerformanceCounter reads per boundary and per clock pass, two thread censuses for the first flip of a gap that is 8 ms
+// late (at 8 and 24 ms), one line per hitch.
 #pragma once
 #include <cstdint>
 #include <cstdio>
@@ -36,10 +37,10 @@ struct Clock {
     double drain_max_ms = 0;       // longest single cellGcm_rsx_process_fifo call in the lockstep clock
     double outside_max_ms = 0;     // longest stretch between two lockstep passes (main.cpp: present, drain, window pump)
     uint32_t flips = 0, restarts = 0;
-    int sampled = 0;               // 1 = the main thread was sampled at a flip kLateMs late
-    int stage = 0;                 // g_jsp_main_stage at the sample (0 guest code, 1.. boundary stages)
-    uint32_t kind = 0, id = 0, lr = 0;   // the main guest thread at the sample: HLE call kind (0 = guest code), its id, the call site
-    double sample_late_ms = 0;     // how late the flip was when sampled
+    // Where the main thread was while the first late flip of the gap was not ready: sampled at kLateMs and at 3 x kLateMs past its deadline.
+    struct Sample { int stage = 0; uint32_t kind = 0, id = 0, lr = 0; double late_ms = 0; };   // g_jsp_main_stage (0 guest code, 1.. boundary stages);
+    static constexpr int kSamples = 2;                                                        // the main guest thread: HLE call kind (0 = guest code), id, call site
+    int samples = 0; Sample s[kSamples];
 };
 
 struct Gap {
@@ -125,8 +126,9 @@ inline std::string close_gap(Match& m, double gap_ms, uint32_t tick, const Clock
             else n += std::snprintf(b + n, sizeof b - n, " | clock: no flip ready");
             if (n < (int)sizeof b) n += std::snprintf(b + n, sizeof b - n, ", drain max %.1f ms, present/pump max %.1f ms, %u flips, %u restarts", c.drain_max_ms,
                                                       c.outside_max_ms, c.flips, c.restarts);
-            if (c.sampled && n < (int)sizeof b)
-                n += std::snprintf(b + n, sizeof b - n, "; at %+.0f ms main was in %s (HLE kind %u id 0x%08X lr 0x%08X)", c.sample_late_ms, stage_name(c.stage), c.kind, c.id, c.lr);
+            for (int i = 0; i < c.samples && i < Clock::kSamples && n < (int)sizeof b; i++)
+                n += std::snprintf(b + n, sizeof b - n, "%s at %+.0f ms main was in %s (HLE kind %u id 0x%08X lr 0x%08X)", i ? "," : ";", c.s[i].late_ms, stage_name(c.s[i].stage),
+                                   c.s[i].kind, c.s[i].id, c.s[i].lr);
             s = b; s += '\n';
         }
     }

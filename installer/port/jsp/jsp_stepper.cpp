@@ -338,7 +338,7 @@ extern "C" void ps3_hle_thread_census(uint32_t* kind, uint32_t* id, uint32_t* ob
 namespace {
 std::mutex g_hz_mu;
 jph::Clock g_hz;
-bool g_hz_ready_seen = false, g_hz_sampled_flip = false;   // frame clock thread only: per flip (lockstep_take_flip clears them)
+bool g_hz_ready_seen = false; int g_hz_sampled_flip = 0;   // frame clock thread only: per flip (lockstep_take_flip clears them)
 long long g_hz_out = 0;                                    // frame clock thread only: QPC when the last lockstep pass gave the loop back to main.cpp
 double hz_ms(long long dq) { static LARGE_INTEGER f{}; if (!f.QuadPart) QueryPerformanceFrequency(&f); return (double)dq * 1000.0 / (double)f.QuadPart; }
 void hz_note_drain(long long dq)
@@ -361,23 +361,28 @@ void hz_ready(long long now, long long next)
     const double late = hz_ms(now - next);
     std::lock_guard<std::mutex> lk(g_hz_mu); if (late > g_hz.ready_late_ms) g_hz.ready_late_ms = late;
 }
-// No flip ready yet: once per flip, at jph::kLateMs past the deadline, where the main thread is (boundary stage, or the guest's HLE call and call site).
+// No flip ready yet: at jph::kLateMs and 3 x kLateMs past the deadline, where the main thread is (boundary stage, or the guest's HLE call and call site).
+// Only the first late flip of a gap is sampled (jph::Clock::kSamples censuses at most per gap).
 void hz_maybe_sample(long long now, long long next)
 {
-    if (g_hz_sampled_flip || g_hz_ready_seen || !next || hz_ms(now - next) < jph::kLateMs) return;
-    g_hz_sampled_flip = true;
-    { std::lock_guard<std::mutex> lk(g_hz_mu); if (g_hz.sampled) return; }   // the first late flip of the gap names it
+    if (g_hz_sampled_flip >= jph::Clock::kSamples || g_hz_ready_seen || !next) return;
+    const double late = hz_ms(now - next);
+    if (late < jph::kLateMs * (1 + 2 * g_hz_sampled_flip)) return;
+    const int slot = g_hz_sampled_flip++;
+    { std::lock_guard<std::mutex> lk(g_hz_mu); if (g_hz.samples != slot) return; }   // an earlier flip of this gap was sampled already
     static uint32_t kind[65], id[65], obj[65], lr[65]; static uint8_t alive[65], unrel[65]; uint32_t ov = 0, ub = 0;
     const int stage = g_jsp_main_stage;
     const uint32_t t = g_jsp_main_tid;
     uint32_t k = 0, i = 0, l = 0;
     if (t >= 1 && t < 65) { ps3_hle_thread_census(kind, id, obj, lr, alive, unrel, &ov, &ub); if (alive[t]) { k = kind[t]; i = id[t]; l = lr[t]; } }
     std::lock_guard<std::mutex> lk(g_hz_mu);
-    g_hz.sampled = 1; g_hz.stage = stage; g_hz.kind = k; g_hz.id = i; g_hz.lr = l; g_hz.sample_late_ms = hz_ms(now - next);
+    if (g_hz.samples != slot) return;
+    jph::Clock::Sample& o = g_hz.s[slot]; o.stage = stage; o.kind = k; o.id = i; o.lr = l; o.late_ms = late;
+    g_hz.samples = slot + 1;
 }
 void hz_take(long long now, long long deadline, bool restart)   // lockstep_take_flip
 {
-    g_hz_ready_seen = false; g_hz_sampled_flip = false;
+    g_hz_ready_seen = false; g_hz_sampled_flip = 0;
     std::lock_guard<std::mutex> lk(g_hz_mu);
     g_hz.flips++; if (restart) g_hz.restarts++;
     if (deadline) { const double late = hz_ms(now - deadline); if (late > g_hz.take_late_ms) g_hz.take_late_ms = late; }

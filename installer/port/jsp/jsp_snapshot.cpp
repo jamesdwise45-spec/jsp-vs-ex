@@ -798,6 +798,7 @@ struct GateOps {
     Suspended& sp; uint32_t k = 0;   // k: the tick, for the retry log
     double sample_ms = 0;   // census cost, summed over the tries of one capture (logged)
     double presample_ms = 0, wait_ms = 0;   // gate_ev: unfrozen prechecks; time blocked in WaitOnAddress (gate_wait, "W")
+    double spin_ms = 0, freeze_call_ms = 0;   // DIAGNOSTIC (per-hitch line): the precheck's poll steps (spin) and the freeze calls themselves (SuspendThread + GetThreadContext of every thread)
     Clock::time_point t_frozen{};           // the last successful freeze (frozen_ms = resume - this)
     bool suspend() {
         if (!g_suspend) { t_frozen = Clock::now(); return true; }
@@ -807,7 +808,10 @@ struct GateOps {
             presample_ms += ms_since(t);
         }
         for (;;) {   // a thread set that changed under the freeze (a thread listed, then gone or refusing) is retried with a fresh listing, bounded; the cause is logged either way
-            if (sp.suspend()) { t_frozen = Clock::now(); return true; }
+            const auto tf = Clock::now();
+            const bool ok = sp.suspend();
+            freeze_call_ms += ms_since(tf);
+            if (ok) { t_frozen = Clock::now(); return true; }
             if (!sp.retryable() || sp.retries >= 4) return false;
             const unsigned r = sp.retries + 1;
             if (!sp.resume()) resume_failed();
@@ -836,6 +840,7 @@ struct GateOps {
         SwitchToThread();
         while (ms_since(s0) < 0.1) YieldProcessor();
         idle_service();
+        spin_ms += ms_since(s0);
 #endif
     }
     bool rsx_busy()
@@ -1214,6 +1219,7 @@ struct WwOps {
     bool no_saved = false;   // a rollback whose target tick has no recorded census view (logged)
     jsy::GateResult gr = {};   // sync census taken with the freeze (a commit records it by tick, a rollback compares with the target tick's)
     double presample_ms = 0, gate_wait_ms = 0, frozen_ms = 0;   // unfrozen prechecks, time blocked on the gate sequence, threads frozen (last freeze .. resume)
+    double spin_ms = 0, freeze_call_ms = 0;                      // DIAGNOSTIC (per-hitch line): GateOps' precheck poll steps and freeze calls, appended to the ww lines
     Clock::time_point t_frozen{}; bool frozen = false;
     bool pause() {
         const auto t = Clock::now();
@@ -1239,7 +1245,7 @@ struct WwOps {
         }
         g_last_gate_reasons = gr.reasons;
         if (g_ext && gr.suspended) rsx_write_guard(k, restore_to, saved, gr.view);   // threads frozen: the ring of RSX-side writes is stable
-        census_ms = gop.sample_ms; presample_ms = gop.presample_ms; gate_wait_ms = gop.wait_ms;
+        census_ms = gop.sample_ms; presample_ms = gop.presample_ms; gate_wait_ms = gop.wait_ms; spin_ms = gop.spin_ms; freeze_call_ms = gop.freeze_call_ms;
         t_frozen = gop.t_frozen; frozen = gr.suspended;
         no_saved = restore_to != kNoTick && !saved;
         if (restore_to == kNoTick && g_gate_jobserver && !gr.view.js_valid) g_js_unlearned++;
@@ -1570,6 +1576,10 @@ bool ww_transaction(uint32_t k, ppu_context* c, uint32_t restore_to)
     std::snprintf(tail, sizeof tail, " | thr=%s threads=%zu layout=%.3f close=%.3f audit=%.3f real=%.3f gate=%s prechecks=%u freezes=%u wakes=%u wake_timeouts=%u retry_waits=%u retry_timeouts=%u retry_immediate=%u presample=%.3f gate_wait=%.3f frozen=%.3f ring=%s first_reasons=0x%X first_notes=0x%X",
                   g_thr_registry ? "registry" : "toolhelp", nthr, layout_ms, close_ms, audit_ms, real_ms, g_gate_ev ? "ev" : "poll", op.gr.prechecks, op.gr.freezes, op.gr.wakes, op.gr.wake_timeouts, op.gr.retry_waits, op.gr.retry_timeouts, op.gr.retry_immediate,
                   op.presample_ms, op.gate_wait_ms, op.frozen_ms, g_ring_mode == jss::RingMode::PagePtr ? "ptr" : "copy2", op.gr.first_reasons, op.gr.first_notes);
+    {   // DIAGNOSTIC (per-hitch line): where a slow gate went (test6: the joiner's 36-86 ms gates with 1 freeze and 1-54 prechecks could not be split)
+        const size_t tl = std::strlen(tail);
+        std::snprintf(tail + tl, sizeof tail - tl, " spin=%.3f freeze_call=%.3f", op.spin_ms, op.freeze_call_ms);
+    }
     (restore_to == kNoTick ? g_cost_commit : g_cost_rb).add(save_ms, prep_ms, layout_ms, close_ms, audit_ms, op.presample_ms, op.gate_wait_ms, op.frozen_ms, op.collect_ms, op.apply_ms, op.gr, (uint32_t)nthr);
     g_hz_real_ms += real_ms; g_hz_gate_ms += op.suspend_ms; g_hz_ops++;   // DIAGNOSTIC (per-hitch line): jsp_snapshot_ext_cost_sum
     if (g_ext && result.ok()) {   // ENHANCEMENT (measurement): the `[snap] cost window` percentiles (threads running)

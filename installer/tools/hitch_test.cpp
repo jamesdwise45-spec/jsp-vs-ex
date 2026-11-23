@@ -50,10 +50,13 @@ int main()
     // guest time over the nominal with the flip ready late: guest-late, with the sample (main thread in guest code, an HLE call)
     {
         jph::Match m; ordinary(m.gap); m.gap.part[jph::Guest] += 45.0;
-        jph::Clock c; c.ready_late_ms = 40.0; c.take_late_ms = 41.0; c.sampled = 1; c.stage = 0; c.kind = 3; c.id = 0x1F953B9F; c.lr = 0x0046A1F0; c.sample_late_ms = 8.4;
+        jph::Clock c; c.ready_late_ms = 40.0; c.take_late_ms = 41.0;
+        c.samples = 2; c.s[0].stage = 0; c.s[0].kind = 3; c.s[0].id = 0x1F953B9F; c.s[0].lr = 0x0046A1F0; c.s[0].late_ms = 8.4;
+        c.s[1].stage = 4; c.s[1].late_ms = 24.2;
         const std::string s = jph::close_gap(m, 78.0, 3898, c);
         CHECK(has(s, "cause guest-late"));
-        CHECK(has(s, "at +8 ms main was in guest-code (HLE kind 3 id 0x1F953B9F lr 0x0046A1F0)"));
+        CHECK(has(s, "; at +8 ms main was in guest-code (HLE kind 3 id 0x1F953B9F lr 0x0046A1F0), at +24 ms main was in boundary:sound-server (HLE kind 0"));
+        CHECK(!has(jph::close_gap(m, 20.0, 1, c), "main was in"));   // no hitch, no line
     }
     // guest time over the nominal, flip ready on time, a long FIFO drain: the frame clock's own work
     {
