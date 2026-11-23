@@ -71,6 +71,37 @@ struct Run {
         return o;
     }
 };
+static void test_unsaved_step()
+{   // test8: the page closes with the block unchanged (Circle = Back): UNSAVED, no Square, no lock, "in the room" held (active)
+    Run r; r.start();
+    r.t = 0; r.step(true, false);
+    r.t = 1500; CHECK(r.step(true, false).square);
+    r.t = 1800; CHECK(r.step(true, true).opened);
+    r.t = 6000; r.step(true, true);
+    In in; in.now = 6100; in.room_now = true; in.page_now = false; in.saved = false;
+    CHECK(r.p.step(in).closed && r.p.state() == St::BACK);
+    in.now = 7200; Out o = r.p.step(in);
+    CHECK(o.unsaved && !o.lock && r.p.state() == St::UNSAVED && r.p.unsaved() && r.p.active() && !r.p.on_page() && !r.p.finished());
+    for (in.now = 7300; in.now < 60000; in.now += 100) { o = r.p.step(in); CHECK(!o.square && !o.lock && !o.unsaved && r.p.state() == St::UNSAVED); }
+    // the player's own Square: open again; then Start (saved): back, lock
+    in.page_now = true; o = r.p.step(in); CHECK(o.opened && r.p.state() == St::OPEN && r.p.opens() == 2);
+    in.now += 5000; r.p.step(in);
+    in.page_now = false; in.saved = true; in.now += 100; CHECK(r.p.step(in).closed);
+    in.now += 1100; o = r.p.step(in); CHECK(o.lock && r.p.state() == St::DONE && r.p.finished());
+    // a second Back on the reopened page: UNSAVED again (a notice each time)
+    Run q; q.start(); q.t = 1500; q.step(true, false); q.t = 1800; q.step(true, true);
+    In k; k.room_now = true; k.saved = false; k.now = 6000; k.page_now = false; q.p.step(k); k.now = 7100; CHECK(q.p.step(k).unsaved);
+    k.page_now = true; k.now = 9000; CHECK(q.p.step(k).opened); k.page_now = false; k.now = 12000; q.p.step(k); k.now = 13100; CHECK(q.p.step(k).unsaved);
+    // the round's idle lock while UNSAVED: DONE with that pick
+    k.own_locked = true; k.now = 20000; o = q.p.step(k); CHECK(o.lock && q.p.state() == St::DONE);
+    // nothing saved but the round already locked this PC's pick when the page closed: lock at once, no notice
+    Run w; w.start(); w.t = 1500; w.step(true, false); w.t = 1800; w.step(true, true);
+    In m; m.room_now = true; m.saved = false; m.own_locked = true; m.now = 6000; w.p.step(m); m.now = 7100; o = w.p.step(m); CHECK(o.lock && !o.unsaved);
+    // UNSAVED still ends at the deadline (the player never comes back to it)
+    Run z; z.c.deadline_ms = 50000; z.start(); z.t = 1500; z.step(true, false); z.t = 1800; z.step(true, true);
+    In y; y.room_now = true; y.saved = false; y.now = 6000; z.p.step(y); y.now = 7100; z.p.step(y); CHECK(z.p.state() == St::UNSAVED);
+    y.now = 50000; CHECK(z.p.step(y).give_up);
+}
 static void test_step()
 {
     {   // the plain run: settle, Square, open, pick, back, lock
@@ -162,20 +193,29 @@ static void test_step()
 struct Game {
     bool page = false; uint64_t open_due = 0; uint32_t blk_f = 0x133, blk_s = 0x133;
     uint64_t close_at = 0, pick_at = 0; uint32_t want_f = 0x133, want_s = 0x133; bool opened_once = false; uint64_t opened_t = 0;
+    // test8: back_first = the player's first close is Circle (Back: nothing written); reopen_after > 0 = then their own Square that long later
+    // (the second opening picks and closes on the same pick_at / close_at as the first), 0 = never again
+    bool back_first = false, backed = false; uint64_t reopen_after = 0, reopen_due = 0; int opens = 0;
     bool room_now() const { return !page && open_due == 0; }
     void press_square(uint64_t t, std::mt19937& r) { if (room_now()) open_due = t + 200 + r() % 400; }
     void tick(uint64_t t)
     {
-        if (open_due && t >= open_due) { page = true; open_due = 0; if (!opened_once) { opened_once = true; opened_t = t; } }
-        if (page && pick_at && t >= opened_t + pick_at) { blk_f = want_f; blk_s = want_s; }
-        if (page && close_at && t >= opened_t + close_at) page = false;
+        if (open_due && t >= open_due) { page = true; open_due = 0; opens++; if (!opened_once || backed) { opened_once = true; opened_t = t; } }
+        if (page && pick_at && t >= opened_t + pick_at && !(back_first && !backed)) { blk_f = want_f; blk_s = want_s; }
+        if (page && close_at && t >= opened_t + close_at) {
+            page = false;
+            if (back_first && !backed) { backed = true; if (reopen_after) reopen_due = t + reopen_after; }
+        }
+        if (reopen_due && t >= reopen_due && room_now()) { open_due = t + 300; reopen_due = 0; }   // the player's own Square
     }
 };
 // One PC's after-match drive, reduced to what the page step touches in jsp_net_game.cpp's pick_frame (the to-room part is a fixed delay).
 struct Pc {
     jspf::Flow f; Game g; PageStep ps; bool in_room_said = false, started = false; uint64_t room_at = 0; bool room_drive = false;
     bool start_seen_with_open_page = false; int squares = 0;
+    uint32_t of = 0x133, os = 0x133; int unsaved = 0; uint64_t in_room_t = 0;   // test8: the block at the last open, notices, when "in the room" went out
 };
+static bool g_back_first_j = false; static uint64_t g_reopen_j = 0; static int g_unsaved_j = 0, g_opens_j = 0; static uint64_t g_in_room_j = 0;
 struct Wire { uint64_t at; int to, from; std::vector<uint8_t> d; };
 
 // Returns the committed pairs' equality; *host_started: the host's start fired (start_ok) at some point; *gave: which PC gave up.
@@ -188,6 +228,7 @@ static bool two_pcs(uint32_t seed, uint64_t close_h, uint64_t close_j, uint32_t 
     jspg::Config pcf; jspk::Config kcf;   // the defaults: 120 s idle lock, 60 s wait
     for (int i = 0; i < 2; i++) { if (!pc[i].f.open(0x1234567890ull, i, 2, slots)) return false; pc[i].f.set_config(pcf, kcf); }
     pc[0].g.close_at = close_h; pc[1].g.close_at = close_j;
+    pc[1].g.back_first = g_back_first_j; pc[1].g.reopen_after = g_reopen_j;
     pc[0].g.want_f = fh; pc[1].g.want_f = fj; pc[0].g.pick_at = close_h ? close_h / 2 : 5000; pc[1].g.pick_at = close_j ? close_j / 2 : 5000;
     std::vector<Wire> q;
     *host_started = false; *gave = -1; *start_t = 0; *last_close_t = 0;
@@ -217,11 +258,15 @@ static bool two_pcs(uint32_t seed, uint64_t close_h, uint64_t close_j, uint32_t 
             if (!p.room_drive && p.room_at && t >= p.room_at) { p.room_drive = true; if (!p.ps.active()) p.f.in_room(true); }
             if (p.room_drive && p.ps.active()) {
                 In in; in.now = t; in.room_now = p.g.room_now(); in.page_now = p.g.page;
+                in.saved = p.g.blk_f != p.of || p.g.blk_s != p.os;   // as jsp_net_game.cpp: the block against the last open
+                in.own_locked = !p.f.picking() || p.f.round().locked_of(p.f.round().me());
                 const Out o = p.ps.step(in);
+                if (o.opened) { p.of = p.g.blk_f; p.os = p.g.blk_s; }
+                if (o.unsaved) p.unsaved++;
                 auto pick = [&] { jspk::Pick k; bool odd; read_pick(p.g.blk_f, p.g.blk_s, [](int id) { return id >= 0 && id < 42; }, [](int) { return false; }, &k.fighter, &k.support, &odd); return k; };
                 if (o.square) { p.g.press_square(t, r); p.squares++; }
                 if (o.read_live && p.f.picking()) p.f.submit(pick(), false);
-                if (o.lock) { if (p.f.picking()) p.f.submit(pick(), true); p.f.in_room(true); if (t > *last_close_t) *last_close_t = t; }
+                if (o.lock) { if (p.f.picking()) p.f.submit(pick(), true); p.f.in_room(true); p.in_room_t = t; if (t > *last_close_t) *last_close_t = t; }
                 if (o.fallback) p.f.in_room(true);
                 if (o.give_up) { *gave = i; }
             }
@@ -234,6 +279,7 @@ static bool two_pcs(uint32_t seed, uint64_t close_h, uint64_t close_j, uint32_t 
         if (*host_started && t > *start_t + 2000) break;
         if (*gave >= 0 && *gave < 10) break;   // a PC gave up: its link closes (jsp_net_game.cpp native_close); the other then loses the round
     }
+    g_unsaved_j = pc[1].unsaved; g_opens_j = pc[1].g.opens; g_in_room_j = pc[1].in_room_t;
     if (pc[0].start_seen_with_open_page) { std::printf("FAIL: the host's start came while a page was up (seed %u)\n", seed); fails++; }
     const bool a = pc[0].f.pair(out_h), b = pc[1].f.pair(out_j);
     if (!a || !b) return false;
@@ -264,6 +310,28 @@ static void test_two_pcs()
         bool hs; int gave; jspf::PairOut h, j; uint64_t st, lc;
         two_pcs(98, 0, 7000, 4, 9, true, &hs, &gave, &h, &j, &st, &lc);
         CHECK(!hs && gave == 0);
+    }
+    {   // test8: the joiner backs out with Circle first (nothing saved), opens the page again with its own Square 5 s later, picks and closes:
+        // one "not saved" notice, no automatic Square, "in the room" only after the second close, the host's start after that, its pick counts
+        for (uint32_t seed = 200; seed < 220; seed++) {
+            g_back_first_j = true; g_reopen_j = 5000;
+            bool hs; int gave; jspf::PairOut h, j; uint64_t st, lc;
+            const bool eq = two_pcs(seed, 9000, 7000, 4, 9, seed % 2 == 0, &hs, &gave, &h, &j, &st, &lc);
+            g_back_first_j = false; g_reopen_j = 0;
+            CHECK(eq && hs && gave < 0);
+            CHECK(g_unsaved_j == 1 && g_opens_j == 2);
+            CHECK(eq && h.pick[1].fighter == 9 && j.pick[1].fighter == 9);
+            CHECK(g_in_room_j > 7000 + 5000 && st >= g_in_room_j);   // "in the room" waited for the second opening; the start waited for it
+        }
+    }
+    {   // test8: the joiner backs out with Circle and never opens the page again: the round's idle lock takes Random (120 s), then the start
+        g_back_first_j = true; g_reopen_j = 0;
+        bool hs; int gave; jspf::PairOut h, j; uint64_t st, lc;
+        const bool eq = two_pcs(230, 9000, 7000, 4, 9, false, &hs, &gave, &h, &j, &st, &lc);
+        g_back_first_j = false;
+        CHECK(eq && hs && gave < 0 && g_unsaved_j == 1 && g_opens_j == 1);
+        CHECK(eq && h.pick[1].fighter == jspk::kRandom && h.pick[0].fighter == 4);
+        CHECK(st >= 120000);
     }
     {   // a joiner that picks nothing the port knows (a unit outside the named list) plays Random; both PCs agree
         bool hs; int gave; jspf::PairOut h, j; uint64_t st, lc;
@@ -300,6 +368,7 @@ int main(int argc, char** argv)
     test_parse();
     test_read_pick();
     test_step();
+    test_unsaved_step();
     test_two_pcs();
     std::string dir = argc > 0 ? argv[0] : ".";
     if (argc > 1) dir = argv[1];

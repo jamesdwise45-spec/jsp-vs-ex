@@ -2351,6 +2351,8 @@ struct PkUi {
     jsps::PageStep ps;                         // ENHANCEMENT (JSP_PICK_NATIVE_SELECT=1): this PC's step on the game's own Battle settings page
     uint32_t ps_f = 0xFFFFFFFFu, ps_s = 0xFFFFFFFFu;   // the pick block last read on the page (raw)
     uint32_t ps_blk[14] = {};                  // R+0x08..+0x3C before the Square (the log of what the page changed: TODO-MAPPING P3)
+    uint32_t ps_of = 0, ps_os = 0;             // the pick block (raw fighter / support) when the page last opened: unchanged at the lock = not saved
+    uint64_t ps_unsaved_t = 0;                 // test8: when the page closed with nothing saved (the notice shows for 6 s)
     size_t fi = 0, si = 0; bool together = false;   // the picker's values
     std::vector<uint16_t> fighters, supports;       // Random first, then the stock fighter list (0x00756C64); supports: Random, ids only with JSP_PICK_SUPPORT_IDS=1
     std::string notice; uint64_t notice_until = 0;
@@ -2452,9 +2454,12 @@ void pick_frame()
             picking = f.picking() && !rematch;
             if (u.drive == PkDrive::Room && u.ps.active()) {   // ENHANCEMENT (JSP_PICK_NATIVE_SELECT=1): the game's own page, picking or already auto-locked
                 const unsigned long long pg = jsp_native_page_seen_ms();
-                jsps::In pi; pi.now = now; pi.room_now = room_now; pi.page_now = pg && now - pg < 500; pi.fight_now = fight_now;
-                const jsps::Out po = u.ps.step(pi);
                 const uint32_t R = vm_read32(0x0095839Cu);
+                jsps::In pi; pi.now = now; pi.room_now = room_now; pi.page_now = pg && now - pg < 500; pi.fight_now = fight_now;
+                // FIX (test8 mapping run): Circle = Back leaves the page without writing the pick block (only Start = Finish writes it)
+                pi.saved = !pk_plausible(R) || vm_read32(R + jspk::kOffSelfFighter) != u.ps_of || vm_read32(R + jspk::kOffSelfSupport) != u.ps_os;
+                pi.own_locked = !f.picking() || f.round().locked_of(f.round().me());
+                const jsps::Out po = u.ps.step(pi);
                 static const bool sup_ids = pk_setting("JSP_PICK_SUPPORT_IDS", 0) == 1;
                 auto read_block = [&](jspk::Pick* p) {   // this PC's own pick block (U1a: u32 BE at R+0x08 / +0x0C); true = it changed since the last read
                     *p = pk_current(u);
@@ -2475,7 +2480,16 @@ void pick_frame()
                     std::fprintf(stderr, "[net] postgame: Square for the Battle settings page (%s, try %d)\n", host ? "host" : "joiner", u.ps.squares());
                 }
                 if (po.retry) std::fprintf(stderr, "[net] postgame: the Battle settings page did not open or closed at once: Square again\n");
-                if (po.opened) std::fprintf(stderr, "[net] postgame: Battle settings page open (%s)\n", host ? "host" : "joiner");
+                if (po.opened) {
+                    if (pk_plausible(R)) { u.ps_of = vm_read32(R + jspk::kOffSelfFighter); u.ps_os = vm_read32(R + jspk::kOffSelfSupport); }
+                    std::fprintf(stderr, "[net] postgame: Battle settings page open (%s%s)
+", host ? "host" : "joiner", u.ps.opens() > 1 ? ", again" : "");
+                }
+                if (po.unsaved) {
+                    u.ps_unsaved_t = now;
+                    std::fprintf(stderr, "[net] postgame: the Battle settings page closed with the pick block unchanged (Back, or nothing finished with Start): pick not saved, Square opens it again
+");
+                }
                 if (po.closed) std::fprintf(stderr, "[net] postgame: Battle settings page closed: back in the room\n");
                 if (po.read_live) {
                     jspk::Pick p;
@@ -2658,8 +2672,11 @@ void pick_frame()
         if (lock_secs >= 0 && lock_secs <= 30) pn.lines.push_back(Line{ "Your pick locks in " + std::to_string(lock_secs) + " s", jpskin::AMBER });
         pn.guide = { Guide{ jpart::PG_LEFT, jpart::PG_RIGHT, "Change" }, Guide{ jpart::PG_CROSS, -1, "Ready" } };   // "Ready": the game's own room word (BUT_067)
     } else if (u.drive == PkDrive::Room && u.ps.active()) {   // ENHANCEMENT (JSP_PICK_NATIVE_SELECT=1): one line over the game's own page, nothing that covers it
+        // test8: the game writes the page's pick only on Start (Finish); Circle (Back) discards it
         pn.band = u.ps.on_page() && u.ps.state() != jsps::St::SQUARE
-                ? (host ? "Choose your fighter, then go back to the room" : "Choose your fighter, then go back to the room (stage and music: the host's)")
+                ? (host ? "Choose your fighter, then press Start to finish" : "Choose your fighter, then press Start to finish (the host picks the stage and music)")
+                : u.ps.unsaved() ? (now - u.ps_unsaved_t < 6000 ? "Your pick was not saved: press Square to open it again, then finish with Start"
+                                                                 : "Press Square to choose your fighter, then finish with Start")
                 : "Opening the character select...";
         if (lock_secs >= 0) pn.band += " - " + std::to_string(lock_secs) + " s left";
         pn.room = true;   // room bands: top left, under the room's header

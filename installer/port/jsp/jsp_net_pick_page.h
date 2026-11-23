@@ -21,6 +21,10 @@
 //   OPEN     the page is up: the player picks; read_live every frame
 //   BACK     the page is gone and the room page is up again; after back_ms without the page: lock (DONE). A page shorter than min_open_ms opens
 //            again once (a Square that landed on a closing page, or a player who backed out by reflex) before the pick is locked as read
+//   UNSAVED  (test8) the page closed but this PC's pick block did not change (the player backed out with Circle = Back, which discards the
+//            page's edits; only Start = Finish writes them, test8 mapping run): the notice says so, the player may open the page again with
+//            their own Square (then OPEN again: the "in the room" flag still waits); no automatic Square. When the round's idle lock has locked
+//            this PC's pick (In::own_locked) the step is DONE with that pick, as with the port's picker
 //   DONE     the pick is locked; this PC's "in the room" flag may go out (the host's start waits for every PC's flag, so it never presses
 //            "Go to battle" while another player is still on its page)
 //   FALLBACK the page could not be opened or tracked: the port's list picker, as with JSP_PICK_NATIVE_SELECT=0
@@ -78,11 +82,11 @@ inline void read_pick(uint32_t raw_fighter, uint32_t raw_support, FOk&& fighter_
     else *support = kRandom;   // not odd: with Support ids off every Support reads as the room's own
 }
 
-enum class St : uint8_t { OFF, WAIT, SQUARE, OPEN, BACK, DONE, FALLBACK, GIVEUP };
+enum class St : uint8_t { OFF, WAIT, SQUARE, OPEN, BACK, UNSAVED, DONE, FALLBACK, GIVEUP };
 inline const char* st_name(St s)
 {
     return s == St::OFF ? "off" : s == St::WAIT ? "waiting for the room page" : s == St::SQUARE ? "Square sent" : s == St::OPEN ? "page open"
-         : s == St::BACK ? "back in the room" : s == St::DONE ? "done" : s == St::FALLBACK ? "port picker" : "gave up";
+         : s == St::BACK ? "back in the room" : s == St::UNSAVED ? "pick not saved" : s == St::DONE ? "done" : s == St::FALLBACK ? "port picker" : "gave up";
 }
 
 struct Cfg {
@@ -99,6 +103,8 @@ struct In {
     bool room_now = false;   // the room page's update ran in the last 500 ms and no fight HUD for 1.5 s (jsp_net_game.cpp room_now)
     bool page_now = false;   // a page update target ran in the last 500 ms
     bool fight_now = false;  // a fight HUD is drawn (the next fight started: the step ends)
+    bool saved = true;       // this PC's pick block changed since the page last opened (Start = Finish wrote it); read when the lock is due
+    bool own_locked = false; // the round has locked this PC's pick already (its idle lock), or the round is no longer picking
 };
 struct Out {
     bool square = false;     // press Square now
@@ -106,6 +112,7 @@ struct Out {
     bool lock = false;       // read the pick block and lock it (once)
     bool fallback = false;   // switch to the port's list picker (once)
     bool give_up = false;    // leave the round (once)
+    bool unsaved = false;    // the page closed with nothing saved: show the notice (once each time)
     bool opened = false, closed = false, retry = false;   // for the log (once each time)
 };
 
@@ -116,7 +123,10 @@ public:
     St state() const { return st_; }
     // The page step owns the pad's meaning: no notice-box Cross, no Ready Cross, no picker capture while it may be on the page.
     bool on_page() const { return st_ == St::SQUARE || st_ == St::OPEN || st_ == St::BACK; }
-    bool active() const { return st_ == St::WAIT || on_page(); }
+    bool active() const { return st_ == St::WAIT || st_ == St::UNSAVED || on_page(); }
+    // Back in the room with nothing saved: the player may open the page again (their own Square); the "in the room" flag waits.
+    bool unsaved() const { return st_ == St::UNSAVED; }
+    int opens() const { return opens_; }
     // This PC may say "in the room" (the pick is locked as read, or the port picker took over).
     bool finished() const { return st_ == St::DONE || st_ == St::FALLBACK; }
     int squares() const { return squares_; }
@@ -159,7 +169,12 @@ public:
             if (!in.room_now) { back_t_ = in.now; break; }                     // a notice box or a transition: wait for the room page
             if (in.now - back_t_ < cfg_.back_ms) break;
             if (back_t_ - open_t_ < cfg_.min_open_ms && opens_ < cfg_.tries) { st_ = St::WAIT; room_seen_ = false; o.retry = true; break; }
+            if (!in.saved && !in.own_locked) { st_ = St::UNSAVED; o.unsaved = true; break; }   // Circle = Back: nothing written
             st_ = St::DONE; o.lock = true;
+            break;
+        case St::UNSAVED:
+            if (in.page_now) { st_ = St::OPEN; open_t_ = in.now; opens_++; o.opened = true; o.read_live = true; break; }   // the player's own Square
+            if (in.own_locked) { st_ = St::DONE; o.lock = true; }   // the round's idle lock took this PC's pick (Random, or what it showed)
             break;
         default: break;
         }
