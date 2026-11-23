@@ -1514,7 +1514,12 @@ namespace JStarsLauncher
             LoadService();
             serviceUseBtn = new Button { Text = serviceServer == null ? "" : ServiceButtonText(), Location = P(16, y), AutoSize = true, MinimumSize = Z(220, 30),
                 Font = new Font("Segoe UI", 9F, FontStyle.Bold), UseMnemonic = false, Visible = serviceServer != null };
-            serviceUseBtn.Click += delegate { UseService(); };
+            serviceUseBtn.Click += delegate {   // FIX (test6 tester run): a second click queued while the first one ran (its message box open) ran UseService
+                // again and showed "is already on. Nothing was changed." although the first click had just turned it on. One click at a time.
+                if (!serviceUseBtn.Enabled) return;
+                serviceUseBtn.Enabled = false;
+                try { UseService(); } finally { Application.DoEvents(); serviceUseBtn.Enabled = true; }
+            };
             p.Controls.Add(serviceUseBtn);
             serviceUseNote = new Label { Text = serviceServer == null ? "" : ServiceOfferText(), Location = P(16, y + 36), Size = Z(700, 36),
                 ForeColor = SystemColors.GrayText, UseMnemonic = false, Visible = serviceServer != null };
