@@ -550,6 +550,7 @@ void audio_lock_wait()
 }
 void audio_lock_start()
 {
+    g_ps3_audio_lock_stretch_us = 0;   // FIX (review of test7): no stretch carried over from the last match
     if (!audio_lock_on() || g.bench) return;
     g_ps3_audio_lock_mute = 0; g_ps3_audio_lock_done = 0; ps3_audio_lock_set_target(0);
     audio_lock_wait();
@@ -557,6 +558,7 @@ void audio_lock_start()
 }
 void audio_lock_end()
 {
+    g_ps3_audio_lock_stretch_us = 0;   // FIX (review of test7): no stretch carried over from the last match
     if (g_ps3_audio_lock_target < 0) return;
     ps3_audio_lock_set_target(-1); g_ps3_audio_lock_mute = 0;
     std::fprintf(stderr, "[net] audio lock ended: %llu waits, mean %.2f ms, %llu timeouts\n", (unsigned long long)g_audio_waits, g_audio_waits ? g_audio_wait_ms / g_audio_waits : 0.0, (unsigned long long)g_audio_timeouts);
