@@ -3,8 +3,9 @@
 // layout paints with no art at all (the fallback) inside its picture. Synthetic data only: no game files, no GPU.
 //
 // Desk use (NOT in CI, needs the player's own disc folder; writes nothing but the previews asked for):
-//   pick_art_test --data <disc>/PS3_GAME/USRDIR/data/PS3 [--preview DIR] [--bg picture.ppm]
-// reads the game's art exactly as the port does and paints the prompt, the picker, the Leave dialog and the band to DIR/*.ppm.
+//   pick_art_test --data <disc>/PS3_GAME/USRDIR/data/PS3 [--preview DIR] [--bg picture.ppm] [--font menu_font.jmf]
+// reads the game's art exactly as the port does and paints the prompt, the picker, the Leave dialog and the band to DIR/*.ppm (with
+// --font, the overlay-font texts too: the header, and every text of the fallback).
 #include "../port/jsp/jsp_pick_skin.h"
 
 #include <chrono>
@@ -173,7 +174,7 @@ static void test_fallback()
         CHECK(inside(f) && f.pw >= jpskin::kMenuW);
         CHECK(open == 0.0f ? opaque(f) == 0 : opaque(f) > size_t(f.pw) * size_t(f.ph) / 2);
         CHECK(!f.text.empty() && f.text[0].s == "Match over");   // the header in the overlay font, then the body texts (no game font)
-        size_t n = 0; for (const auto& t : f.text) n += t.s == "Fight again" || t.s == "Confirm"; CHECK(n == 2);
+        size_t n = 0; for (const auto& t : f.text) n += t.s == "Fight again"; CHECK(n == 1);   // the guide is its own bar now
     }
     jpskin::View p; p.kind = jpskin::MENU; p.title = "Select character"; p.sel = 0;
     p.rows = { { "Battle Character", "Naruto Uzumaki" }, { "Support Character", "Random" }, { "Teams", "versus, each with a COM" } };
@@ -184,10 +185,13 @@ static void test_fallback()
     d.guide = { { jpart::PG_CROSS, -1, "Leave" }, { jpart::PG_CIRCLE, -1, "Back" } };
     const jpskin::Frame fd = jpskin::dialog(P, nullptr, d, 1.0f);
     CHECK(inside(fd) && opaque(fd) > 0);
-    const jpskin::Frame fb = jpskin::band(P, "Fight again: back to the room...");
+    const jpskin::Frame fb = jpskin::band(P, nullptr, "Fight again: back to the room...");
     CHECK(inside(fb) && opaque(fb) > 0);
-    const jpskin::Frame fl = jpskin::band(P, std::string(400, 'W'));   // a long band stays on screen
+    const jpskin::Frame fl = jpskin::band(P, nullptr, std::string(400, 'W'));   // a long band stays on screen
     CHECK(inside(fl));
+    const jpskin::Frame fg = jpskin::guide_bar(P, v.guide);   // the guide bar at the game's place, above nothing else of ours
+    CHECK(inside(fg) && opaque(fg) > 0 && fg.y >= fb.y + fb.ph);
+    for (const jpskin::Frame& m : { jpskin::menu(P, v, 1.0f, 1.0f), fp, fd }) CHECK(m.y + m.ph <= fg.y);   // panels end above the guide bar
     CHECK(v.key() != p.key() && v.key() == prompt_view().key());
 }
 
@@ -200,26 +204,68 @@ static std::vector<uint8_t> read_ppm(const char* p, int& w, int& h)
     if (std::fscanf(f, "P6 %d %d %d", &w, &h, &mx) == 3 && w > 0 && h > 0) { std::fgetc(f); px.resize(size_t(w) * h * 3); if (std::fread(px.data(), 1, px.size(), f) != px.size()) px.clear(); }
     std::fclose(f); return px;
 }
+// The overlay's own font (menu_font.jmf, the port's art: installer/tools/menu_font_art.py), drawn as the overlay does, so the previews show the
+// header and the fallback texts too. Layout as in menu_font_art.py: 10 u32 LE header, count x 8 u16 LE glyph records, RGBA atlas.
+struct Jmf {
+    jpart::Image atlas; uint32_t ns = 0, first = 0, count = 0, cell_h = 0, base = 0, stride = 0, cap = 0; std::vector<uint16_t> tab;
+    bool load(const char* path)
+    {
+        FILE* f = path ? std::fopen(path, "rb") : nullptr; if (!f) return false;
+        uint32_t h[10] = {};
+        bool ok = std::fread(h, 4, 10, f) == 10 && h[0] == 0x31464D4Au;
+        if (ok) { ns = h[3]; first = h[4]; count = h[5]; cell_h = h[6]; base = h[7]; stride = h[8]; cap = h[9]; tab.resize(size_t(count) * 8);
+                  atlas.w = int(h[1]); atlas.h = int(h[2]); atlas.px.resize(size_t(h[1]) * h[2] * 4);
+                  ok = std::fread(tab.data(), 2, tab.size(), f) == tab.size() && std::fread(atlas.px.data(), 1, atlas.px.size(), f) == atlas.px.size(); }
+        std::fclose(f); return ok;
+    }
+    float width(const std::string& s, float scale) const
+    {
+        float w = 0;
+        for (unsigned char ch : s) { const uint32_t i = ch >= first && ch < first + count ? ch - first : '?' - first; w += tab[size_t(i) * 8 + 4] / 16.0f; }
+        return w * scale;
+    }
+    void draw(jpskin::Canvas& c, const jpskin::TextOp& t) const
+    {
+        const float by = t.y + cap * t.scale;
+        const int k = t.style < 0 ? 0 : t.style;
+        const int planes[2] = { ns >= 6 && k < 2 ? 2 + 2 * k : k, ns >= 6 && k < 2 ? 3 + 2 * k : -1 };
+        const float r = (t.rgba & 255) / 255.0f, g = (t.rgba >> 8 & 255) / 255.0f, b = (t.rgba >> 16 & 255) / 255.0f, a = (t.rgba >> 24) / 255.0f;
+        for (int pl : planes) {
+            if (pl < 0) continue;
+            float pen = t.x;
+            for (unsigned char ch : t.s) {
+                uint32_t i = ch >= first && ch < first + count ? ch - first : '?' - first;
+                const uint16_t* m = &tab[size_t(i) * 8];
+                if (m[2]) c.image(atlas, m[0], float(m[1] + pl * stride), m[2], float(cell_h), pen - int16_t(m[3]) * t.scale, by - base * t.scale,
+                                  m[2] * t.scale, cell_h * t.scale, a, jpskin::OVER, r, g, b);
+                pen += m[4] / 16.0f * t.scale;
+            }
+        }
+    }
+};
+static Jmf g_jmf; static bool g_jmf_ok = false;
 static void preview(const std::string& out, const std::vector<jpskin::Frame>& fs, const std::vector<uint8_t>& bg, int bw, int bh)
 {
-    std::vector<float> img(size_t(1280) * 720 * 3, 0.12f);
-    if (bw > 0) for (int y = 0; y < 720; y++) for (int x = 0; x < 1280; x++) for (int k = 0; k < 3; k++)
-        img[(size_t(y) * 1280 + x) * 3 + k] = bg[(size_t(y * bh / 720) * bw + x * bw / 1280) * 3 + k] / 255.0f;
-    for (const auto& f : fs)
-        for (int y = 0; y < f.ph; y++) for (int x = 0; x < f.pw; x++) {
-            const uint8_t* s = &f.pic[(size_t(y) * f.pw + x) * 4]; const int X = f.x + x, Y = f.y + y;
-            if (X < 0 || Y < 0 || X >= 1280 || Y >= 720) continue;
-            const float a = s[3] / 255.0f;
-            for (int k = 0; k < 3; k++) { float& d = img[(size_t(Y) * 1280 + X) * 3 + k]; d = s[k] / 255.0f * a + d * (1 - a); }
-        }
+    jpskin::Canvas c; c.make(1280, 720);
+    for (int y = 0; y < 720; y++) for (int x = 0; x < 1280; x++) {
+        float v[3] = { 0.12f, 0.12f, 0.12f };
+        if (bw > 0) for (int k = 0; k < 3; k++) v[k] = bg[(size_t(y * bh / 720) * bw + x * bw / 1280) * 3 + k] / 255.0f;
+        c.over(x, y, v[0], v[1], v[2], 1.0f);
+    }
+    for (const auto& f : fs) {
+        jpart::Image im; im.w = f.pw; im.h = f.ph; im.px = f.pic;
+        c.image(im, float(f.x), float(f.y), float(f.pw), float(f.ph), 1.0f);
+        for (const auto& t : f.text) { if (g_jmf_ok) g_jmf.draw(c, t); else std::printf("  overlay text (no --font) at %.0f,%.0f: %s\n", t.x, t.y, t.s.c_str()); }
+    }
+    std::vector<uint8_t> px; c.straight(px);
     FILE* o = std::fopen(out.c_str(), "wb"); if (!o) return;
     std::fprintf(o, "P6 1280 720 255\n");
-    for (float v : img) std::fputc(int(std::min(1.0f, std::max(0.0f, v)) * 255.0f + 0.5f), o);
+    for (size_t i = 0; i < px.size(); i += 4) { std::fputc(px[i], o); std::fputc(px[i + 1], o); std::fputc(px[i + 2], o); }
     std::fclose(o);
-    for (const auto& f : fs) for (const auto& t : f.text) std::printf("  overlay text at %.0f,%.0f scale %.2f: %s\n", t.x, t.y, t.scale, t.s.c_str());
 }
-static int desk(const char* data, const char* dir, const char* bgp)
+static int desk(const char* data, const char* dir, const char* bgp, const char* font)
 {
+    g_jmf_ok = g_jmf.load(font);
     jpart::DirIo io(data);
     std::vector<std::string> log;
     const jpart::Art art = jpart::load_art(io, log);
@@ -229,34 +275,50 @@ static int desk(const char* data, const char* dir, const char* bgp)
     int bw = 0, bh = 0; const std::vector<uint8_t> bg = bgp ? read_ppm(bgp, bw, bh) : std::vector<uint8_t>();
     const jpskin::Painter P(&art, nullptr);
     jpskin::View v = prompt_view();
+    v.rows = { { art.word("PAU_011", "Fight again"), "" }, { art.word("PAU_009", "Re-select character(s)"), "" } };   // the glue's words
+    v.guide = { { jpart::PG_CROSS, -1, art.word("BUT_000", "Confirm") }, { jpart::PG_CIRCLE, -1, art.word("BUT_017", "Leave") } };
+    for (const auto& kv : art.words) std::printf("[pickui] word %s = \"%s\"\n", kv.first.c_str(), kv.second.c_str());
     { const auto t0 = std::chrono::steady_clock::now(); for (int i = 0; i < 10; i++) (void)jpskin::menu(P, v, 1.0f, 1.0f);
       std::printf("[pickui] menu paint: %.2f ms\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / 10); }
-    preview(std::string(dir) + "/prompt.ppm", { jpskin::menu(P, v, 1.0f, 1.0f) }, bg, bw, bh);
-    v.sel = 0; preview(std::string(dir) + "/prompt_sel0_open50.ppm", { jpskin::menu(P, v, 0.5f, 0.4f) }, bg, bw, bh);
+    const std::string d0 = std::string(dir) + "/";
+    preview(d0 + "prompt.ppm", { jpskin::menu(P, v, 1.0f, 1.0f), jpskin::guide_bar(P, v.guide) }, bg, bw, bh);
+    v.sel = 0;
+    { jpskin::Frame half = jpskin::menu(P, v, 1.0f, 1.0f), gb = jpskin::guide_bar(P, v.guide);   // the fade at 50 % as the glue blits it (alpha scaled, 6 px lift)
+      for (jpskin::Frame* f : { &half, &gb }) { for (size_t i = 3; i < f->pic.size(); i += 4) f->pic[i] = uint8_t(f->pic[i] / 2); for (auto& t : f->text) t.rgba = (t.rgba & 0xFFFFFFu) | (t.rgba >> 25) << 24; }
+      half.y += 6; preview(d0 + "prompt_sel0_open50.ppm", { half, gb }, bg, bw, bh); }
     jpskin::View p; p.kind = jpskin::MENU; p.title = "Select character"; p.sel = 1;
-    p.rows = { { "Battle Character", "Gintoki Sakata" }, { "Support Character", "Random" }, { "Teams", "1st + 3rd to join vs 2nd + COM" } };
-    p.lines = { { "Pick your character", jpskin::WHITE }, { "You: Gintoki Sakata / Random", jpskin::GREY }, { "Opponent: choosing...", jpskin::GREY }, { "Your pick locks in 21 s", jpskin::AMBER } };
+    p.rows = { { "Battle Character", "Gintoki Sakata" }, { "Support Character", "Random" }, { "Teams", "P1 + COM vs P2 + COM" } };
+    p.lines = { { "Pick your character", jpskin::WHITE }, { "P1 (you): Gintoki Sakata + Random, choosing", jpskin::GREY }, { "P2: Random + Random, choosing", jpskin::GREY }, { "Your pick locks in 21 s", jpskin::AMBER } };
     p.guide = { { jpart::PG_LEFT, jpart::PG_RIGHT, "Change" }, { jpart::PG_CROSS, -1, "Ready" } };
-    preview(std::string(dir) + "/picker.ppm", { jpskin::menu(P, p, 1.0f, 1.0f) }, bg, bw, bh);
-    jpskin::View d; d.kind = jpskin::DIALOG; d.title = "Leave the match?"; d.rows = { { "Leave", "" } };
+    preview(d0 + "picker.ppm", { jpskin::menu(P, p, 1.0f, 1.0f), jpskin::guide_bar(P, p.guide) }, bg, bw, bh);
+    jpskin::View d; d.kind = jpskin::DIALOG; d.title = "Leave the match?"; d.rows = { { art.word("BUT_017", "Leave"), "" } };
     d.lines = { { "Rollback ends for you.", jpskin::GREY }, { "Then leave the room with Circle.", jpskin::GREY } };
-    d.guide = { { jpart::PG_CROSS, -1, "Leave" }, { jpart::PG_CIRCLE, -1, "Back" } };
-    preview(std::string(dir) + "/leave.ppm", { jpskin::dialog(P, &art, d, 1.0f) }, bg, bw, bh);
-    preview(std::string(dir) + "/band.ppm", { jpskin::band(P, "Fight again: back to the room...") }, bg, bw, bh);
-    const jpskin::Painter F(nullptr, nullptr);
-    preview(std::string(dir) + "/fallback_prompt.ppm", { jpskin::menu(F, prompt_view(), 1.0f, 1.0f) }, bg, bw, bh);
+    d.guide = { { jpart::PG_CROSS, -1, art.word("BUT_017", "Leave") }, { jpart::PG_CIRCLE, -1, art.word("BUT_013", "Back") } };
+    preview(d0 + "leave.ppm", { jpskin::dialog(P, &art, d, 1.0f), jpskin::guide_bar(P, d.guide) }, bg, bw, bh);
+    preview(d0 + "band.ppm", { jpskin::band(P, &art, art.word("PAU_011", "Fight again") + ": back to the room...") }, bg, bw, bh);
+    // the game's own end-of-fight (Free Battle finish) menu as its art and tables describe it: its "Pause Menu" title plate and its rows
+    // (table 004: Fight again, Re-select character(s), ... ; layout as ours: its real placement lives in the game's code, not in its data)
+    { jpskin::View r; r.kind = jpskin::MENU; r.title = ""; r.sel = 0;
+      r.rows = { { art.word("PAU_011", "Fight again"), "" }, { art.word("PAU_009", "Re-select character(s)"), "" }, { "View replay", "" }, { "Save Replay", "" }, { "Return to main menu", "" } };
+      jpskin::Frame f = jpskin::menu(P, r, 1.0f, 1.0f), plate;
+      if (art.title_plate.ok()) { plate.x = f.x + 18; plate.y = f.y - 4; plate.pw = art.title_plate.w; plate.ph = art.title_plate.h; plate.pic = art.title_plate.px; }
+      preview(d0 + "game_endmenu_recon.ppm", { f, plate, jpskin::guide_bar(P, v.guide) }, bg, bw, bh); }
+    const jpskin::Painter F(nullptr, [](const std::string& t, float sc) { return g_jmf_ok ? g_jmf.width(t, sc) : 0.0f; });
+    preview(d0 + "fallback_prompt.ppm", { jpskin::menu(F, prompt_view(), 1.0f, 1.0f), jpskin::guide_bar(F, prompt_view().guide) }, bg, bw, bh);
+    preview(d0 + "fallback_band.ppm", { jpskin::band(F, nullptr, "Fight again: back to the room...") }, bg, bw, bh);
     return art.any() ? 0 : 1;
 }
 
 int main(int argc, char** argv)
 {
-    const char *data = nullptr, *dir = nullptr, *bg = nullptr;
+    const char *data = nullptr, *dir = nullptr, *bg = nullptr, *font = nullptr;
     for (int i = 1; i + 1 < argc; i += 2) {
         if (!std::strcmp(argv[i], "--data")) data = argv[i + 1];
         else if (!std::strcmp(argv[i], "--preview")) dir = argv[i + 1];
         else if (!std::strcmp(argv[i], "--bg")) bg = argv[i + 1];
+        else if (!std::strcmp(argv[i], "--font")) font = argv[i + 1];
     }
-    if (data) return desk(data, dir, bg);
+    if (data) return desk(data, dir, bg, font);
     test_cmp(); test_stpk_srd(); test_font(); test_fallback();
     if (fails) { std::printf("pick_art_test: %d failure(s)\n", fails); return 1; }
     std::printf("pick_art_test: all passed\n");

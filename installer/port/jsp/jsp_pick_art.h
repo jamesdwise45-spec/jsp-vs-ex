@@ -25,6 +25,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -143,7 +145,7 @@ inline bool stpk_get(const Bytes& pak, const std::string& name, Bytes& out)
 }
 
 // ---- SRD textures ---------------------------------------------------------------------------------------------------------------------
-struct TexInfo { std::string name; int w = 0, h = 0, fmt = 0; uint32_t off = 0, len = 0; };
+struct TexInfo { std::string name; int w = 0, h = 0, fmt = 0, swz = 0; uint32_t off = 0, len = 0; };   // swz: the $TXR swizzle word (0x200: Morton order)
 inline std::vector<TexInfo> srd_textures(const Bytes& s)
 {
     std::vector<TexInfo> out;
@@ -155,7 +157,7 @@ inline std::vector<TexInfo> srd_textures(const Bytes& s)
         if (sp > s.size() || sp + sl > s.size()) break;
         if (!memcmp(&s[p], "$TXR", 4) && dl >= 13) {
             TexInfo t;
-            t.w = int(rd16(&s[dp + 6])); t.h = int(rd16(&s[dp + 8])); t.fmt = s[dp + 12];
+            t.swz = int(rd16(&s[dp + 4])); t.w = int(rd16(&s[dp + 6])); t.h = int(rd16(&s[dp + 8])); t.fmt = s[dp + 12];
             for (size_t q = sp; q + 16 <= sp + sl;) {   // the $RSI sub-block
                 const size_t qd = rd32(&s[q + 4]);
                 if (!memcmp(&s[q], "$RSI", 4) && qd >= 0x21 && q + 16 + qd <= s.size()) {
@@ -238,13 +240,22 @@ inline Image decode_argb_morton(const uint8_t* d, size_t n, int w, int h)
         }
     return im;
 }
+// ARGB8 in rows (a texture that is not a power of two).
+inline Image decode_argb_linear(const uint8_t* d, size_t n, int w, int h)
+{
+    Image im;
+    if (w <= 0 || h <= 0 || n < size_t(w) * size_t(h) * 4) return im;
+    im.w = w; im.h = h; im.px.resize(size_t(w) * size_t(h) * 4);
+    for (size_t i = 0; i < size_t(w) * size_t(h); i++) { const uint8_t* s = d + i * 4; uint8_t* o = &im.px[i * 4]; o[0] = s[1]; o[1] = s[2]; o[2] = s[3]; o[3] = s[0]; }
+    return im;
+}
 inline Image decode_tex(const TexInfo& t, const Bytes& v)
 {
     if (uint64_t(t.off) + t.len > v.size()) return Image();
     const uint8_t* d = v.data() + t.off;
     if (t.fmt == 0x0F) return decode_dxt(d, t.len, t.w, t.h, false);
     if (t.fmt == 0x11) return decode_dxt(d, t.len, t.w, t.h, true);
-    if (t.fmt == 0x01) return decode_argb_morton(d, t.len, t.w, t.h);
+    if (t.fmt == 0x01) return t.swz == 0x200 ? decode_argb_morton(d, t.len, t.w, t.h) : decode_argb_linear(d, t.len, t.w, t.h);
     return Image();
 }
 // The texture called `name` ("" = the first) of an SRD / SRDV pair.
@@ -308,7 +319,12 @@ struct Art {
     Image win[3], carsol, halftone, swirl;         // the general dialog: left, right, middle; the yellow button glow (additive); decorations
     Image guide[3];                                // the guide strip: left, middle, right
     Image pad[PG_N];                               // the game's button glyphs
+    Image note[3], busy, dots;                     // the game's notice window (save / load / connect: left, middle, right), its busy icon, its dotted rule
+    Image title_plate;                             // the pause menu's own title art ("Pause Menu"; kept for the desk comparison, not drawn in the menu)
     Font font;                                     // the system font (US)
+    std::map<std::string, std::string> words;      // the game's own strings by id (PAU_011 "Fight again", ...), ASCII, button tags removed
+    // the game's string `id`, else `dflt`
+    std::string word(const char* id, const char* dflt) const { const auto it = words.find(id); return it == words.end() || it->second.empty() ? dflt : it->second; }
     bool panel_ok() const { for (const Image& i : pl) if (!i.ok()) return false; return true; }
     bool dialog_ok() const { return win[0].ok() && win[1].ok() && win[2].ok(); }
     bool guide_ok() const { return guide[0].ok() && guide[1].ok() && guide[2].ok(); }
@@ -318,11 +334,38 @@ struct Art {
         std::string s;
         auto add = [&s](const char* n, bool ok) { s += s.empty() ? "" : ", "; s += n; s += ok ? " yes" : " no"; };
         add("pause panel", panel_ok()); add("cursor", cursor.ok() && cursorline.ok()); add("dialog", dialog_ok() && carsol.ok());
-        add("guide strip", guide_ok()); add("button glyphs", pad_ok()); add("font", font.ok());
+        add("guide strip", guide_ok()); add("button glyphs", pad_ok()); add("notice window", note[0].ok() && note[1].ok() && note[2].ok() && busy.ok());
+        add("font", font.ok()); s += ", " + std::to_string(words.size()) + " strings";
         return s;
     }
     bool any() const { return panel_ok() || dialog_ok() || guide_ok() || pad_ok() || font.ok(); }
 };
+
+// A message-table text (UTF-16 LE with BOM) as ASCII: "<PAD=...>" tags and the space after them removed, other non-ASCII as '?'.
+inline std::string utf16_text(const Bytes& b)
+{
+    std::string s;
+    size_t i = b.size() >= 2 && b[0] == 0xFF && b[1] == 0xFE ? 2 : 0;
+    for (; i + 1 < b.size(); i += 2) {
+        const uint32_t c = uint32_t(b[i]) | uint32_t(b[i + 1]) << 8;
+        if (!c) break;
+        s += c >= 32 && c < 127 ? char(c) : c == 10 ? ' ' : '?';
+    }
+    for (size_t a; (a = s.find("<PAD=")) != std::string::npos;) {
+        const size_t e = s.find('>', a);
+        if (e == std::string::npos) break;
+        size_t z = e + 1;
+        while (z < s.size() && s[z] == ' ') z++;
+        s.erase(a, z - a);
+    }
+    return s;
+}
+// The texts `ids` ("PAU_011" -> "PAU_011_US.txt") of a message package into `out`.
+inline void read_words(const Bytes& pak, std::initializer_list<const char*> ids, std::map<std::string, std::string>& out)
+{
+    Bytes t;
+    for (const char* id : ids) if (stpk_get(pak, std::string(id) + "_US.txt", t)) out[id] = utf16_text(t);
+}
 
 // The entry `path` ("Dir/File") of a CPK `base`, made plain.
 inline bool cpk_get(jmods::Io& io, const jmods::Archive& a, const std::string& path, Bytes& out)
@@ -391,6 +434,12 @@ inline Art load_art(jmods::Io& io, std::vector<std::string>& log)
             if (stpk_get(wm, "guide.srd", s) && stpk_get(wv, "guide.srdv", v))
                 for (int i = 0; i < 3; i++) art.guide[i] = srd_image(s, v, "main_guide_00" + std::to_string(i) + ".png");
             else log.push_back("guide: not found");
+            if (stpk_get(wm, "connect_window.srd", s) && stpk_get(wv, "connect_window.srdv", v)) {
+                for (int i = 0; i < 3; i++) art.note[i] = srd_image(s, v, "save_load_pl_00" + std::to_string(i) + ".png");
+                art.dots = srd_image(s, v, "line_000.png");
+            } else log.push_back("connect_window: not found");
+            if (stpk_get(wm, "connect_anime.srd", s) && stpk_get(wv, "connect_anime.srdv", v)) art.busy = srd_image(s, v, "load_icon_000.png");
+            else log.push_back("connect_anime: not found");
         } else if (all) log.push_back("game_window: not found");
         if (all && stpk_get(am, "pad_texture.srd", s) && stpk_get(av, "pad_texture.srdv", v)) {
             static const char* const n[PG_N] = { "05_sys_cross.png", "02_sys_circle.png", "20_sys_plus_up.png", "21_sys_plus_dn.png", "23_sys_plus_left.png", "22_sys_plus_right.png" };
@@ -400,6 +449,11 @@ inline Art load_art(jmods::Io& io, std::vector<std::string>& log)
             stpk_get(um, "op_font_US_PS3.stx", s) && stpk_get(uv, "op_font_US_PS3.srdv", v)) {
             if (!spft_parse(s, srd_image(s, v, ""), art.font)) log.push_back("op_font_US_PS3: not decoded");
         } else log.push_back("op_font_US_PS3: not found");
+        Bytes sf, mp;
+        if (!um.empty() && stpk_get(um, "game_system_font_US_m.pak", sf)) {
+            if (stpk_get(sf, "I_Button_US.pak", mp)) read_words(mp, { "BUT_000", "BUT_013", "BUT_017" }, art.words);   // Confirm, Back, Leave
+            if (stpk_get(sf, "D_Online_US.pak", mp)) read_words(mp, { "ONLPS_034", "ONLPS_073" }, art.words);         // Standing by..., Leave the room?
+        } else log.push_back("game_system_font_US: not found");
     }
     if (open("partition_op_battle_ps3.cpk", battle)) {
         Bytes bm, bv, pm, pv, s, v;
@@ -410,6 +464,12 @@ inline Art load_art(jmods::Io& io, std::vector<std::string>& log)
             art.cursor = srd_image(s, v, "pause_cursor_000.png"); art.cursorline = srd_image(s, v, "pause_cursorline_000.png");
             art.rule = srd_image(s, v, "pause_line_000.png"); art.band = srd_image(s, v, "pause_gurade_000.png");
         } else log.push_back("pause_menu: not found");
+        Bytes um, uv, pu, pw;
+        if (cpk_get(io, battle, "battle/resident/battle_resident_US_m.pak", um) && stpk_get(um, "pause_menu_US_m.pak", pu)) {
+            if (stpk_get(pu, "V_Pause_US.pak", pm)) read_words(pm, { "PAU_009", "PAU_011", "PAU_032" }, art.words);   // Re-select character(s), Fight again, OK
+            if (cpk_get(io, battle, "battle/resident/battle_resident_US_v.pak", uv) && stpk_get(uv, "pause_menu_US_v.pak", pw) && stpk_get(pu, "pause_menu_US_PS3.srd", s) &&
+                stpk_get(pw, "pause_menu_US_PS3.srdv", v)) art.title_plate = srd_image(s, v, "pause_tx_000.png");
+        } else log.push_back("pause_menu_US: not found");
     }
     return art;
 }

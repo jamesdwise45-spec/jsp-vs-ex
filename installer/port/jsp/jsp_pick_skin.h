@@ -217,27 +217,59 @@ public:
             }
     }
     // the guide strip; returns its width (measure only when c is null)
-    float guide(Canvas* c, int fx, int fy, float x, float y, const std::vector<Guide>& gs, float al, std::vector<TextOp>* ops) const
+    // the guide strip at (x, y), `width` wide (0: as wide as its items); returns its width. The game's sizes: glyph 26 px, text cap 18 px.
+    float guide(Canvas* c, int fx, int fy, float x, float y, const std::vector<Guide>& gs, float al, std::vector<TextOp>* ops, float width = 0) const
     {
-        const float H = 39, gs_ = 26, sc = 0.66f;
-        float w = 28;
-        for (const Guide& g : gs) w += gs_ + 6 + tw(g.s, sc) + 22;
-        w += 6;
+        const float H = 39, gs_ = 26, sc = 0.75f;
+        float w = 36;
+        for (const Guide& g : gs) w += gs_ + 6 + tw(g.s, sc) + 24;
+        w = std::max(w + 6, width);
         if (!c) return w;
         if (a_ && a_->guide_ok()) {
             const float lw = 32, rw = 32;
             c->image(a_->guide[0], x, y, lw, H, al); c->image(a_->guide[1], x + lw, y, w - lw - rw, H, al); c->image(a_->guide[2], x + w - rw, y, rw, H, al);
         } else { c->fill(x + 10, y + 3, w - 20, H - 6, 196, 196, 196, 0.95f * al); c->fill(x + 10, y + 3, w - 20, 3, 30, 30, 30, al); c->fill(x + 10, y + H - 6, w - 20, 3, 30, 30, 30, al); }
-        float px = x + 28;
+        float px = x + 36;
         for (const Guide& g : gs) {
             glyph(*c, g.glyph, px, y + (H - gs_) / 2, gs_, al);
             if (g.glyph2 >= 0) glyph(*c, g.glyph2, px, y + (H - gs_) / 2, gs_, al);   // the same D-pad with the second arm lit too
             px += gs_;
             px += 6;
-            text(*c, fx, fy, px, y + 27, g.s, sc, WHITE, al, *ops, true);
-            px += tw(g.s, sc) + 22;
+            text(*c, fx, fy, px, y + 28, g.s, sc, WHITE, al, *ops, true);
+            px += tw(g.s, sc) + 24;
         }
         return w;
+    }
+    // a menu title: the game's system font in the treatment of its own title plates (chrome white-to-grey, black rim, italic lean);
+    // the overlay font when the game's font is not there
+    void title(Canvas& c, int fx, int fy, float x, float base, const std::string& s, float scale, float al, std::vector<TextOp>& ops) const
+    {
+        if (!font()) { ops.push_back({ fx + x, fy + base - 21.0f * 1.1f, s, 1.1f, rgba(255, 255, 255, al), 0 }); return; }
+        const jpart::Font& f = a_->font;
+        const int pad = 6, tw_ = int(f.width(s, scale)) + 2 * pad + 16, th = int(f.line * scale) + 2 * pad;
+        Canvas t; t.make(tw_, th);
+        t.text(f, float(pad), pad + f.base * scale, s, scale, 255, 255, 255, 1.0f);
+        const float top = pad + (f.base - f.cap) * scale, bot = pad + f.base * scale, lean = 0.2f;
+        auto cov = [&t](int x, int y) { return x < 0 || y < 0 || x >= t.w || y >= t.h ? 0.0f : t.c[(size_t(y) * t.w + x) * 4 + 3]; };
+        const float ox = x - pad, oy = base - (pad + f.base * scale);
+        for (int y = 0; y < th; y++) {
+            const float sh = (bot - y) * lean;
+            const float g = std::clamp((y - top) / std::max(1.0f, bot - top), 0.0f, 1.0f), v = 1.0f - 0.45f * g * g;   // white -> grey, like the plates
+            for (int xx = 0; xx < tw_; xx++) {
+                float rim = 0;
+                for (int dy = -2; dy <= 2; dy++) for (int dx = -2; dx <= 2; dx++) if (dx * dx + dy * dy <= 5) rim = std::max(rim, cov(xx + dx, y + dy));
+                const float a = cov(xx, y);
+                const int X = int(ox + xx + sh), Y = int(oy + y);
+                if (rim > 0) { c.over(X + 1, Y + 2, 0, 0, 0, rim * al * 0.9f); c.over(X, Y, 0, 0, 0, rim * al); }   // the drop and the rim
+                if (a > 0) c.over(X, Y, v * a * al, v * a * al, v * a * al, a * al);
+            }
+        }
+    }
+    // the dotted rule of the game's notice window (else a faint line)
+    void dots(Canvas& c, float x, float y, float W, float al) const
+    {
+        if (a_ && a_->dots.ok()) c.image(a_->dots, x, y, W, 4, 0.7f * al);
+        else c.hgrad(x, y + 1, W, 1, 255, 255, 255, 0.35f * al, 0.0f);
     }
     static constexpr float kOvScale = 0.9f;   // the overlay font is wider: a little smaller at the same nominal size
 private:
@@ -247,21 +279,23 @@ private:
 
 // ---- the three layouts ------------------------------------------------------------------------------------------------------------------
 constexpr int kMenuW = 520, kMenuValuesW = 680, kRowH = 46, kLineH = 30, kMenuX = 700;
+constexpr int kLinesGap = 22;     // rows -> status lines (the dotted rule in the gap)
+constexpr int kGuideY = 626;      // the game's guide bar: its top at 720p (Main Menu, Character Info)
+constexpr float kGlyphGap = 10;   // D-pad glyph <-> value text
 inline Frame menu(const Painter& P, const View& v, float open, float sweep)
 {
     Frame f;
     const float al = std::clamp(open, 0.0f, 1.0f), lift = (1.0f - al) * 12.0f;
     const int nrows = int(v.rows.size()), nlines = int(v.lines.size());
-    const int H = std::max(144, 72 + nrows * kRowH + (nlines ? 10 + nlines * kLineH : 0) + 30);
-    const float gw = v.guide.empty() ? 0 : P.guide(nullptr, 0, 0, 0, 0, v.guide, al, nullptr);
+    const int H = std::max(144, 72 + nrows * kRowH + (nlines ? kLinesGap + nlines * kLineH : 0) + 30);
     bool values = false;
     for (const Row& r : v.rows) values = values || !r.value.empty();
-    const int W = std::max(values ? kMenuValuesW : kMenuW, int(gw) + 8), GH = v.guide.empty() ? 0 : 47;
+    const int W = values ? kMenuValuesW : kMenuW;
     const float ls = values ? 0.82f : 0.92f;   // label scale: smaller beside a value
-    f.x = std::min(kMenuX, 1280 - 40 - W); f.y = int((720 - H - GH) / 2 + lift);
-    Canvas c; c.make(W, H + GH);
+    f.x = std::min(kMenuX, 1280 - 40 - W); f.y = int((kGuideY - H) / 2 + lift);
+    Canvas c; c.make(W, H);
     P.panel(c, 0, 0, float(W), float(H), 64, al);
-    f.text.push_back({ float(f.x + 30), float(f.y + 19), v.title, 1.1f, rgba(255, 255, 255, al), 0 });   // the header: the menu-label font
+    P.title(c, f.x, f.y, 30, 43, v.title, 1.05f, al, f.text);   // the header inside the panel's black top band
     P.rule(c, 26, 52, float(W - 52), al);
     for (int i = 0; i < nrows; i++) {
         const float y = 70.0f + i * kRowH;
@@ -269,17 +303,27 @@ inline Frame menu(const Painter& P, const View& v, float open, float sweep)
         if (i == v.sel) P.cursor(c, 22, y, float(W - 44), 40, sweep, al);
         const bool on = i == v.sel;
         P.text(c, f.x, f.y, 44, y + 29, v.rows[size_t(i)].label, ls, on ? WHITE : GREY, al, f.text);
-        const float right = float(W - 48 - 26);   // values end here, the right glyph after it (room kept on every row: values stay aligned)
-        const std::string val = P.fit(v.rows[size_t(i)].value, right - 28 - (44 + P.tw(v.rows[size_t(i)].label, ls) + 20), 0.86f);
+        const float right = float(W - 44 - 24 - kGlyphGap);   // values end here, the right glyph after it (room kept on every row: values stay aligned)
+        const std::string val = P.fit(v.rows[size_t(i)].value, right - 24 - kGlyphGap - (44 + P.tw(v.rows[size_t(i)].label, ls) + 20), 0.86f);
         if (!val.empty()) {
             const float vw = P.tw(val, 0.86f);
             P.text(c, f.x, f.y, right - vw, y + 29, val, 0.86f, WHITE, al, f.text);
-            if (on) { P.glyph(c, jpart::PG_LEFT, right - vw - 28, y + 8, 24, al); P.glyph(c, jpart::PG_RIGHT, right + 2, y + 8, 24, al); }
+            if (on) { P.glyph(c, jpart::PG_LEFT, right - vw - kGlyphGap - 24, y + 8, 24, al); P.glyph(c, jpart::PG_RIGHT, right + kGlyphGap, y + 8, 24, al); }
         }
     }
+    if (nlines && nrows) P.dots(c, 30, 70.0f + nrows * kRowH + 6, float(W - 60), al);   // the game's dotted rule between the rows and the status lines
     for (int i = 0; i < nlines; i++)
-        P.text(c, f.x, f.y, 30, 70.0f + nrows * kRowH + 10 + i * kLineH + 21, P.fit(v.lines[size_t(i)].s, float(W - 60), 0.72f), 0.72f, v.lines[size_t(i)].tone, al, f.text);
-    if (GH) P.guide(&c, f.x, f.y, float(W) - gw, float(H + 8), v.guide, al, &f.text);
+        P.text(c, f.x, f.y, 30, 70.0f + nrows * kRowH + kLinesGap + i * kLineH + 21, P.fit(v.lines[size_t(i)].s, float(W - 60), 0.72f), 0.72f, v.lines[size_t(i)].tone, al, f.text);
+    f.pw = c.w; f.ph = c.h; c.straight(f.pic);
+    return f;
+}
+// The guide bar, where the game's menus have theirs: across the foot of the screen (x 40 to 1240), the items from the left.
+inline Frame guide_bar(const Painter& P, const std::vector<Guide>& gs)
+{
+    Frame f;
+    f.x = 40; f.y = kGuideY;
+    Canvas c; c.make(1200, 39);
+    P.guide(&c, f.x, f.y, 0, 0, gs, 1.0f, &f.text, 1200);
     f.pw = c.w; f.ph = c.h; c.straight(f.pic);
     return f;
 }
@@ -289,10 +333,8 @@ inline Frame dialog(const Painter& P, const jpart::Art* a, const View& v, float 
     Frame f;
     const float al = std::clamp(open, 0.0f, 1.0f), lift = (1.0f - al) * 12.0f;
     const int W = 640, H = 256;
-    const float gw = v.guide.empty() ? 0 : P.guide(nullptr, 0, 0, 0, 0, v.guide, al, nullptr);
-    const int GH = v.guide.empty() ? 0 : 47;
-    f.x = (1280 - W) / 2; f.y = int((720 - H - GH) / 2 + lift);
-    Canvas c; c.make(W, H + GH);
+    f.x = (1280 - W) / 2; f.y = int((kGuideY - H) / 2 + lift);
+    Canvas c; c.make(W, H);
     if (a && a->dialog_ok()) {
         const float s = H / 320.0f, cw = 32 * s;
         c.image(a->win[0], 0, 0, cw, float(H), al); c.image(a->win[2], cw, 0, W - 2 * cw, float(H), al); c.image(a->win[1], W - cw, 0, cw, float(H), al);
@@ -311,20 +353,24 @@ inline Frame dialog(const Painter& P, const jpart::Art* a, const View& v, float 
         const std::string& b = v.rows[0].label;
         P.text(c, f.x, f.y, bx + (bw - P.tw(b, 0.86f)) / 2, by + 27, b, 0.86f, WHITE, al, f.text, true);
     }
-    if (GH) P.guide(&c, f.x, f.y, float(W) - gw, float(H + 8), v.guide, al, &f.text);
     f.pw = c.w; f.ph = c.h; c.straight(f.pic);
     return f;
 }
 // The one-line band, bottom left (a slim pause panel).
-inline Frame band(const Painter& P, const std::string& s)
+inline Frame band(const Painter& P, const jpart::Art* a, const std::string& s)
 {
     Frame f;
     const float sc = 0.8f;
-    const int W = std::min(1220, int(P.tw(s, sc)) + 60), H = 52;
-    f.x = 30; f.y = 572;
+    const bool note = a && a->note[0].ok() && a->note[1].ok() && a->note[2].ok();
+    const int H = 64, icon = note && a->busy.ok() ? 44 : 0, W = std::min(1220, int(P.tw(s, sc)) + 56 + icon);
+    f.x = 30; f.y = 556;
     Canvas c; c.make(W, H);
-    P.panel(c, 0, 0, float(W), float(H), 26, 1.0f);
-    P.text(c, f.x, f.y, 30, 35, s, sc, WHITE, 1.0f, f.text);
+    if (note) {   // the game's notice window (its save / load / connecting box), its busy icon at the left
+        const float k = H / 228.0f, cw = 64 * k;
+        c.image(a->note[0], 0, 0, cw, float(H), 1.0f); c.image(a->note[1], cw, 0, W - 2 * cw, float(H), 1.0f); c.image(a->note[2], W - cw, 0, cw, float(H), 1.0f);
+        if (icon) c.image(a->busy, 22, (H - 36) / 2.0f, 36, 36, 1.0f);
+    } else P.panel(c, 0, 0, float(W), float(H), 26, 1.0f);
+    P.text(c, f.x, f.y, 28.0f + icon, H / 2.0f + 9, s, sc, WHITE, 1.0f, f.text);
     f.pw = c.w; f.ph = c.h; c.straight(f.pic);
     return f;
 }
