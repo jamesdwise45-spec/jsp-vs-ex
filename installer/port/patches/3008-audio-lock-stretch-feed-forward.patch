@@ -1,0 +1,295 @@
+Patch 3008: the tick-locked audio's output plays each tick's blocks over the time-sync-stretched tick (feed-forward; AUDIO_LOCK_FF=0 turns it off).
+
+Symptom (test6 testers): the sound is choppy for the whole online fight, menus are fine. The time sync (port, jsp_net_game.cpp) makes each tick
+period longer by (frames ahead - 0.5) ms, at most 2 ms (6%), on the peer that is ahead, but a tick still mixes 6.25 blocks (33.3 ms). The output's
+rate control (patch 3007) makes up at most AUDIO_LOCK_DRC/256 (1.6%), so above about 0.5 ms per tick the device drained and a gap was concealed
+every few seconds; the rate sat at its +1.56% cap in every measurement of 3007 rev 2.
+
+Output only (blocks mixed, read index and notify events are exactly as in 3005; muted re-run blocks are never submitted, so they never see it):
+- g_ps3_audio_lock_stretch_us: the stretch of the tick period that starts at this boundary in microseconds, written by the game thread before
+  ps3_audio_lock_set_target (0 = none, also in the bench and with the lockstep clock off);
+- the first block of a burst adds stretch / 33333 us to the resampler's rate, so the tick's blocks last as long as the stretched tick; the feedback
+  (its own cap unchanged) only handles what is left. The total is capped at +-8% (a block makes at most 278 frames; LK_OUTMAX is 528);
+- AUDIO_LOCK_FF (default 1; 0 = 3007 as it was, with the counters) for an A/B in one build. With AUDIO_LOCK_SMOOTH=0 there is no resampler and no
+  feed-forward;
+- the "[audio-lock]" line keeps every field and their order and appends: "stretch fed forward: N bursts, mean X us, max Y us, total rate a..b %,
+  feed-forward on|off". The bursts and stretch are what the output saw (also with it off); "rate" stays the feedback's own, "total rate" includes it;
+- tests: libs/audio/tests/test_audio_lock_race.c adds a steady 0.5, 1 and 2 ms stretch on a 150 ms fake device in virtual time, on and off (on: no
+  concealed gap after the start, the level at the cushion, the feedback not pinned; off: concealed gaps) and the 8% cap; audio_lock_measure.c
+  publishes each scenario's stretch as the game does and adds 1 and 2 ms scenarios, a "field hitches" scenario (76 ms about every 11 s, every
+  third one 150-300 ms, as test6 matches logged them; one line per hitch says whether it concealed a gap) and a scenario filter (second argument).
+
+diff --git a/libs/audio/cellAudio.c b/libs/audio/cellAudio.c
+index e4a2d9e..9c11183 100644
+--- a/libs/audio/cellAudio.c
++++ b/libs/audio/cellAudio.c
+@@ -747,6 +747,10 @@ static void audio_dump_mix(void)
+ volatile long long g_ps3_audio_lock_target = -1;
+ volatile long long g_ps3_audio_lock_done = 0;
+ volatile int g_ps3_audio_lock_mute = 0;
++/* J-Stars patch 3008: the time-sync stretch of the tick period that starts at this boundary, in microseconds (0 = none), written by the game thread
++ * before ps3_audio_lock_set_target (whose release store publishes it with the target). Read by the output side only (lk_submit_block), never by the
++ * guest-visible part of the lock. */
++volatile int g_ps3_audio_lock_stretch_us = 0;
+ #ifdef _WIN32
+ static HANDLE s_lock_wake = NULL;   /* the mix thread sleeps on it while it has mixed every block it may (never a spin: it runs at TIME_CRITICAL) */
+ /* Held for one whole locked block (mix, output, notify, publish) and by ps3_audio_lock_rewind: a rewind never lands inside a block. Statically
+@@ -854,6 +858,19 @@ static int lk_env(const char* e, int def) { return (e && *e) ? atoi(e) : def; }
+ #define LK_H   (LK_L + LK_X)       /* history kept: the loop and the frames before it */
+ #define LK_F   128                 /* crossfade into the first real block after concealment */
+ #define LK_OUTMAX (LK_N * 2 + 16)
++/* J-Stars patch 3008 (AUDIO_LOCK_FF=0 turns it off): feed-forward of the time-sync stretch. The peer that is ahead makes each tick period longer by up
++ * to 2 ms (6%), but a tick still mixes 6.25 blocks (33.3 ms): the rate control alone makes up at most AUDIO_LOCK_DRC/256 (1.6%), so the device drained
++ * and concealed a gap every few seconds for a whole fight (the rate pinned at its cap in every measurement). The game thread now publishes each tick's
++ * stretch (g_ps3_audio_lock_stretch_us); the first block of a burst adds stretch / 33333 us to the rate, so the tick's blocks last as long as the
++ * stretched tick, and the feedback only handles what is left (its own cap unchanged). The total is capped at +-LK_SKEW_MAX_PCT %; a block of 256 frames
++ * then makes at most 277 + 1, well inside LK_OUTMAX, and a 7-block burst still fits in the 9 blocks lk_cushion_frames leaves on top of the cushion.
++ * Output only, like 3007: muted re-run blocks are never submitted, so the stretch is never applied to them. */
++#define LK_TICK_US      (1000000.0 / 30.0)
++#define LK_SKEW_MAX_PCT 8
++#define LK_SKEW_MAX     (LK_SKEW_MAX_PCT / 100.0)
++_Static_assert(LK_OUTMAX >= LK_N + LK_N * LK_SKEW_MAX_PCT / 100 + 2, "LK_OUTMAX holds a block at the largest rate");
++static int    s_lk_ff = 1;
++static unsigned long long s_lk_ff_bursts; static double s_lk_ff_sum, s_lk_tot_min, s_lk_tot_max; static int s_lk_ff_max;
+ static int    s_lk_smooth = -1, s_lk_cushion_ms = 50, s_lk_drc = 4, s_lk_log = 0, s_lk_low_ms = 12, s_lk_conceal_ms = 150;
+ static int    s_lk_active = 0, s_lk_burst = 1, s_lk_have_last = 0;
+ static float  s_lk_out[LK_OUTMAX * 2], s_lk_tmp[LK_OUTMAX * 2], s_lk_fill[LK_N * 2];
+@@ -887,10 +904,12 @@ static void lk_begin(void)
+         s_lk_low_ms = lk_env(getenv("AUDIO_LOCK_LOW_MS"), 12); if (s_lk_low_ms < 4) s_lk_low_ms = 4;
+         s_lk_conceal_ms = lk_env(getenv("AUDIO_LOCK_CONCEAL_MS"), 150); if (s_lk_conceal_ms < 0) s_lk_conceal_ms = 0;
+         s_lk_log = lk_env(getenv("AUDIO_LOCK_LOG"), 0);
++        s_lk_ff = lk_env(getenv("AUDIO_LOCK_FF"), 1) != 0;   /* patch 3008 */
+     }
+     s_lk_active = 1; s_lk_burst = 1; s_lk_have_last = 0; s_lk_pos = 0.0; s_lk_ema = -1.0; s_lk_skew = 0.0; s_lk_ring_w = 0; s_lk_conc = 0;
+     s_lk_blocks = s_lk_dry = s_lk_conceals = s_lk_conc_frames = s_lk_long_gaps = s_lk_drops = s_lk_squeezed = s_lk_bursts = 0;
+     s_lk_trough_sum = 0; s_lk_trough_min = -1; s_lk_skew_min = s_lk_skew_max = 0;
++    s_lk_ff_bursts = 0; s_lk_ff_sum = 0; s_lk_ff_max = 0; s_lk_tot_min = s_lk_tot_max = 0;   /* patch 3008 */
+ }
+ static int lk_cushion_frames(void)
+ {
+@@ -903,10 +922,15 @@ static void lk_report(const char* why)
+ {
+     const double fpms = CELL_AUDIO_SAMPLE_RATE / 1000.0;
+     fprintf(stderr, "[audio-lock] %s: %llu blocks, %llu device underruns, %llu concealed gaps (%.0f ms, %llu longer than %d ms), %llu blocks squeezed, %llu dropped, "
+-                    "rate %+.2f..%+.2f %%, level before a burst min %.1f ms mean %.1f ms, cushion %.1f ms, device buffer %.1f ms, smoothing %s\n",
++                    "rate %+.2f..%+.2f %%, level before a burst min %.1f ms mean %.1f ms, cushion %.1f ms, device buffer %.1f ms, smoothing %s, "
++                    "stretch fed forward: %llu bursts, mean %.0f us, max %d us, total rate %+.2f..%+.2f %%, feed-forward %s\n",
+             why, s_lk_blocks, s_lk_dry, s_lk_conceals, s_lk_conc_frames / fpms, s_lk_long_gaps, s_lk_conceal_ms, s_lk_squeezed, s_lk_drops,
+             s_lk_skew_min * 100.0, s_lk_skew_max * 100.0, s_lk_trough_min < 0 ? 0.0 : s_lk_trough_min / fpms, s_lk_bursts ? s_lk_trough_sum / s_lk_bursts / fpms : 0.0,
+-            lk_cushion_frames() / fpms, lk_cap_frames() / fpms, s_lk_smooth ? "on" : "off (AUDIO_LOCK_SMOOTH=0)");
++            lk_cushion_frames() / fpms, lk_cap_frames() / fpms, s_lk_smooth ? "on" : "off (AUDIO_LOCK_SMOOTH=0)",
++            /* patch 3008, appended (the fields above keep their order): the stretched bursts the output saw (fed forward only when it is on), and the
++             * rate with the feed-forward in it; "rate" above stays the feedback's own */
++            s_lk_ff_bursts, s_lk_ff_bursts ? s_lk_ff_sum / s_lk_ff_bursts : 0.0, s_lk_ff_max, s_lk_tot_min * 100.0, s_lk_tot_max * 100.0,
++            !s_lk_smooth ? "off (smoothing off)" : s_lk_ff ? "on" : "off (AUDIO_LOCK_FF=0)");
+ }
+ static void lk_end(void) { if (!s_lk_active) return; s_lk_active = 0; lk_report("lock ended"); }
+ static void lk_send(const float* f, u32 n)   /* to the device, and into the history */
+@@ -976,11 +1000,21 @@ static void lk_submit_block(void)
+         s_lk_burst = 0; s_lk_bursts++; s_lk_trough_sum += level; if (s_lk_trough_min < 0 || level < s_lk_trough_min) s_lk_trough_min = level;
+         if (level == 0 && s_lk_have_last && !s_lk_conc) s_lk_dry++;
+         s_lk_ema = s_lk_ema < 0 ? level : s_lk_ema * 0.9 + level * 0.1;
++        double fb = 0.0;
+         if (s_lk_smooth && s_lk_drc > 0 && cushion > 0) {
+             double e = (cushion - s_lk_ema) / cushion; if (e > 1) e = 1; if (e < -1) e = -1;
+-            s_lk_skew = e * s_lk_drc / (double)LK_N;
+-            if (s_lk_skew < s_lk_skew_min) s_lk_skew_min = s_lk_skew; if (s_lk_skew > s_lk_skew_max) s_lk_skew_max = s_lk_skew;
+-        } else s_lk_skew = 0;
++            fb = e * s_lk_drc / (double)LK_N;
++            if (fb < s_lk_skew_min) s_lk_skew_min = fb; if (fb > s_lk_skew_max) s_lk_skew_max = fb;
++        }
++        /* patch 3008: this tick's stretch, fed forward (the burst's blocks last as long as the stretched tick); the feedback above handles the rest */
++        const int st = __atomic_load_n(&g_ps3_audio_lock_stretch_us, __ATOMIC_RELAXED);
++        double ff = 0.0;
++        if (st > 0) {
++            s_lk_ff_bursts++; s_lk_ff_sum += st; if (st > s_lk_ff_max) s_lk_ff_max = st;
++            if (s_lk_smooth && s_lk_ff) ff = st / LK_TICK_US;
++        }
++        s_lk_skew = fb + ff; if (s_lk_skew > LK_SKEW_MAX) s_lk_skew = LK_SKEW_MAX; if (s_lk_skew < -LK_SKEW_MAX) s_lk_skew = -LK_SKEW_MAX;
++        if (s_lk_skew < s_lk_tot_min) s_lk_tot_min = s_lk_skew; if (s_lk_skew > s_lk_tot_max) s_lk_tot_max = s_lk_skew;
+     }
+     if (!s_lk_smooth) {   /* patch 3005 as it was, counted */
+         if (rm >= (int)LK_N) { audio_backend_submit(s_mix_buffer, LK_N); s_lk_have_last = 1; } else s_lk_drops++;
+diff --git a/libs/audio/tests/audio_lock_measure.c b/libs/audio/tests/audio_lock_measure.c
+index 640f006..2237077 100644
+--- a/libs/audio/tests/audio_lock_measure.c
++++ b/libs/audio/tests/audio_lock_measure.c
+@@ -6,8 +6,10 @@
+  *    (the newest), each plus the stream latency: mean, p95, max in ms;
+  *  - device underruns as 3007 counts them (the device found empty), concealed gaps, squeezed and dropped blocks, the rate range;
+  *  - played-clock lag: wall time minus the device's played position, start to end (it grows only when the engine played silence for this stream).
++ * Patch 3008: a scenario's stretch is published at each tick as the game does (g_ps3_audio_lock_stretch_us); AUDIO_LOCK_FF=0 runs the same without the
++ * feed-forward, for the A/B.
+  *   x86_64-w64-mingw32-clang -std=gnu11 -O2 -Wall -Wextra -I include libs/audio/tests/audio_lock_measure.c -lole32 -lwinmm -o audio_lock_measure.exe
+- *   audio_lock_measure.exe [seconds per scenario, default 10]     (the AUDIO_LOCK_* and PS3_AUDIO_BUF_MS settings apply as in the game) */
++ *   audio_lock_measure.exe [seconds per scenario, default 10] [scenario names, comma-separated prefixes]     (the AUDIO_LOCK_* and PS3_AUDIO_BUF_MS settings apply as in the game) */
+ #include "../cellAudio.c"
+ #include <mmsystem.h>
+ 
+@@ -35,7 +37,9 @@ static unsigned s_rng = 1;
+ static double rnd(void) { s_rng = s_rng * 1103515245u + 12345u; return ((s_rng >> 8) & 0xFFFF) / 65536.0; }
+ static int cmp_d(const void* a, const void* b) { const double x = *(const double*)a, y = *(const double*)b; return x < y ? -1 : x > y; }
+ 
+-typedef struct { const char* name; double jitter_ms, stretch_ms, stall_ms, stall_every_s; } scenario;
++/* stall_ms < 0: game hitches as test6 matches logged them ("[perf] hitches > 50 ms", p50 76 ms, max about 300): one about every stall_every_s
++ * (+-1 s), 76 ms, every third one 150-300 ms. min_s: the scenario runs at least that long (a few hitches). */
++typedef struct { const char* name; double jitter_ms, stretch_ms, stall_ms, stall_every_s, min_s; } scenario;
+ 
+ static double s_lat_ms;
+ static void stats(const char* what, double* v, int n)
+@@ -52,13 +56,21 @@ static void run(const scenario* sc, double seconds, IAudioClock* clk, UINT64 clk
+     clk->lpVtbl->GetPosition(clk, &p0, &qpc0);
+     const double t_start = now_ms(); double next = t_start, last_stall = t_start;
+     long long blocks = 0; int tick = 0;
++    if (seconds < sc->min_s) seconds = sc->min_s;
++    int hitches = 0, hid = 0; unsigned long long gaps_before = 0, gaps0 = 0; double hitch_ms = 0.0, lvl0 = 0.0, gap_s = sc->stall_every_s - 1.0 + 2.0 * rnd();
+     while (now_ms() - t_start < seconds * 1000.0) {
+         /* the tick boundary: 1/30 s, plus this scenario's lateness */
+         double due = next + rnd() * sc->jitter_ms;
+         if (sc->stall_ms > 0 && due - last_stall >= sc->stall_every_s * 1000.0) { due += sc->stall_ms; last_stall = due; }
++        if (sc->stall_ms < 0 && due - last_stall >= gap_s * 1000.0) {
++            hitch_ms = ++hitches % 3 ? 76.0 : 150.0 + 150.0 * rnd(); due += hitch_ms; last_stall = due; gap_s = sc->stall_every_s - 1.0 + 2.0 * rnd();
++            if (hitches == 1) gaps_before = s_lk_conceals;   /* the gaps of the start (an empty device) */
++            gaps0 = s_lk_conceals; lvl0 = (lk_cap_frames() - audio_backend_room()) / 48.0;
++        }
+         while (now_ms() < due) { lk_idle_tail(); Sleep(1); }   /* the mix thread's 2 ms idle waits (timeBeginPeriod(1)) */
+         const int rm0 = audio_backend_room(), cap = lk_cap_frames();
+         s_lk_burst = 1;
++        g_ps3_audio_lock_stretch_us = (int)(sc->stretch_ms * 1000.0 + 0.5);   /* patch 3008: the stretch of the period this burst plays in */
+         const long long want = (long long)(tick + 1) * 25 / 4;   /* 6.25 blocks per tick */
+         for (; blocks < want; blocks++) {
+             for (int i = 0; i < CELL_AUDIO_BLOCK_SAMPLES; i++) s_mix_buffer[i * 2] = s_mix_buffer[i * 2 + 1] = 0.25f * sinf((float)(blocks * 256 + i) * 0.0576f);
+@@ -66,6 +78,10 @@ static void run(const scenario* sc, double seconds, IAudioClock* clk, UINT64 clk
+         }
+         const int rm1 = audio_backend_room();
+         if (rm0 >= 0 && rm1 >= 0 && nd < 20000) { before[nd] = (cap - rm0) / 48.0; after[nd] = (cap - rm1) / 48.0; nd++; }
++        if (hitches != hid) {   /* the burst after a hitch: did the hitch conceal a gap? */
++            hid = hitches;
++            printf("  hitch %d: %.0f ms, level when it began %.1f ms, concealed gaps +%llu\n", hitches, hitch_ms, lvl0, s_lk_conceals - gaps0);
++        }
+         tick++; next += 1000.0 / 30.0 + sc->stretch_ms;
+         if (now_ms() - next > 1000.0 / 60.0) next = now_ms();   /* the stepper restarts its schedule after a flip more than half a period late */
+     }
+@@ -74,7 +90,9 @@ static void run(const scenario* sc, double seconds, IAudioClock* clk, UINT64 clk
+     printf("%-24s output delay:", sc->name);
+     stats("oldest frame of a burst", before, nd); stats("newest", after, nd);
+     printf(" %d ticks; played-clock lag %.1f ms over %.1f s\n", nd, wall - played_ms, wall / 1000.0);
++    if (hitches) printf("  %d hitches; concealed gaps before the first (the start): %llu\n", hitches, gaps_before);
+     fflush(stdout);
++    g_ps3_audio_lock_stretch_us = 0;
+     lk_end();   /* the game's "[audio-lock] lock ended" line, on stderr */
+     while (lk_cap_frames() - audio_backend_room() > 0) Sleep(5);   /* let the device run empty before the next scenario */
+ }
+@@ -98,12 +116,24 @@ int main(int argc, char** argv)
+     printf("device: buffer %u frames (%.1f ms), free-running fill %d ms, stream latency %.1f ms, device period %.1f ms (min %.1f ms), clock %llu Hz\n",
+            (unsigned)s_wasapi_buf_frames, s_wasapi_buf_frames / 48.0, s_lk_fill_ms, lat / 10000.0, per_def / 10000.0, per_min / 10000.0, (unsigned long long)freq);
+     static const scenario sc[] = {
+-        { "steady (0-1 ms jitter)", 1.0, 0.0, 0.0, 0.0 },
+-        { "jitter 0-6 ms",          6.0, 0.0, 0.0, 0.0 },
+-        { "stretch 0.5 ms/tick",    2.0, 0.5, 0.0, 0.0 },
+-        { "80 ms stall every 3 s",  2.0, 0.0, 80.0, 3.0 },
++        { "steady (0-1 ms jitter)", 1.0, 0.0, 0.0, 0.0, 0.0 },
++        { "jitter 0-6 ms",          6.0, 0.0, 0.0, 0.0, 0.0 },
++        { "stretch 0.5 ms/tick",    2.0, 0.5, 0.0, 0.0, 0.0 },
++        { "stretch 1 ms/tick",      2.0, 1.0, 0.0, 0.0, 0.0 },
++        { "stretch 2 ms/tick",      2.0, 2.0, 0.0, 0.0, 0.0 },
++        { "80 ms stall every 3 s",  2.0, 0.0, 80.0, 3.0, 0.0 },
++        { "field hitches ~11 s",    2.0, 0.0, -1.0, 11.0, 90.0 },
+     };
+-    for (unsigned i = 0; i < sizeof sc / sizeof sc[0]; i++) run(&sc[i], seconds, clk, freq);
++    /* argv[2]: run only the scenarios whose name starts with one of these comma-separated words (e.g. "steady,stretch 1,80,field") */
++    for (unsigned i = 0; i < sizeof sc / sizeof sc[0]; i++) {
++        if (argc > 2) {
++            int pick = 0; const char* w = argv[2];
++            while (*w) { const char* e = strchr(w, ','); const size_t n = e ? (size_t)(e - w) : strlen(w);
++                         if (n && !strncmp(sc[i].name, w, n)) pick = 1; w += n; if (*w == ',') w++; }
++            if (!pick) continue;
++        }
++        run(&sc[i], seconds, clk, freq);
++    }
+     clk->lpVtbl->Release(clk);
+     audio_backend_shutdown();
+     timeEndPeriod(1);
+diff --git a/libs/audio/tests/test_audio_lock_race.c b/libs/audio/tests/test_audio_lock_race.c
+index 7fad2ed..698a75d 100644
+--- a/libs/audio/tests/test_audio_lock_race.c
++++ b/libs/audio/tests/test_audio_lock_race.c
+@@ -7,7 +7,10 @@
+  *    thread that raises the target, waits for ps3_audio_lock_idle and checks that the guest took and finished every block (and every port's read
+  *    index), with rewinds in between. Before the fix the block was counted before its event was pushed, and the queue was read without its lock.
+  * 2. a device re-open taken over by the first block of a burst: the burst's level sample and the device's fill setting come with it.
+- * 3. concealment on a device with less room than it wants: nothing is cut off by the device (no dropped frames). */
++ * 3. concealment on a device with less room than it wants: nothing is cut off by the device (no dropped frames).
++ * 4. patch 3008: a steady time-sync stretch (0.5, 1 and 2 ms per tick) on a 150 ms device in virtual time, feed-forward on and off. On: no concealed
++ *    gap after the start, the level settles at the cushion, and the feedback is not pinned at its cap. Off (3007 as it was): above about 0.5 ms the
++ *    feedback sits at its cap and the device drains into concealed gaps. Also the total rate's cap with a large AUDIO_LOCK_DRC. */
+ #include "../cellAudio.c"
+ #include <assert.h>
+ 
+@@ -202,6 +205,58 @@ static void test_conceal_room(void)
+     lk_end();
+ }
+ 
++/* ---- 4. patch 3008: the time-sync stretch fed forward ---- */
++typedef struct { unsigned long long conceals, dry, bursts, stretched; double fb_max, tot_max, level_mean; } ff_result;
++static ff_result run_stretch(double stretch_ms, int ff, int seconds)
++{
++    static fake_dev d;
++    fake_init(&d, 7200);   /* 150 ms, as AUDIO_LOCK_BUF_MS opens it */
++    wasapi_dev w = fake_wasapi(&d, 60); wasapi_adopt(&w);
++    ps3r_audio_dev_opened(&s_wasapi_st, GetTickCount64() + 3600 * 1000ull);
++    lk_begin(); s_lk_ff = ff;
++    g_ps3_audio_lock_stretch_us = (int)(stretch_ms * 1000.0 + 0.5);   /* what the game thread writes at every boundary */
++    const int ticks = seconds * 30, warm = 10 * 30;   /* the first 10 s fill the cushion from an empty device (as at a real lock start) */
++    unsigned long long c0 = 0, d0 = 0; double owed = 0.0, lsum = 0.0; long long blocks = 0; int nl = 0;
++    for (int t = 0; t < ticks; t++) {
++        if (t == warm) { c0 = s_lk_conceals; d0 = s_lk_dry; s_lk_skew_min = s_lk_skew_max = s_lk_tot_min = s_lk_tot_max = 0; }
++        if (t >= warm) { lsum += d.padding; nl++; }
++        s_lk_burst = 1;   /* the mix thread waited: the next block starts a burst */
++        for (; blocks < (long long)(t + 1) * 25 / 4; blocks++) { tone((int)blocks); lk_submit_block(); }
++        owed += 1600.0 + 48.0 * stretch_ms;   /* the stretched tick period, in device frames: played 1 ms at a time, the idle tail every 2 ms */
++        for (int k = 0; owed >= 48.0; k++) { play(&d, 48); owed -= 48.0; if (k & 1) lk_idle_tail(); }
++    }
++    CHECK(s_lk_blocks == (unsigned long long)blocks);   /* every block sent once: the stretch changes the output's length only */
++    ff_result r = { s_lk_conceals - c0, s_lk_dry - d0, s_lk_bursts, s_lk_ff_bursts, s_lk_skew_max, s_lk_tot_max, nl ? lsum / nl / 48.0 : 0.0 };
++    lk_end();
++    g_ps3_audio_lock_stretch_us = 0;
++    return r;
++}
++static void test_stretch_feed_forward(void)
++{
++    const double cap = s_lk_drc / (double)LK_N;   /* the feedback's own cap (AUDIO_LOCK_DRC, default 4 = 1.56%) */
++    static const double st[] = { 0.5, 1.0, 2.0 };
++    for (int i = 0; i < 3; i++) {
++        const ff_result on = run_stretch(st[i], 1, 40), off = run_stretch(st[i], 0, 40);
++        printf("stretch %.1f ms/tick, 30 s after the start: feed-forward on %llu concealed gaps, %llu dry, feedback max %+.2f %%, total max %+.2f %%, level %.1f ms;"
++               " off %llu concealed gaps, %llu dry, feedback max %+.2f %%, level %.1f ms\n", st[i], on.conceals, on.dry, on.fb_max * 100, on.tot_max * 100, on.level_mean,
++               off.conceals, off.dry, off.fb_max * 100, off.level_mean);
++        CHECK(on.stretched == on.bursts && off.stretched == off.bursts);        /* every burst saw the stretch, also with the feed-forward off */
++        CHECK(on.conceals == 0 && on.dry == 0);                                 /* on: no gap once the cushion is there */
++        CHECK(on.fb_max < cap * 0.5);                                           /* ... the feedback is not pinned */
++        CHECK(on.level_mean > 40.0 && on.level_mean < 60.0);                    /* ... and the level sits at the 50 ms cushion */
++        CHECK(fabs(on.tot_max - (st[i] / (1000.0 / 30.0) + on.fb_max)) < 1e-9); /* the total is the stretch plus the feedback */
++        if (st[i] >= 1.0) CHECK(off.conceals > 0 && off.fb_max > cap * 0.5);   /* off: 3007 as it was: drained, concealing, the feedback near its cap */
++    }
++    /* the total cap: a 2 ms stretch with AUDIO_LOCK_DRC=12 on an empty device would be 6.0 + 4.7 %: held at 8 %, and the block fits in LK_OUTMAX */
++    static fake_dev d;
++    fake_init(&d, 7200); wasapi_dev w = fake_wasapi(&d, 60); wasapi_adopt(&w);
++    lk_begin(); const int drc = s_lk_drc; s_lk_drc = 12; s_lk_ff = 1; g_ps3_audio_lock_stretch_us = 2000;
++    s_lk_burst = 1; tone(0); const unsigned long long got = d.got; lk_submit_block();
++    CHECK(fabs(s_lk_skew - LK_SKEW_MAX) < 1e-12 && d.got - got <= (unsigned long long)(LK_N * (1.0 + LK_SKEW_MAX)) + 2);
++    s_lk_drc = drc; g_ps3_audio_lock_stretch_us = 0; lk_end();
++    printf("stretch fed forward: total rate held at %+.1f %% with AUDIO_LOCK_DRC=12\n", LK_SKEW_MAX * 100);
++}
++
+ int main(int argc, char** argv)
+ {
+     vm_base = (uint8_t*)VirtualAlloc(NULL, 0x100000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+@@ -209,6 +264,7 @@ int main(int argc, char** argv)
+     test_contention(argc > 1 ? atof(argv[1]) : 2.0);
+     test_reopen_in_burst();
+     test_conceal_room();
++    test_stretch_feed_forward();
+     puts("audio lock: all passed");
+     return 0;
+ }

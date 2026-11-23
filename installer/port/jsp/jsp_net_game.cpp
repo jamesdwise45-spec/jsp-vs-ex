@@ -523,6 +523,10 @@ uint64_t rz_rejected() { if (auto* d = dynamic_cast<DirectRendezvous*>(g.rz.get(
 // (1/30 s) per tick, and the next tick waits until the game's audio thread took them; a rollback moves the audio back with the tick, re-runs are muted.
 extern "C" volatile long long g_ps3_audio_lock_target, g_ps3_audio_lock_done;
 extern "C" volatile int g_ps3_audio_lock_mute;
+// FIX (choppy fight audio, patch 3008): the time-sync stretch of the tick period that starts at this boundary, in microseconds (0 = none). The output
+// side of the lock plays the tick's blocks over the stretched period (AUDIO_LOCK_FF=0 turns that off); written before ps3_audio_lock_set_target, whose
+// release store publishes it. Output only: the blocks mixed, the read index and the notify events do not depend on it.
+extern "C" volatile int g_ps3_audio_lock_stretch_us;
 extern "C" int ps3_audio_lock_idle(void);
 extern "C" void ps3_audio_lock_rewind(long long blocks);
 extern "C" void ps3_audio_lock_set_target(long long blocks);   // sets the target and wakes the mix thread
@@ -1686,13 +1690,16 @@ void boundary(ppu_context* c)
     // peer that ran ahead never slowed down (it predicted every tick, saved a snapshot every tick and took every rollback). In a match it now stretches the
     // next lockstep period instead: (frames ahead - 0.5) ms per tick, at most 2 ms (6%), only on the peer that is ahead. Timing only: the vblanks per flip and
     // the inputs do not change, so determinism is untouched. Without the lockstep clock (the bench) the old proportional sleep stays.
+    uint32_t audio_stretch_us = 0;   // FIX (choppy fight audio): the stretch the lockstep clock took for the next period, for the audio output (0: none, the bench, clock off)
     if (g.glue->updates() != u0) {
         jsp_snapshot_ext_budget_reset();
         const float ahead = g.bench ? 0.f : g.sess.frames_ahead();
         const uint32_t us = ahead > 0.5f ? (uint32_t)std::min(2000.0f, (ahead - 0.5f) * 1000.0f) : 0u;
         if (g.bench || !jsp_stepper_lockstep_stretch_us(us)) { if (const uint32_t ms = g.sess.pace_sleep_ms(33)) Sleep(ms); }
+        else audio_stretch_us = us;
     }
     else g.sess.poll();   // replay / regrant / stall iterations: the network is still serviced
+    g_ps3_audio_lock_stretch_us = (int)audio_stretch_us;
     // FIX (rollback determinism: a render-only frame flipped): an iteration where no tick may run still ran the game's frame outside the simulation phases and flipped, and every
     // flip is 2 vblanks the game counts; how many such iterations a PC has depends on its timing. While the session is synchronized, the main thread now waits
     // here (polling, asking the session again every millisecond) for up to 400 ms before a render-only frame is let through (below the 500 ms idle vblank).
