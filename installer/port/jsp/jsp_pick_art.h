@@ -3,7 +3,7 @@
 // loader's interface; DirIo below reads them from a folder with stdio) and gets decoded RGBA images and the system font's glyph table,
 // kept in memory only. Nothing is written anywhere, and the repository ships no game data: only the names below and the format rules. Host-tested by installer/tools/pick_art_test.cpp.
 //
-// Formats (desk notes: D:\jsp-audit\pick-ui\ART-REVIEW.md):
+// Formats:
 //   CPK      jmods::load_archive (TOC rows "Dir/File", entry bytes at toc_offset + FileOffset)
 //   $CMP     the game's compression: 0x20-byte header (+0x10 BE unpacked size), then chunks {tag, u32 unpacked, u32 size incl. its 16-byte
 //            header, u32}: $CL0 LZ tokens (even t: t>>1 literal bytes; odd t: copy (t>>1)&31 bytes from distance ((t>>6)<<8)|next byte,
@@ -37,18 +37,20 @@ inline uint32_t rd32(const uint8_t* p) { return uint32_t(p[0]) << 24 | uint32_t(
 inline uint32_t rd16(const uint8_t* p) { return uint32_t(p[0]) << 8 | p[1]; }
 
 // ---- $CMP ---------------------------------------------------------------------------------------------------------------------------
-inline bool cmp_lz(const uint8_t* d, size_t p, size_t end, Bytes& out, size_t base)
+// LZ tokens d[p..end) appended to `out`; the chunk's output starts at out[base] and may not grow past out[lim] (checked before each write).
+inline bool cmp_lz(const uint8_t* d, size_t p, size_t end, Bytes& out, size_t base, size_t lim)
 {
+    if (lim < base || out.size() < base) return false;
     while (p < end) {
         const uint8_t t = d[p++];
         if (!(t & 1)) {
             const size_t n = t >> 1;
-            if (p + n > end) return false;
+            if (p + n > end || n > lim - out.size()) return false;
             out.insert(out.end(), d + p, d + p + n); p += n;
         } else {
             if (p >= end) return false;
             const size_t n = (t >> 1) & 0x1F, dist = size_t(t >> 6) << 8 | d[p++];
-            if (dist == 0 || dist > out.size() - base) return false;
+            if (dist == 0 || dist > out.size() - base || n > lim - out.size()) return false;
             for (size_t i = 0; i < n; i++) out.push_back(out[out.size() - dist]);
         }
     }
@@ -94,19 +96,19 @@ inline bool cmp_decode(const uint8_t* d, size_t n, Bytes& out)
     if (n < 0x20 || memcmp(d, "$CMP", 4) != 0) return false;
     const uint32_t total = rd32(d + 16);
     if (total > (256u << 20)) return false;
-    out.clear(); out.reserve(total);
+    out.clear(); out.reserve(std::min<size_t>(total, n * 16));   // a hint only: the header's size is not trusted for the allocation
     size_t p = 0x20;
     Bytes h;
     while (p + 16 <= n && d[p] == '$') {
         const uint32_t a = rd32(d + p + 4), sz = rd32(d + p + 8);
-        if (sz < 16 || p + sz > n) return false;
-        const size_t base = out.size();
-        if (!memcmp(d + p, "$CL0", 4)) { if (!cmp_lz(d, p + 16, p + sz, out, base)) return false; }
+        if (sz < 16 || sz > n - p || a > total - out.size()) return false;   // no chunk may claim more than the stated total
+        const size_t base = out.size(), lim = base + a;
+        if (!memcmp(d + p, "$CL0", 4)) { if (!cmp_lz(d, p + 16, p + sz, out, base, lim)) return false; }
         else if (!memcmp(d + p, "$CLH", 4)) {
             if (!cmp_huff(d, p + 16, p + sz, h) || h.size() < 16 || memcmp(h.data(), "$CL0", 4) != 0) return false;
-            if (!cmp_lz(h.data(), 16, h.size(), out, base)) return false;
-        } else if (!memcmp(d + p, "$CR0", 4)) out.insert(out.end(), d + p + 16, d + p + sz);
-        else if (!memcmp(d + p, "$CH0", 4)) { if (!cmp_huff(d, p, p + sz, h)) return false; out.insert(out.end(), h.begin(), h.end()); }
+            if (!cmp_lz(h.data(), 16, h.size(), out, base, lim)) return false;
+        } else if (!memcmp(d + p, "$CR0", 4)) { if (sz - 16 > a) return false; out.insert(out.end(), d + p + 16, d + p + sz); }
+        else if (!memcmp(d + p, "$CH0", 4)) { if (!cmp_huff(d, p, p + sz, h) || h.size() > a) return false; out.insert(out.end(), h.begin(), h.end()); }
         else return false;
         if (out.size() - base != a) return false;
         p += sz;
@@ -180,12 +182,16 @@ struct Image {
     std::vector<uint8_t> px;   // straight RGBA8, rows top to bottom
     bool ok() const { return w > 0 && h > 0 && px.size() == size_t(w) * size_t(h) * 4; }
 };
+// The largest texture the reader decodes (the menu art is a few hundred pixels): w and h come from the file, so they are capped before any
+// allocation (at most 4096 x 4096 x 4 = 64 MB of RGBA).
+constexpr int kMaxTexDim = 4096;
+inline bool tex_dims_ok(int w, int h) { return w > 0 && h > 0 && w <= kMaxTexDim && h <= kMaxTexDim; }
 inline void rgb565(uint32_t v, uint8_t* c) { const uint32_t r = v >> 11 & 31, g = v >> 5 & 63, b = v & 31; c[0] = uint8_t(r << 3 | r >> 2); c[1] = uint8_t(g << 2 | g >> 4); c[2] = uint8_t(b << 3 | b >> 2); }
 inline Image decode_dxt(const uint8_t* d, size_t n, int w, int h, bool dxt5)
 {
     Image im;
     const int bw = (w + 3) / 4, bh = (h + 3) / 4, bs = dxt5 ? 16 : 8;
-    if (w <= 0 || h <= 0 || n < size_t(bw) * size_t(bh) * size_t(bs)) return im;
+    if (!tex_dims_ok(w, h) || n < size_t(bw) * size_t(bh) * size_t(bs)) return im;
     im.w = w; im.h = h; im.px.assign(size_t(w) * size_t(h) * 4, 0);
     for (int by = 0; by < bh; by++)
         for (int bx = 0; bx < bw; bx++) {
@@ -225,7 +231,7 @@ inline Image decode_dxt(const uint8_t* d, size_t n, int w, int h, bool dxt5)
 inline Image decode_argb_morton(const uint8_t* d, size_t n, int w, int h)
 {
     Image im;
-    if (w <= 0 || h <= 0 || (w & (w - 1)) || (h & (h - 1)) || n < size_t(w) * size_t(h) * 4) return im;
+    if (!tex_dims_ok(w, h) || (w & (w - 1)) || (h & (h - 1)) || n < size_t(w) * size_t(h) * 4) return im;
     im.w = w; im.h = h; im.px.assign(size_t(w) * size_t(h) * 4, 0);
     for (int y = 0; y < h; y++)
         for (int x = 0; x < w; x++) {
@@ -244,7 +250,7 @@ inline Image decode_argb_morton(const uint8_t* d, size_t n, int w, int h)
 inline Image decode_argb_linear(const uint8_t* d, size_t n, int w, int h)
 {
     Image im;
-    if (w <= 0 || h <= 0 || n < size_t(w) * size_t(h) * 4) return im;
+    if (!tex_dims_ok(w, h) || n < size_t(w) * size_t(h) * 4) return im;
     im.w = w; im.h = h; im.px.resize(size_t(w) * size_t(h) * 4);
     for (size_t i = 0; i < size_t(w) * size_t(h); i++) { const uint8_t* s = d + i * 4; uint8_t* o = &im.px[i * 4]; o[0] = s[1]; o[1] = s[2]; o[2] = s[3]; o[3] = s[0]; }
     return im;

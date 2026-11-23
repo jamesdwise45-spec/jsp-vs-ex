@@ -136,6 +136,25 @@ static void test_box_basic()
     for (uint64_t t = 41000; t < 60000; t += 50) if (b.step(in, t, press_t, &back) == BoxCross::PRESS) { press_t = t; n++; }
     CHECK(n == BoxCross::kMax);
 }
+// review N1: by hand after the to-room timeout with no room page ever seen: no Cross; by hand after the start timed out (room seen): Crosses
+static void test_box_by_hand()
+{
+    CHECK(jspd::box_reached(true, false, false) && jspd::box_reached(true, false, true));
+    CHECK(!jspd::box_reached(false, true, false) && jspd::box_reached(false, true, true));
+    CHECK(!jspd::box_reached(false, false, true));
+    int back = 0;
+    {
+        BoxCross b; BoxIn in = reached_hidden(0); in.reached = jspd::box_reached(false, true, false);
+        for (uint64_t t = 1000; t < 60000; t += 50) CHECK(b.step(in, t, 0, &back) == BoxCross::NONE);
+        CHECK(b.away_n == 0);
+    }
+    {
+        BoxCross b; BoxIn in = reached_hidden(0); in.reached = jspd::box_reached(false, true, true);
+        int n = 0; uint64_t press_t = 0;
+        for (uint64_t t = 1000; t < 60000; t += 50) if (b.step(in, t, press_t, &back) == BoxCross::PRESS) { press_t = t; n++; }
+        CHECK(n == BoxCross::kMax);
+    }
+}
 static void test_box_gates()
 {
     int back = 0;
@@ -373,9 +392,10 @@ int main()
     test_autopilot_pad();
     test_box_basic();
     test_box_gates();
+    test_box_by_hand();
     test_join_ready();
     test_map1();
     if (fails) { std::printf("net pick drive: %d check(s) FAILED\n", fails); return 1; }
-    std::printf("net pick drive: pad gate (capture, late-pick start block, injected presses), the AUTO_ONLINE autopilot keeps the drive's press, notice-box Cross (timing, cap, gates, loading), joiner's Ready, map1 timelines, ownership after the roster write (2000 rooms), ownership after Select character through the flow and the fighter map's planned seats (500 rooms + refusals) ok\n");
+    std::printf("net pick drive: pad gate (capture, late-pick start block, injected presses), the AUTO_ONLINE autopilot keeps the drive's press, notice-box Cross (timing, cap, gates, loading, by hand only after the room was seen), joiner's Ready, map1 timelines, ownership after the roster write (2000 rooms), ownership after Select character through the flow and the fighter map's planned seats (500 rooms + refusals) ok\n");
     return 0;
 }

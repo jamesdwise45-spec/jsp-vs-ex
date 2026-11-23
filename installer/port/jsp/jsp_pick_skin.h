@@ -1,7 +1,7 @@
 // ENHANCEMENT (after-match menu in the game's own look, JSP_ROLLBACK_PICK=1): lays out and paints the online after-match prompt, its
 // Leave confirm, the Select character picker and the one-line band with the game's own art (jsp_pick_art.h), into an RGBA picture the
 // overlay blits (jsp_overlay_blit_rgba) plus a few header texts in the overlay's menu-label font. Header only and pure (no Windows,
-// toolkit or game calls); host-tested by installer/tools/pick_art_test.cpp. Design: D:\jsp-audit\pick-ui\ART-REVIEW.md.
+// toolkit or game calls); host-tested by installer/tools/pick_art_test.cpp.
 //
 // Every piece has a drawn fallback in the same palette, used when the player's game data did not give it (art == nullptr or the piece
 // missing): black glass panel with a light rim, a gold gradient cursor, drawn circle glyphs, and the overlay font for the text.
