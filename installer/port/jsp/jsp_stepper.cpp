@@ -373,11 +373,11 @@ void hz_maybe_sample(long long now, long long next)
     static uint32_t kind[65], id[65], obj[65], lr[65]; static uint8_t alive[65], unrel[65]; uint32_t ov = 0, ub = 0;
     const int stage = g_jsp_main_stage;
     const uint32_t t = g_jsp_main_tid;
-    uint32_t k = 0, i = 0, l = 0;
-    if (t >= 1 && t < 65) { ps3_hle_thread_census(kind, id, obj, lr, alive, unrel, &ov, &ub); if (alive[t]) { k = kind[t]; i = id[t]; l = lr[t]; } }
+    uint32_t k = 0, i = 0, l = 0, known = 0;   // known: the main thread's id, 0 = unknown (no id yet, or not alive in the census)
+    if (t >= 1 && t < 65) { ps3_hle_thread_census(kind, id, obj, lr, alive, unrel, &ov, &ub); if (alive[t]) { known = t; k = kind[t]; i = id[t]; l = lr[t]; } }
     std::lock_guard<std::mutex> lk(g_hz_mu);
     if (g_hz.samples != slot) return;
-    jph::Clock::Sample& o = g_hz.s[slot]; o.stage = stage; o.kind = k; o.id = i; o.lr = l; o.late_ms = late;
+    jph::Clock::Sample& o = g_hz.s[slot]; o.stage = stage; o.tid = known; o.kind = k; o.id = i; o.lr = l; o.late_ms = late;
     g_hz.samples = slot + 1;
 }
 void hz_take(long long now, long long deadline, bool restart)   // lockstep_take_flip

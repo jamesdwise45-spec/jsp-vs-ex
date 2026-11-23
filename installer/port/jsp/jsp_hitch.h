@@ -28,7 +28,8 @@ inline constexpr double kGuestNominalMs = 22.0;   // guest time of an ordinary t
 inline constexpr double kLateMs = 8.0;         // a flip this late (ready after its deadline) counts as a late guest; also when the clock samples the main thread
 inline constexpr double kRenderMs = 20.0;      // a FIFO drain or present/pump stretch this long counts as the frame clock's own delay
 
-enum Part { Session, Snapshot, Hold, Audio, Files, Server, Other, Guest, Replay, kParts };   // Snapshot is inside Session
+enum Part { Session, Snapshot, Hold, Audio, Files, Server, Other, Guest, Replay, kParts };   // Snapshot is inside Session (the caller files the hold loop's
+                                                                                              // updates, and the snapshots they take, as session, not hold)
 
 // The frame clock's view of one gap (jsp_stepper.cpp fills it; jsp_stepper_hitch_take hands it over and starts the next one).
 struct Clock {
@@ -38,8 +39,10 @@ struct Clock {
     double outside_max_ms = 0;     // longest stretch between two lockstep passes (main.cpp: present, drain, window pump)
     uint32_t flips = 0, restarts = 0;
     // Where the main thread was while the first late flip of the gap was not ready: sampled at kLateMs and at 3 x kLateMs past its deadline.
-    struct Sample { int stage = 0; uint32_t kind = 0, id = 0, lr = 0; double late_ms = 0; };   // g_jsp_main_stage (0 guest code, 1.. boundary stages);
-    static constexpr int kSamples = 2;                                                        // the main guest thread: HLE call kind (0 = guest code), id, call site
+    // stage: g_jsp_main_stage (0 guest code, 1.. boundary stages). tid: the main guest thread's id, 0 = unknown (no id yet, or not alive in the census): then
+    // kind / id / lr say nothing. Else kind = its HLE call (0 = guest code), id, call site.
+    struct Sample { int stage = 0; uint32_t tid = 0, kind = 0, id = 0, lr = 0; double late_ms = 0; };
+    static constexpr int kSamples = 2;
     int samples = 0; Sample s[kSamples];
 };
 
@@ -49,11 +52,11 @@ struct Gap {
     uint32_t boundaries = 0, snap_ops = 0, reruns = 0, rollbacks = 0, depth_max = 0;
 };
 
-enum Cause { CSnapshot, CSession, CHold, CAudio, CSound, COther, CReplay, CGuestLate, CDrain, CPresent, CGuest, kCauses };
+enum Cause { CSnapshot, CSession, CHold, CAudio, CSound, COther, CReplay, CGuestLate, CDrain, CPresent, CGuest, CNone, kCauses };
 inline const char* cause_name(int c)
 {
     static const char* n[kCauses] = { "snapshot", "session", "hold-for-tick", "audio-lock", "sound-barrier", "boundary-other", "rollback-replay",
-                                      "guest-late", "fifo-drain", "present-pump", "guest-flip-wait" };
+                                      "guest-late", "fifo-drain", "present-pump", "guest-flip-wait", "unexplained" };
     return c >= 0 && c < kCauses ? n[c] : "?";
 }
 inline const char* stage_name(int s)   // the same names as jsp_stepper.cpp's main_stage_name (g_jsp_main_stage)
@@ -63,20 +66,23 @@ inline const char* stage_name(int s)   // the same names as jsp_stepper.cpp's ma
     return "?";
 }
 
-// The part that took the most time. Boundary parts count whole; the guest only above kGuestNominalMs (an ordinary tick spends that much there). A guest
-// winner is split with the frame clock: its flip ready late = the guest was late (the sample names where); ready on time but a drain or a present/pump
-// stretch over kRenderMs = the frame clock's own work (draws, uploads, a pipeline built on the drawing thread); else the guest waited for the flip.
+// The part that took the most time. Boundary parts count whole; the guest only above kGuestNominalMs (an ordinary tick spends that much there); nothing
+// above 0 = unexplained (the line's "unaccounted" may then hold it). A guest winner is split with the frame clock. A drain or a present/pump stretch over
+// kRenderMs comes FIRST: the clock thread only sees the flip ready after its drain walked the FIFO to the flip command and after main.cpp gave the loop
+// back, so a 40 ms drain or present makes ready_late +35 even when the guest queued the flip on time (review of diag/hitch, S1). Then a flip ready
+// kLateMs late = the guest was late (the samples name where); else the guest waited for the flip.
 inline int cause(const Gap& g, const Clock& c)
 {
+    const double sess = g.part[Session] - g.part[Snapshot];
     struct { int c; double ms; } v[] = {
-        { CSnapshot, g.part[Snapshot] }, { CSession, g.part[Session] - g.part[Snapshot] }, { CHold, g.part[Hold] }, { CAudio, g.part[Audio] },
+        { CSnapshot, g.part[Snapshot] }, { CSession, sess > 0 ? sess : 0 }, { CHold, g.part[Hold] }, { CAudio, g.part[Audio] },
         { CSound, g.part[Files] + g.part[Server] }, { COther, g.part[Other] }, { CReplay, g.part[Replay] }, { CGuest, g.part[Guest] - kGuestNominalMs } };
     int best = 0;
     for (int i = 1; i < (int)(sizeof v / sizeof v[0]); i++) if (v[i].ms > v[best].ms) best = i;
+    if (v[best].ms <= 0) return CNone;
     if (v[best].c != CGuest) return v[best].c;
+    if (c.drain_max_ms >= kRenderMs || c.outside_max_ms >= kRenderMs) return c.drain_max_ms >= c.outside_max_ms ? CDrain : CPresent;
     if (c.ready_late_ms >= kLateMs) return CGuestLate;
-    if (c.drain_max_ms >= kRenderMs && c.drain_max_ms >= c.outside_max_ms) return CDrain;
-    if (c.outside_max_ms >= kRenderMs) return CPresent;
     return CGuest;
 }
 
@@ -86,15 +92,19 @@ struct Match {
     uint32_t by_cause[kCauses] = {};
 };
 
-// Main thread, per boundary that the gap covers.
+// Main thread, per boundary that the gap covers. Every part is clamped at 0 (timer granularity, a caller's subtraction).
 inline void add_boundary(Gap& g, double session, double snapshot, double snap_gate, uint32_t snap_ops, double hold, double audio, double files, double server, double total)
 {
+    auto pos = [](double x) { return x > 0 ? x : 0.0; };
+    session = pos(session); snapshot = pos(snapshot); hold = pos(hold); audio = pos(audio); files = pos(files); server = pos(server);
     g.boundaries++;
-    g.part[Session] += session; g.part[Snapshot] += snapshot; g.snap_gate += snap_gate; g.snap_ops += snap_ops; g.part[Hold] += hold; g.part[Audio] += audio;
+    g.part[Session] += session; g.part[Snapshot] += snapshot; g.snap_gate += pos(snap_gate); g.snap_ops += snap_ops; g.part[Hold] += hold; g.part[Audio] += audio;
     g.part[Files] += files; g.part[Server] += server;
-    const double other = total - session - hold - audio - files - server;
-    if (other > 0) g.part[Other] += other;
+    g.part[Other] += pos(total - session - hold - audio - files - server);
 }
+// The slice of the boundary that closes the gap, from its entry to the perf point (native / match poll, the tick state, the watches): boundary "other"
+// of the CLOSING gap (review of diag/hitch, S2); the rest of that boundary goes to the next gap through add_boundary.
+inline void add_pre(Gap& g, double ms) { if (ms > 0) g.part[Other] += ms; }
 // The guest stretch between two boundaries; after an iteration that ran a re-run tick it is replay time.
 inline void add_guest(Gap& g, double ms, bool after_rerun)
 {
@@ -104,6 +114,7 @@ inline void add_guest(Gap& g, double ms, bool after_rerun)
 inline void add_rollback(Gap& g, uint32_t depth) { g.rollbacks++; if (depth > g.depth_max) g.depth_max = depth; }
 
 // A presented frame closed a gap of `gap_ms`: the line for it ("" when not a hitch or past the cap), the gap restarts. `tick` = session-relative tick.
+// "unaccounted" = the gap minus everything filed (boundaries, guest, replay): a hole the parts do not cover (negative: an overlap).
 inline std::string close_gap(Match& m, double gap_ms, uint32_t tick, const Clock& c)
 {
     std::string s;
@@ -113,23 +124,28 @@ inline std::string close_gap(Match& m, double gap_ms, uint32_t tick, const Clock
         m.by_cause[k]++;
         if (m.lines < kMaxLines) {
             m.lines++;
-            const Gap& g = m.gap; char b[1024];
+            const Gap& g = m.gap; char b[1024]; size_t n = 0;
+            auto put = [&](const char* fmt, auto... a) {   // bounded append: an oversize line is cut, never overrun
+                if (n >= sizeof b - 1) return;
+                const int r = std::snprintf(b + n, sizeof b - n, fmt, a...);
+                if (r > 0) n += (size_t)r < sizeof b - n ? (size_t)r : sizeof b - n - 1;
+            };
             const double bnd = g.part[Session] + g.part[Hold] + g.part[Audio] + g.part[Files] + g.part[Server] + g.part[Other];
-            int n = std::snprintf(b, sizeof b, "[perf] hitch %u: %.0f ms at tick %u, cause %s | main: boundary %.1f ms (session %.1f, of it snapshot %.1f in %u op(s), gate %.1f; "
-                                  "hold %.1f, audio %.1f, sound files %.1f server %.1f, other %.1f; %u boundaries), guest %.1f ms, replay %.1f ms (%u re-run ticks, "
-                                  "%u rollbacks, deepest %u)",
-                                  m.hitches, gap_ms, tick, cause_name(k), bnd, g.part[Session], g.part[Snapshot], g.snap_ops, g.snap_gate, g.part[Hold], g.part[Audio], g.part[Files],
-                                  g.part[Server], g.part[Other], g.boundaries, g.part[Guest], g.part[Replay], g.reruns, g.rollbacks, g.depth_max);
-            if (n < 0 || n >= (int)sizeof b) n = (int)sizeof b - 1;
-            if (c.ready_late_ms > -1e8) n += std::snprintf(b + n, sizeof b - n, " | clock: flip ready %+.1f ms, taken %+.1f ms",
-                                                           c.ready_late_ms, c.take_late_ms > -1e8 ? c.take_late_ms : 0.0);
-            else n += std::snprintf(b + n, sizeof b - n, " | clock: no flip ready");
-            if (n < (int)sizeof b) n += std::snprintf(b + n, sizeof b - n, ", drain max %.1f ms, present/pump max %.1f ms, %u flips, %u restarts", c.drain_max_ms,
-                                                      c.outside_max_ms, c.flips, c.restarts);
-            for (int i = 0; i < c.samples && i < Clock::kSamples && n < (int)sizeof b; i++)
-                n += std::snprintf(b + n, sizeof b - n, "%s at %+.0f ms main was in %s (HLE kind %u id 0x%08X lr 0x%08X)", i ? "," : ";", c.s[i].late_ms, stage_name(c.s[i].stage),
-                                   c.s[i].kind, c.s[i].id, c.s[i].lr);
-            s = b; s += '\n';
+            put("[perf] hitch %u: %.0f ms at tick %u, cause %s | main: boundary %.1f ms (session %.1f, of it snapshot %.1f in %u op(s), gate %.1f; "
+                "hold %.1f, audio %.1f, sound files %.1f server %.1f, other %.1f; %u boundaries), guest %.1f ms, replay %.1f ms (%u re-run ticks, "
+                "%u rollbacks, deepest %u), unaccounted %.1f ms",
+                m.hitches, gap_ms, tick, cause_name(k), bnd, g.part[Session], g.part[Snapshot], g.snap_ops, g.snap_gate, g.part[Hold], g.part[Audio], g.part[Files],
+                g.part[Server], g.part[Other], g.boundaries, g.part[Guest], g.part[Replay], g.reruns, g.rollbacks, g.depth_max,
+                gap_ms - bnd - g.part[Guest] - g.part[Replay]);
+            if (c.ready_late_ms > -1e8) put(" | clock: flip ready %+.1f ms", c.ready_late_ms); else put("%s", " | clock: no flip ready");
+            if (c.take_late_ms > -1e8) put(", taken %+.1f ms", c.take_late_ms); else put("%s", ", not taken");
+            put(", drain max %.1f ms, present/pump max %.1f ms, %u flips, %u restarts", c.drain_max_ms, c.outside_max_ms, c.flips, c.restarts);
+            for (int i = 0; i < c.samples && i < Clock::kSamples; i++) {
+                const Clock::Sample& x = c.s[i];
+                put("%s at %+.0f ms main was in %s", i ? "," : ";", x.late_ms, stage_name(x.stage));
+                if (x.tid) put(" (tid %u HLE kind %u id 0x%08X lr 0x%08X)", x.tid, x.kind, x.id, x.lr); else put("%s", " (tid ?)");
+            }
+            s.assign(b, n); s += '\n';
         }
     }
     m.gap = Gap();

@@ -58,7 +58,7 @@ extern "C" unsigned long long jsp_net_presence_room(char* server, int sn) { if (
 #include "jsp_net_online.h"
 #include "jsp_net_badge.h"
 #include "jsp_net_delay_rule.h"   // ENHANCEMENT (adaptive input delay, rule 2): the decision, shared with the host simulator
-#include "jsp_net_perf.h"   // ENHANCEMENT (match perf summary): input latency, rollback depth, hitches, replay shown; five [perf] lines per match
+#include "jsp_net_perf.h"   // ENHANCEMENT (match perf summary): input latency, rollback depth, hitches, replay shown; five [perf] lines per match (+ jsp_hitch.h's)
 #include "jsp_hitch.h"      // DIAGNOSTIC (per-hitch line): one [perf] hitch line per gap over 50 ms, with where the main thread's time went
 #include "jsp_net_ko_rule.h"      // FIX (review of PR 248): the KO / time-up end rules and the live confirmation watermark, shared with net_session_test
 #include "jsp_net_repsn_client.h"
@@ -859,7 +859,7 @@ void end_with(const std::string& text, bool quiet = false)
     jsp_snapshot_ext_set_idle_hook(nullptr);   // the gate must not call into a finished session
     jsp_snapshot_ext_guard_summary();
     if (g.started_ms) log_status();   // the session ran: its last status line
-    perf_log();   // ENHANCEMENT (match perf summary): the five [perf] lines of this match
+    perf_log();   // ENHANCEMENT (match perf summary): the five [perf] summary lines of this match and the hitch-cause line (jsp_hitch.h)
     badge(""); ping_hide();
     set_text(text); g.phase = Phase::Ended; g.skip_sim = g.skip_pad = false;
     if (g.was_replaying || g.stepper.replaying()) jsp_stepper_replay(0, g.done_now);   // an end during a replay: gate, clock and flag off
@@ -1547,6 +1547,7 @@ extern "C" volatile uint32_t g_jsp_main_tid;               // jsp_stepper.cpp: t
 extern "C" void jsp_snapshot_ext_cost_sum(double* real_ms, double* gate_ms, uint32_t* ops);   // jsp_snapshot.cpp: running sums of every commit / rollback
 struct HitchScope {
     int64_t in; bool armed = false, rerun = false; double session = 0;
+    double hold_updates = 0;   // the hold loop's own session updates (and the save or restore they call): session, not hold (review of diag/hitch, S3)
     double hold0, audio0, fs0, cri0, snap0 = 0, gate0 = 0; uint32_t ops0 = 0;
     HitchScope() : in(qpc_now()), hold0(g_hold_ms), audio0(g_audio_wait_ms), fs0(g_fs_wait_ms), cri0(g_cri_wait_ms) { jsp_snapshot_ext_cost_sum(&snap0, &gate0, &ops0); }
     ~HitchScope()
@@ -1554,8 +1555,8 @@ struct HitchScope {
         if (!armed || !perf_on()) return;   // not armed, or the match ended in this boundary (reset_match ran)
         const int64_t out = qpc_now();
         double sn = 0, gt = 0; uint32_t ops = 0; jsp_snapshot_ext_cost_sum(&sn, &gt, &ops);
-        jph::add_boundary(g_hz.gap, session, sn - snap0, gt - gate0, ops - ops0, g_hold_ms - hold0, g_audio_wait_ms - audio0, g_fs_wait_ms - fs0, g_cri_wait_ms - cri0,
-                          qpc_ms(in, out));
+        jph::add_boundary(g_hz.gap, session + hold_updates, sn - snap0, gt - gate0, ops - ops0, g_hold_ms - hold0 - hold_updates, g_audio_wait_ms - audio0,
+                          g_fs_wait_ms - fs0, g_cri_wait_ms - cri0, qpc_ms(in, out));
         g_hz_exit = out; g_hz_after_rerun = rerun;
     }
 };
@@ -1567,6 +1568,8 @@ void hitch_frame(HitchScope& hz, double pn)
     if (g.ctx) g_jsp_main_tid = (uint32_t)g.ctx->thread_id;
     if (g_hz_exit) jph::add_guest(g_hz.gap, qpc_ms(g_hz_exit, hz.in), g_hz_after_rerun);
     g_hz_exit = 0;
+    const int64_t now = qpc_now();   // FIX (review of diag/hitch, S2): this boundary up to here (native / match poll, the tick state, the watches) ends the gap
+    jph::add_pre(g_hz.gap, qpc_ms(hz.in, now)); hz.in = now;   // that is about to close; the destructor files only the rest into the next one
     if (g.was_replaying) return;   // this iteration presents nothing (jpperf::on_frame: not shown): the gap goes on
     jph::Clock ck; jsp_stepper_hitch_take(&ck);
     if (g_perf.last_frame < 0) { g_hz.gap = jph::Gap(); return; }   // the first presented frame of the match: nothing before it to measure
@@ -1657,7 +1660,9 @@ void boundary(ppu_context* c)
         while (op.kind != jsx::OpKind::Run && qpc_ms(h0, qpc_now()) < 400.0 && !g.sess.failed()) {
             Sleep(1); g.sess.poll();
             const uint64_t u1 = g.glue->updates();
+            const int64_t hu0 = qpc_now();   // DIAGNOSTIC (per-hitch line): the update and any save it calls are session time, not hold
             op = g.glue->iteration(true);
+            hz.hold_updates += qpc_ms(hu0, qpc_now());
             if (g.glue->updates() != u1) jsp_snapshot_ext_budget_reset();
         }
         g_hold_ms += qpc_ms(h0, qpc_now()); g_holds++; if (op.kind != jsx::OpKind::Run) g_hold_renders++;
