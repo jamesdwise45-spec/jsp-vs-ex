@@ -57,9 +57,11 @@ extern "C" int jsp_pick_submit(unsigned, unsigned, int, int) { return 0; }
 #include <array>
 #include <cmath>
 #include <string>
+#include <thread>
 #include <vector>
 #include <utility>
 #include <windows.h>
+extern "C" const char* ppu_vfs_root;   // ppu_fs.cpp: the folder holding PS3_GAME (ENHANCEMENT, after-match menu art: jsp_pick_art.h reads its archives)
 
 #include "ps3emu/ps3types.h"
 #include "ppu_recomp.h"
@@ -87,6 +89,7 @@ static bool clock_diag() { static const bool v = [] { const char* e = std::geten
 #include "jsp_net_pick_flow.h"      // ENHANCEMENT (post-game / pick, JSP_ROLLBACK_PICK=1): the prompt, the pick round, the pair for the builder (pure, host-tested)
 #include "jsp_net_pick_drive.h"     // ENHANCEMENT (post-game / pick): the pad gate, the notice-box Cross, the joiner's Ready Cross (pure, host-tested)
 #include "jsp_net_pick_own.h"       // FIX (pick7): the planned seats, the predicted fighter map, the match-end rule (pure, host-tested)
+#include "jsp_pick_skin.h"         // ENHANCEMENT (after-match menu art): the game's own menu art from the player's archives, and the layouts (pure, host-tested)
 static_assert(jspf::kTagPostgame == jspnet::kLinkTagPostgame && jspf::kTagPick == jspnet::kLinkTagPick, "one set of link tags");
 #include "jsp_session_reader.h"
 #include "jsp_session_manifest.h"
@@ -324,9 +327,14 @@ struct State {
     std::atomic<bool> stall_ended{false};
     // ENHANCEMENT (post-game / pick, JSP_ROLLBACK_PICK=1): the prompt and the pick round of the open link (jsp_net_pick_flow.h), under the pump mutex. pick_link:
     // this link was opened for a native room (conn_open; only those get the prompt). pk_*: what the prompt / picker layer draws (main thread, redraw).
+    // ENHANCEMENT (after-match menu art): pk is the menu in the game's own look (jsp_pick_skin.h); pk_open_ms starts its fade-in, pk_pic / pk_band_pic
+    // cache the painted pictures by their content key (a paint costs ~10 ms; a redraw of the same content only blits).
     jspf::Flow flow; bool pick_link = false;
-    struct PickPanel { std::string title; std::vector<std::string> rows; int sel = -1; std::vector<std::string> lines; std::string hint, band; } pk;
+    jpskin::View pk;
     std::string pk_key;
+    uint64_t pk_open_ms = 0;
+    std::string pk_pic_key, pk_band_key;
+    jpskin::Frame pk_pic, pk_band_pic;
 } g;
 // FIX (a missed KO): the KO / time-up winner of EVERY saved tick (commit and hash_only, predicted or not), keyed by tick; a re-save after a
 // rollback overwrites its entry and a rollback drops the entries after its target. The boundary ends the match on the earliest recorded winner whose tick is
@@ -376,37 +384,86 @@ uint32_t build_id()
 #endif
 }
 
+// ENHANCEMENT (after-match menu art, JSP_ROLLBACK_PICK=1): the game's own menu art (pause panel, cursor, general dialog, guide strip, button
+// glyphs, system font: jsp_pick_art.h), read once from the player's disc copy (<vfs root>/PS3_GAME/USRDIR/data/PS3, the archives the game
+// itself reads) on a background thread at the first frame with the switch on, and kept in memory; nothing is written. Until it is there,
+// or for any piece it could not read, the layouts draw their fallback shapes (jsp_pick_skin.h). One [pickui] line says what was found.
+// Overlay only: no guest memory, pad, watchdog or room-flow state is touched, so the rollback session is unaffected.
+std::atomic<const jpart::Art*> g_pk_art{ nullptr };
+std::atomic<bool> g_pk_art_started{ false };
+void pk_art_start()
+{
+    if (g_pk_art_started.exchange(true)) return;
+    std::string dir = ppu_vfs_root && *ppu_vfs_root ? ppu_vfs_root : ".";
+    while (!dir.empty() && (dir.back() == '/' || dir.back() == '\\')) dir.pop_back();
+    dir += "/PS3_GAME/USRDIR/data/PS3";
+    std::thread([dir] {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        const uint64_t t0 = GetTickCount64();
+        jpart::DirIo io(dir);
+        std::vector<std::string> log;
+        const jpart::Art* art = new jpart::Art(jpart::load_art(io, log));   // kept for the process (read by the main thread's redraw)
+        for (const std::string& l : log) std::fprintf(stderr, "[pickui] %s\n", l.c_str());
+        std::fprintf(stderr, "[pickui] game art: %s (%llu ms)%s\n", art->summary().c_str(), (unsigned long long)(GetTickCount64() - t0),
+                     art->any() ? "" : "; the after-match menu draws its fallback shapes");
+        g_pk_art.store(art, std::memory_order_release);
+    }).detach();
+}
+void pk_blit(const jpskin::Frame& f, float alpha, int lift)
+{
+    if (f.pic.empty()) return;
+    if (alpha >= 1.0f) jsp_overlay_blit_rgba(f.x, f.y + lift, f.pw, f.ph, f.pic.data(), f.pw * 4);
+    else {   // the fade-in: the cached picture with its alpha scaled
+        static std::vector<uint8_t> tmp;
+        tmp = f.pic;
+        const unsigned a = (unsigned)(alpha * 256.0f);
+        for (size_t i = 3; i < tmp.size(); i += 4) tmp[i] = (uint8_t)((tmp[i] * a) >> 8);
+        jsp_overlay_blit_rgba(f.x, f.y + lift, f.pw, f.ph, tmp.data(), f.pw * 4);
+    }
+    for (const jpskin::TextOp& t : f.text) {
+        const uint32_t ta = (uint32_t)((float)(t.rgba >> 24) * alpha);
+        jsp_overlay_text_style(t.x, t.y + (float)lift, t.s.c_str(), t.scale, (t.rgba & 0x00FFFFFFu) | ta << 24, t.style);
+    }
+}
+// 0..1 (eased) over the 160 ms after the window opened
+float pk_open_t()
+{
+    const uint64_t now = GetTickCount64();
+    const float t = now > g.pk_open_ms ? (float)(now - g.pk_open_ms) / 160.0f : 0.0f;
+    return t >= 1.0f ? 1.0f : 1.0f - (1.0f - t) * (1.0f - t);
+}
+// Paints what changed (before jsp_overlay_begin: the overlay's edit lock stays short); a repeat of the same content reuses the pictures.
+void pk_prepare(const jpskin::View& k)
+{
+    const jpart::Art* art = g_pk_art.load(std::memory_order_acquire);
+    const std::string tag = art ? "a" : "f";   // the art arriving repaints
+    const jpskin::Painter P(art, [](const std::string& t, float sc) { return jsp_overlay_text_width(t.c_str(), sc); });
+    if (k.kind != jpskin::NONE) {
+        const std::string key = tag + k.key();
+        if (key != g.pk_pic_key) { g.pk_pic_key = key; g.pk_pic = k.kind == jpskin::DIALOG ? jpskin::dialog(P, art, k, 1.0f) : jpskin::menu(P, k, 1.0f, 1.0f); }
+    }
+    if (!k.band.empty()) {
+        const std::string key = tag + k.band;
+        if (key != g.pk_band_key) { g.pk_band_key = key; g.pk_band_pic = jpskin::band(P, k.band); }
+    }
+}
+void pk_draw(const jpskin::View& k)
+{
+    if (k.kind != jpskin::NONE) { const float open = pk_open_t(); pk_blit(g.pk_pic, open, (int)((1.0f - open) * 12.0f)); }
+    if (!k.band.empty()) pk_blit(g.pk_band_pic, 1.0f, 0);
+}
+
 // The glue's overlay layer holds the message line (bottom left), when on the status badge (top left) and the ping counter (under the fight timer, bottom right);
 // a change of any redraws all.
 void redraw()
 {
     const std::string& s = g.shown; const std::string& b = g.badge_shown; const std::string& p = g.ping_shown;
-    const State::PickPanel& k = g.pk;
-    if (s.empty() && b.empty() && p.empty() && k.title.empty() && k.band.empty()) { jsp_overlay_close(); return; }
+    const jpskin::View& k = g.pk;
+    if (s.empty() && b.empty() && p.empty() && k.kind == jpskin::NONE && k.band.empty()) { jsp_overlay_close(); return; }
+    const bool menu = k.kind != jpskin::NONE || !k.band.empty();
+    if (menu) pk_prepare(k);   // ENHANCEMENT (post-game / pick): the menu in the game's own look
     if (!jsp_overlay_begin(1280, 720)) return;
-    const uint32_t white = JSP_RGBA(255, 255, 255, 255), gold = JSP_RGBA(240, 190, 30, 255);
-    if (!k.title.empty()) {   // ENHANCEMENT (post-game / pick): the prompt / picker panel in the Port Settings page's look (navy panel, gold rules, the menu font's off / on labels)
-        const int rows = (int)k.rows.size(), lines = (int)k.lines.size();
-        const int h = 96 + rows * 56 + lines * 32 + (k.hint.empty() ? 0 : 40), y0 = (720 - h) / 2;
-        jsp_overlay_fill_rect(340, y0, 600, h, JSP_RGBA(16, 20, 40, 235));
-        jsp_overlay_fill_rect(340, y0, 600, 6, gold);
-        jsp_overlay_fill_rect(340, y0 + h - 6, 600, 6, gold);
-        jsp_overlay_text_style(370, (float)(y0 + 28), k.title.c_str(), 1.2f, white, 0);
-        for (int i = 0; i < rows; i++) {
-            const int y = y0 + 92 + i * 56;
-            const bool on = i == k.sel;
-            if (on) jsp_overlay_fill_rect(360, y - 12, 560, 48, JSP_RGBA(255, 255, 255, 235));
-            jsp_overlay_text_style(390, (float)y, k.rows[(size_t)i].c_str(), 1.0f, white, on ? 1 : 0);
-        }
-        for (int i = 0; i < lines; i++) jsp_overlay_text_style(370, (float)(y0 + 92 + rows * 56 + i * 32), k.lines[(size_t)i].c_str(), 0.7f, i == 0 ? white : gold, 0);
-        if (!k.hint.empty()) jsp_overlay_text_style(370, (float)(y0 + h - 40), k.hint.c_str(), 0.55f, white, 0);
-    }
-    if (!k.band.empty()) {   // one line above the message line (the notice band's colours)
-        const float w = jsp_overlay_text_width(k.band.c_str(), 0.8f);
-        jsp_overlay_fill_rect(30, 576, (int)(w > 0 ? w : 700) + 40, 46, JSP_RGBA(16, 20, 40, 225));
-        jsp_overlay_fill_rect(30, 618, (int)(w > 0 ? w : 700) + 40, 4, gold);
-        jsp_overlay_text_style(50, 588, k.band.c_str(), 0.8f, white, 0);
-    }
+    if (menu) pk_draw(k);
     if (!b.empty()) {
         const float bw = jsp_overlay_text_width(b.c_str(), jpnb::kScale);
         jsp_overlay_fill_rect(jpnb::kBoxX, jpnb::kBoxY, (int)(bw > 0 ? bw : 360) + 2 * jpnb::kBoxPad, jpnb::kBoxH, JSP_RGBA(0, 0, 0, 160));
@@ -2290,8 +2347,6 @@ void pk_lists(PkUi& u)
     if (pk_setting("JSP_PICK_SUPPORT_IDS", 0) == 1) u.supports.assign(ids, ids + jspf::picker_supports(ids, 80));
     else u.supports.assign(1, jspk::kRandom);
 }
-// A text cut to w pixels at this scale in the menu font (printable ASCII; "..." when cut)
-std::string pk_fit(const std::string& s, float w, float scale) { return jspf::fit_text(s, w, [scale](const std::string& t) { return jsp_overlay_text_width(t.c_str(), scale); }); }
 size_t pk_index(const std::vector<uint16_t>& v, uint16_t id) { for (size_t i = 0; i < v.size(); i++) if (v[i] == id) return i; return 0; }
 jspk::Pick pk_current(const PkUi& u)
 {
@@ -2303,11 +2358,12 @@ bool pk_plausible(uint32_t a) { return a >= 0x10000u && a < 0xF0000000u && !(a &
 void pick_frame()
 {
     if (!pick_on()) return;
+    pk_art_start();   // ENHANCEMENT (after-match menu art): once, in the background
     PkUi& u = g_pk;
     if (g.phase.load() == Phase::Running) {   // the match owns the frame: no pump-mutex lock here, nothing drawn, nothing pressed
         if (u.drive != PkDrive::Off) pk_drive(PkDrive::Off);
         g_pk_capture = 0; g_pk_press_until = 0; g_pk_block = 0;
-        if (!g.pk_key.empty()) { g.pk_key.clear(); g.pk = State::PickPanel(); redraw(); }
+        if (!g.pk_key.empty()) { g.pk_key.clear(); g.pk = jpskin::View(); redraw(); }
         return;
     }
     const uint64_t now = GetTickCount64(), nm = now_ms();
@@ -2320,7 +2376,7 @@ void pick_frame()
     bool open = false, host = false, picking = false, start_ok = false, rematch = false, capture = false, block = false; int nplayers = 2;
     std::string outcome_text, round_status; jspg::View v; int lock_secs = -1;
     std::vector<std::string> who;   // one line per player's pick (Select character), for everyone to see
-    State::PickPanel pn;
+    jpskin::View pn;
     {
         std::lock_guard<std::mutex> lk(g.pump.mutex());
         jspf::Flow& f = g.flow;
@@ -2459,44 +2515,52 @@ void pick_frame()
     if (fight_now && (u.drive == PkDrive::Room || u.drive == PkDrive::Start)) pk_drive(PkDrive::Off);
     g_pk_capture = capture && u.drive != PkDrive::Off ? 1 : 0;
     g_pk_block = block && open ? 1 : 0;
-    // the drawing
+    // the drawing (ENHANCEMENT, after-match menu art: the game's own end-of-fight menu look and wording, jsp_pick_skin.h). The game's words:
+    // "Fight again" (its end-of-fight menu), "Select character", "Battle Character" / "Support Character" (the room), "Leave the room?" (its
+    // own confirm). Buttons are the game's glyphs in its guide strip, not words.
+    using jpskin::Guide; using jpskin::Line;
     if (u.drive == PkDrive::Prompt) {
         if (u.leave_ask && !v.locked && v.outcome == jspg::PENDING) {
-            pn.title = "Leave?"; pn.rows = { "Leave the rollback match" }; pn.sel = 0;
-            pn.lines = { "Rollback ends for you; then press Circle in the room to leave it." }; pn.hint = "Cross: leave    Circle: back";
+            pn.kind = jpskin::DIALOG; pn.title = "Leave the match?"; pn.rows = { { "Leave", "" } }; pn.sel = 0;
+            pn.lines = { Line{ "Rollback ends for you.", jpskin::GREY }, Line{ "Then leave the room with Circle.", jpskin::GREY } };
+            pn.guide = { Guide{ jpart::PG_CROSS, -1, "Leave" }, Guide{ jpart::PG_CIRCLE, -1, "Back" } };
         } else {
-            pn.title = "Match over"; pn.rows = { "Fight again", "Select character" }; pn.sel = v.sel <= 1 ? v.sel : -1;
-            pn.lines.push_back(v.status);
-            if (!v.peer_line.empty()) pn.lines.push_back(v.peer_line);
-            if (!v.countdown.empty()) pn.lines.push_back(v.countdown);
-            if (!v.locked && v.outcome == jspg::PENDING) pn.hint = "Up/Down: choose    Cross: confirm    Circle: leave";
+            pn.kind = jpskin::MENU; pn.title = "Match over"; pn.rows = { { "Fight again", "" }, { "Select character", "" } }; pn.sel = v.sel <= 1 ? v.sel : -1;
+            pn.lines.push_back(Line{ v.status, jpskin::WHITE });
+            if (!v.peer_line.empty()) pn.lines.push_back(Line{ v.peer_line, jpskin::GREY });
+            if (!v.countdown.empty()) pn.lines.push_back(Line{ v.countdown, jpskin::AMBER });
+            if (!v.locked && v.outcome == jspg::PENDING) pn.guide = { Guide{ jpart::PG_CROSS, -1, "Confirm" }, Guide{ jpart::PG_CIRCLE, -1, "Leave" } };
         }
     } else if (u.drive == PkDrive::Room && capture) {
-        pn.title = "Select character"; pn.sel = u.prow;
-        pn.rows = { pk_fit("Fighter: < " + jspf::fighter_text(pk_current(u).fighter) + " >", 520, 1.0f), pk_fit("Support: < " + jspf::support_text(pk_current(u).support) + " >", 520, 1.0f) };
+        pn.kind = jpskin::MENU; pn.title = "Select character"; pn.sel = u.prow;
+        pn.rows = { { "Battle Character", jspf::fighter_text(pk_current(u).fighter) }, { "Support Character", jspf::support_text(pk_current(u).support) } };
         if (host) {   // what jspk::roster_apply makes of the mode (humans in join order): 2 players: 1 + 1 or 2 against the COMs; 3: 2 + 1 (with a COM); 4: 2 + 2
-            const char* t = nplayers == 2 ? (u.together ? "both of us vs 2 COMs" : "versus, each with a COM")
+            const char* t = nplayers == 2 ? (u.together ? "Both of us vs 2 COMs" : "Versus, each with a COM")
                           : nplayers == 3 ? (u.together ? "1st + 2nd to join vs 3rd + COM" : "1st + 3rd to join vs 2nd + COM")
                           : (u.together ? "1st + 2nd vs 3rd + 4th to join" : "1st + 3rd vs 2nd + 4th to join");
-            pn.rows.push_back(pk_fit(std::string("Teams: ") + t, 520, 1.0f));
+            pn.rows.push_back({ "Teams", t });
         }
-        pn.lines.push_back(round_status);
-        if (!host) pn.lines.push_back("Teams: the host decides");
-        for (const std::string& l : who) pn.lines.push_back(pk_fit(l, 560, 0.7f));
-        if (lock_secs >= 0 && lock_secs <= 30) pn.lines.push_back("Your pick locks in " + std::to_string(lock_secs) + " s");
-        pn.hint = "Up/Down: row    Left/Right: change    Cross: ready";
+        pn.lines.push_back(Line{ round_status, jpskin::WHITE });
+        if (!host) pn.lines.push_back(Line{ "Teams: the host decides", jpskin::GREY });
+        for (const std::string& l : who) pn.lines.push_back(Line{ l, jpskin::GREY });
+        if (lock_secs >= 0 && lock_secs <= 30) pn.lines.push_back(Line{ "Your pick locks in " + std::to_string(lock_secs) + " s", jpskin::AMBER });
+        pn.guide = { Guide{ jpart::PG_LEFT, jpart::PG_RIGHT, "Change" }, Guide{ jpart::PG_CROSS, -1, "Ready" } };
     } else if (u.drive == PkDrive::Room && !who.empty() && !(native_page == 1 && host && picking && u.page != 9)) {   // locked: everyone's picks until the fight
-        pn.title = "Select character";
-        pn.lines.push_back(round_status);
-        for (const std::string& l : who) pn.lines.push_back(pk_fit(l, 560, 0.7f));
+        pn.kind = jpskin::MENU; pn.title = "Select character";
+        pn.lines.push_back(Line{ round_status, jpskin::WHITE });
+        for (const std::string& l : who) pn.lines.push_back(Line{ l, jpskin::GREY });
     } else if (u.drive == PkDrive::ToRoom) pn.band = rematch ? "Fight again: back to the room..." : "Select character: back to the room...";
     else if (u.drive == PkDrive::Room) pn.band = native_page == 1 && host && picking && u.page != 9 ? "Choose on the Battle settings page, then come back to the room" : round_status;
     else if (u.drive == PkDrive::Start) pn.band = "Starting the next fight...";
     if (now < u.notice_until && (pn.band.empty() || u.drive == PkDrive::Off || u.drive == PkDrive::Manual)) pn.band = u.notice;
-    std::string key = pn.title + '\x1f' + pn.band + '\x1f' + pn.hint + '\x1f' + std::to_string(pn.sel);
-    for (const std::string& r : pn.rows) key += '\x1e' + r;
-    for (const std::string& l : pn.lines) key += '\x1d' + l;
-    if (key != g.pk_key || ((!pn.title.empty() || !pn.band.empty()) && !jsp_overlay_active())) { g.pk_key = key; g.pk = pn; redraw(); }
+    const std::string key = pn.key();
+    const bool shown = pn.kind != jpskin::NONE || !pn.band.empty();
+    if (key != g.pk_key || (shown && !jsp_overlay_active())) {
+        if (pn.kind != jpskin::NONE && (pn.kind != g.pk.kind || pn.title != g.pk.title)) g.pk_open_ms = now;   // a new window: its fade-in
+        g.pk_key = key; g.pk = pn; redraw();
+    } else if (pn.kind != jpskin::NONE && now - g.pk_open_ms < 200) redraw();   // the fade-in's frames
+    else if (g_pk_art.load(std::memory_order_acquire) && ((pn.kind != jpskin::NONE && g.pk_pic_key.rfind('f', 0) == 0) || (!pn.band.empty() && g.pk_band_key.rfind('f', 0) == 0)))
+        redraw();   // the game's art arrived while shown: painted again with it
 }
 
 }  // namespace
