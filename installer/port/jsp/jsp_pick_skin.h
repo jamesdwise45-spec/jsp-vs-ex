@@ -103,7 +103,7 @@ struct Canvas {
 
 // ---- the model the glue fills ---------------------------------------------------------------------------------------------------------
 enum Kind { NONE, MENU, DIALOG };
-enum Tone { WHITE, GREY, AMBER };
+enum Tone { WHITE, GREY, AMBER, DIM };   // DIM: a row that was not chosen (grey at half strength)
 struct Row { std::string label, value; };
 struct Line { std::string s; int tone = WHITE; };
 struct Guide { int glyph = jpart::PG_CROSS, glyph2 = -1; std::string s; };   // glyph2: drawn on the same spot (Left + Right: one D-pad, both arms lit)
@@ -115,9 +115,12 @@ struct View {
     std::vector<Line> lines;
     std::vector<Guide> guide;
     std::string band;           // the one-line band (any kind)
+    bool room = false;          // on the room screen (the picker): wide panel at the picker's place over a dark backing, the room's guide line
+                                // and band places; else over the fight (the prompt)
+    bool chosen = false;        // MENU: this PC has chosen: the cursor settles on `sel` and the other rows are dimmed
     std::string key() const
     {
-        std::string k = std::to_string(kind) + '\x1f' + title + '\x1f' + std::to_string(sel) + '\x1f' + band;
+        std::string k = std::to_string(kind) + '\x1f' + title + '\x1f' + std::to_string(sel) + '\x1f' + band + (room ? "|room" : "") + (chosen ? "|chosen" : "");
         for (const Row& r : rows) k += '\x1e' + r.label + '\x1d' + r.value;
         for (const Line& l : lines) k += '\x1c' + std::to_string(l.tone) + l.s;
         for (const Guide& g : guide) k += '\x1b' + std::to_string(g.glyph) + ',' + std::to_string(g.glyph2) + g.s;
@@ -158,6 +161,7 @@ public:
     {
         uint8_t r = 255, g = 255, b = 255;
         if (dark) r = g = b = 24; else if (tone == GREY) r = g = b = 190; else if (tone == AMBER) { r = 255; g = 204; b = 40; }
+        else if (tone == DIM) { r = g = b = 190; alpha *= 0.5f; }
         if (font()) { c.text(a_->font, x, base, s, scale, r, g, b, alpha); return; }
         ops.push_back({ fx + x, fy + base - 21.0f * scale * kOvScale, s, scale * kOvScale, rgba(r, g, b, alpha), dark ? 1 : 0 });
     }
@@ -217,6 +221,19 @@ public:
             }
     }
     // the guide strip; returns its width (measure only when c is null)
+    // a plain arrowhead (the value arrows of the game's own character select): dir -1 left, +1 right, s px tall
+    void arrow(Canvas& c, int dir, float x, float y, float s, bool amber, float al) const
+    {
+        const uint8_t r = 255, g = amber ? 204 : 255, b = amber ? 40 : 255;
+        const float w = s * 0.62f;
+        for (int yy = int(y); yy < int(y + s); yy++)
+            for (int xx = int(x); xx < int(x + w + 1); xx++) {
+                const float v = std::fabs(yy + 0.5f - (y + s / 2)) / (s / 2), u = (xx + 0.5f - x) / w;   // u 0..1 across, v 0..1 from the axis
+                const float t = dir < 0 ? u : 1.0f - u;                                                   // 0 at the tip
+                const float cov = std::clamp((t - v) * w + 0.5f, 0.0f, 1.0f) * (u >= 0 && u <= 1 ? 1.0f : 0.0f);
+                if (cov > 0) c.over(xx, yy, r / 255.0f * cov * al, g / 255.0f * cov * al, b / 255.0f * cov * al, cov * al);
+            }
+    }
     // the guide strip at (x, y), `width` wide (0: as wide as its items); returns its width. The game's sizes: glyph 26 px, text cap 18 px.
     float guide(Canvas* c, int fx, int fy, float x, float y, const std::vector<Guide>& gs, float al, std::vector<TextOp>* ops, float width = 0) const
     {
@@ -263,7 +280,12 @@ private:
 constexpr int kMenuW = 520, kMenuValuesW = 680, kRowH = 46, kLineH = 30, kMenuX = 700;
 constexpr int kLinesGap = 22;     // rows -> status lines (the dotted rule in the gap)
 constexpr int kGuideY = 626;      // the game's guide bar: its top at 720p (Main Menu, Character Info)
-constexpr float kGlyphGap = 10;   // D-pad glyph <-> value text
+constexpr float kGlyphGap = 8;    // value arrow <-> value text
+constexpr float kArrow = 16;      // the value arrows' height
+constexpr int kFightTop = 150;    // the prompt's top (clear of the fighters' name tags), and the picker's in the room
+constexpr int kRoomTop = 120;
+constexpr int kFightGuideY = 668; // over the fight the guide sits under the win-quote subtitles (y ~584-630)
+constexpr int kFightBandY = 470, kRoomBandY = 110;   // bands: above the subtitles over the fight; under the "Friendly Match" header in the room
 inline Frame menu(const Painter& P, const View& v, float open, float sweep)
 {
     Frame f;
@@ -272,25 +294,26 @@ inline Frame menu(const Painter& P, const View& v, float open, float sweep)
     const int H = std::max(144, 72 + nrows * kRowH + (nlines ? kLinesGap + nlines * kLineH : 0) + 30);
     bool values = false;
     for (const Row& r : v.rows) values = values || !r.value.empty();
-    const int W = values ? kMenuValuesW : kMenuW;
+    const int W = values || v.room ? kMenuValuesW : kMenuW;   // the picker keeps its width when it locks (no rows left)
     const float ls = values ? 0.82f : 0.92f;   // label scale: smaller beside a value
-    f.x = std::min(kMenuX, 1280 - 40 - W); f.y = int((kGuideY - H) / 2 + lift);
+    f.x = std::min(kMenuX, 1280 - 40 - W); f.y = int((v.room ? kRoomTop : kFightTop) + lift);   // a fixed top: the panel grows downward
     Canvas c; c.make(W, H);
+    if (v.room) c.fill(6, 6, float(W - 12), float(H - 12), 0, 0, 0, 0.55f * al);   // over the busy room: a dark backing under the glass
     P.panel(c, 0, 0, float(W), float(H), 64, al);
     P.title(float(f.x + 24), float(f.y + 14), v.title, al, f.text);   // where the game's plate sits: the panel's black top band
     P.rule(c, 26, 52, float(W - 52), al);
     for (int i = 0; i < nrows; i++) {
         const float y = 70.0f + i * kRowH;
         P.row_band(c, 22, y, float(W - 44), 40, al);
-        if (i == v.sel) P.cursor(c, 22, y, float(W - 44), 40, sweep, al);
+        if (i == v.sel) P.cursor(c, 22, y, float(W - 44), 40, v.chosen ? 1.0f : sweep, al);
         const bool on = i == v.sel;
-        P.text(c, f.x, f.y, 44, y + 29, v.rows[size_t(i)].label, ls, on ? WHITE : GREY, al, f.text);
-        const float right = float(W - 44 - 24 - kGlyphGap);   // values end here, the right glyph after it (room kept on every row: values stay aligned)
-        const std::string val = P.fit(v.rows[size_t(i)].value, right - 24 - kGlyphGap - (44 + P.tw(v.rows[size_t(i)].label, ls) + 20), 0.86f);
+        P.text(c, f.x, f.y, 44, y + 29, v.rows[size_t(i)].label, ls, on ? WHITE : v.chosen ? DIM : GREY, al, f.text);
+        const float right = float(W - 44 - kArrow - kGlyphGap);   // values end here, the right arrow after it (room kept on every row: values stay aligned)
+        const std::string val = P.fit(v.rows[size_t(i)].value, right - kArrow - kGlyphGap - (44 + P.tw(v.rows[size_t(i)].label, ls) + 20), 0.86f);
         if (!val.empty()) {
             const float vw = P.tw(val, 0.86f);
             P.text(c, f.x, f.y, right - vw, y + 29, val, 0.86f, WHITE, al, f.text);
-            if (on) { P.glyph(c, jpart::PG_LEFT, right - vw - kGlyphGap - 24, y + 8, 24, al); P.glyph(c, jpart::PG_RIGHT, right + kGlyphGap, y + 8, 24, al); }
+            if (on) { P.arrow(c, -1, right - vw - kGlyphGap - kArrow * 0.62f, y + 12, kArrow, true, al); P.arrow(c, +1, right + kGlyphGap, y + 12, kArrow, true, al); }
         }
     }
     if (nlines && nrows) P.dots(c, 30, 70.0f + nrows * kRowH + 6, float(W - 60), al);   // the game's dotted rule between the rows and the status lines
@@ -299,13 +322,15 @@ inline Frame menu(const Painter& P, const View& v, float open, float sweep)
     f.pw = c.w; f.ph = c.h; c.straight(f.pic);
     return f;
 }
-// The guide bar, where the game's menus have theirs: across the foot of the screen (x 40 to 1240), the items from the left.
-inline Frame guide_bar(const Painter& P, const std::vector<Guide>& gs)
+// The guide bar. In the room: the room's own guide line, across the foot of the screen (x 40 to 1240, top kGuideY). Over the fight: as
+// wide as its items and lower (top kFightGuideY), under the game's win-quote subtitles and left of the ping counter.
+inline Frame guide_bar(const Painter& P, const std::vector<Guide>& gs, bool room = true)
 {
     Frame f;
-    f.x = 40; f.y = kGuideY;
-    Canvas c; c.make(1200, 39);
-    P.guide(&c, f.x, f.y, 0, 0, gs, 1.0f, &f.text, 1200);
+    f.x = 40; f.y = room ? kGuideY : kFightGuideY;
+    const float w = room ? 1200.0f : P.guide(nullptr, 0, 0, 0, 0, gs, 1.0f, nullptr);
+    Canvas c; c.make(int(w), 39);
+    P.guide(&c, f.x, f.y, 0, 0, gs, 1.0f, &f.text, w);
     f.pw = c.w; f.ph = c.h; c.straight(f.pic);
     return f;
 }
@@ -339,13 +364,13 @@ inline Frame dialog(const Painter& P, const jpart::Art* a, const View& v, float 
     return f;
 }
 // The one-line band, bottom left (a slim pause panel).
-inline Frame band(const Painter& P, const jpart::Art* a, const std::string& s)
+inline Frame band(const Painter& P, const jpart::Art* a, const std::string& s, bool room = false)
 {
     Frame f;
     const float sc = 0.8f;
     const bool note = a && a->note[0].ok() && a->note[1].ok() && a->note[2].ok();
     const int H = 64, icon = note && a->busy.ok() ? 44 : 0, W = std::min(1220, int(P.tw(s, sc)) + 56 + icon);
-    f.x = 30; f.y = 556;
+    f.x = 30; f.y = room ? kRoomBandY : kFightBandY;
     Canvas c; c.make(W, H);
     if (note) {   // the game's notice window (its save / load / connecting box), its busy icon at the left
         const float k = H / 228.0f, cw = 64 * k;

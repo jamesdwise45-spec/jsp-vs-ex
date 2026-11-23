@@ -134,7 +134,7 @@ int main()
         CHECK(a.pick(REMATCH, 300) && a.pick(CHARSELECT, 400) && a.mine() == CHARSELECT);       // changeable before the peer picks
         CHECK(a.view(0, 400).status == "Waiting for opponent...");
         CHECK(a.receive(msg(1, 2, REMATCH, false), 500) && a.locked() && a.outcome() == PENDING);
-        CHECK(a.view(0, 500).peer_line == "Opponent wants a rematch" && a.view(0, 500).sel == 1);
+        CHECK(a.view(0, 500).peer_line == "Opponent chose Fight again" && a.view(0, 500).sel == 1);
         CHECK(!a.pick(REMATCH, 600) && a.mine() == CHARSELECT);                                // locked
         CHECK(a.take(600, &m) && m.saw && m.pick == CHARSELECT);                               // the lock goes out at once
         CHECK(a.receive(msg(1, 2, REMATCH, true), 700) && a.outcome() == PENDING);             // duplicate rev: nothing

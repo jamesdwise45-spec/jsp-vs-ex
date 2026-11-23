@@ -445,11 +445,12 @@ void pk_prepare(const jpskin::View& k)
     if (!k.guide.empty()) {   // the guide bar where the game's menus have theirs (the foot of the screen)
         std::string key = tag;
         for (const jpskin::Guide& q : k.guide) key += std::to_string(q.glyph) + ',' + std::to_string(q.glyph2) + q.s + '\x1f';
-        if (key != g.pk_guide_key) { g.pk_guide_key = key; g.pk_guide_pic = jpskin::guide_bar(P, k.guide); }
+        if (k.room) key += 'R';
+        if (key != g.pk_guide_key) { g.pk_guide_key = key; g.pk_guide_pic = jpskin::guide_bar(P, k.guide, k.room); }
     }
     if (!k.band.empty()) {
-        const std::string key = tag + k.band;
-        if (key != g.pk_band_key) { g.pk_band_key = key; g.pk_band_pic = jpskin::band(P, art, k.band); }
+        const std::string key = tag + (k.room ? "R" : "F") + k.band;
+        if (key != g.pk_band_key) { g.pk_band_key = key; g.pk_band_pic = jpskin::band(P, art, k.band, k.room); }
     }
 }
 // The game's own string `id` (its message tables: PAU_011 "Fight again", BUT_000 "Confirm", ...) once the art is read, else `dflt`.
@@ -2481,7 +2482,7 @@ void pick_frame()
         const bool self = act == jspf::Act::LeaveGiveUp;   // FIX (pick7): a freeze (here or there) closes the link without giving the room up
         u.notice = act == jspf::Act::Froze ? "This game stopped for a minute: the rollback link was closed"
                  : act == jspf::Act::PeerFroze ? "The other player's game stopped responding: back to the room"
-                 : act == jspf::Act::Lost ? round_status : self ? "Back to the lobby: press Circle in the room to leave it" : outcome_text;
+                 : act == jspf::Act::Lost ? round_status : self ? "Match left: press Circle in the room to go back to the lobby" : outcome_text;
         u.notice_until = now + 6000;
         pk_drive(PkDrive::Off); g_pk_capture = 0;
         if (g_nat.link) { const uint64_t room = g_nat.room; native_close(self ? "post-game: this player left" : "post-game: the round ended without this link"); if (self) g_nat.given_up = room; }
@@ -2535,19 +2536,25 @@ void pick_frame()
     if (u.drive == PkDrive::Prompt) {
         if (u.leave_ask && !v.locked && v.outcome == jspg::PENDING) {
             pn.kind = jpskin::DIALOG; pn.title = "Leave the match?"; pn.rows = { { pk_word("BUT_017", "Leave"), "" } }; pn.sel = 0;
-            pn.lines = { Line{ "Rollback ends for you.", jpskin::GREY }, Line{ "Then leave the room with Circle.", jpskin::GREY } };
+            pn.lines = { Line{ "You will return to the room.", jpskin::GREY }, Line{ "Press Circle there to go back to the lobby.", jpskin::GREY } };
             pn.guide = { Guide{ jpart::PG_CROSS, -1, pk_word("BUT_017", "Leave") }, Guide{ jpart::PG_CIRCLE, -1, pk_word("BUT_013", "Back") } };
         } else {
             // the rows say what the game's own end-of-fight menu says (PAU_011, PAU_009)
-            pn.kind = jpskin::MENU; pn.title = "Match over"; pn.rows = { { pk_word("PAU_011", "Fight again"), "" }, { pk_word("PAU_009", "Re-select character(s)"), "" } };
+            // Title Case like the game's own plates ("Pause Menu", "Main Menu")
+            pn.kind = jpskin::MENU; pn.title = "Match Over"; pn.rows = { { pk_word("PAU_011", "Fight again"), "" }, { pk_word("PAU_009", "Re-select character(s)"), "" } };
             pn.sel = v.sel <= 1 ? v.sel : -1;
+            pn.chosen = v.mine != jspg::NONE;   // this PC has chosen: the cursor settles on its row, the other row is dimmed
             pn.lines.push_back(Line{ v.status, jpskin::WHITE });
             if (!v.peer_line.empty()) pn.lines.push_back(Line{ v.peer_line, jpskin::GREY });
             if (!v.countdown.empty()) pn.lines.push_back(Line{ v.countdown, jpskin::AMBER });
-            if (!v.locked && v.outcome == jspg::PENDING) pn.guide = { Guide{ jpart::PG_CROSS, -1, pk_word("BUT_000", "Confirm") }, Guide{ jpart::PG_CIRCLE, -1, pk_word("BUT_017", "Leave") } };
+            // the guide offers what the input above still takes: both until this PC chose; then only Circle (Leave), until both chose
+            if (!v.locked && v.outcome == jspg::PENDING) {
+                if (pn.chosen) pn.guide = { Guide{ jpart::PG_CIRCLE, -1, pk_word("BUT_017", "Leave") } };
+                else pn.guide = { Guide{ jpart::PG_CROSS, -1, pk_word("BUT_000", "Confirm") }, Guide{ jpart::PG_CIRCLE, -1, pk_word("BUT_017", "Leave") } };
+            }
         }
     } else if (u.drive == PkDrive::Room && capture) {
-        pn.kind = jpskin::MENU; pn.title = "Select character"; pn.sel = u.prow;
+        pn.kind = jpskin::MENU; pn.title = "Character Select"; pn.sel = u.prow; pn.room = true;   // the game's own header for this screen
         pn.rows = { { "Battle Character", jspf::fighter_text(pk_current(u).fighter) }, { "Support Character", jspf::support_text(pk_current(u).support) } };
         if (host) {   // what jspk::roster_apply makes of the mode (humans in join order): 2 players: 1 + 1 or 2 against the COMs; 3: 2 + 1 (with a COM); 4: 2 + 2.
             // Written with the P numbers of the pick lines below (jspf::pick_line: P1 = the first to join).
@@ -2562,12 +2569,12 @@ void pick_frame()
         if (lock_secs >= 0 && lock_secs <= 30) pn.lines.push_back(Line{ "Your pick locks in " + std::to_string(lock_secs) + " s", jpskin::AMBER });
         pn.guide = { Guide{ jpart::PG_LEFT, jpart::PG_RIGHT, "Change" }, Guide{ jpart::PG_CROSS, -1, "Ready" } };   // "Ready": the game's own room word (BUT_067)
     } else if (u.drive == PkDrive::Room && !who.empty() && !(native_page == 1 && host && picking && u.page != 9)) {   // locked: everyone's picks until the fight
-        pn.kind = jpskin::MENU; pn.title = "Select character";
+        pn.kind = jpskin::MENU; pn.title = "Character Select"; pn.room = true;   // the same window, settled: same place and width
         pn.lines.push_back(Line{ round_status, jpskin::WHITE });
         for (const std::string& l : who) pn.lines.push_back(Line{ l, jpskin::GREY });
     } else if (u.drive == PkDrive::ToRoom) pn.band = (rematch ? pk_word("PAU_011", "Fight again") : pk_word("PAU_009", "Re-select character(s)")) + ": back to the room...";
-    else if (u.drive == PkDrive::Room) pn.band = native_page == 1 && host && picking && u.page != 9 ? "Choose on the Battle settings page, then come back to the room" : round_status;
-    else if (u.drive == PkDrive::Start) pn.band = "Starting the next fight...";
+    else if (u.drive == PkDrive::Room) { pn.band = native_page == 1 && host && picking && u.page != 9 ? "Choose on the Battle settings page, then come back to the room" : round_status; pn.room = true; }
+    else if (u.drive == PkDrive::Start) { pn.band = "Starting the next fight..."; pn.room = true; }   // room bands: top left, under the room's header
     if (now < u.notice_until && (pn.band.empty() || u.drive == PkDrive::Off || u.drive == PkDrive::Manual)) pn.band = u.notice;
     const std::string key = pn.key();
     const bool shown = pn.kind != jpskin::NONE || !pn.band.empty();
