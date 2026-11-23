@@ -76,6 +76,7 @@ extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*);
 #include "jsp_net_pick_flow.h"   // ENHANCEMENT (post-game / pick, JSP_ROLLBACK_PICK=1): the agreed pair's roster write (apply_pair)
 #include "jsp_net_pick_drive.h"  // FIX (pick8 run s1a): jspd::autopilot_pad, the after-match drive's press kept outside a match
 #include "jsp_net_pick_own.h"    // FIX (pick7): the fighter map the coming session will build (predict_map, the planned seats)
+#include "jsp_net_pick_page.h"   // ENHANCEMENT (JSP_PICK_NATIVE_SELECT=1): the Battle settings page's update targets
 extern "C" int jsp_setting_get(const char* key, char* out, int n);
 /* jsp_net_game.cpp (ENHANCEMENT, post-game / pick): the pair the coming build applies, whether one is active, the switch, and the AUTO_ONLINE steps */
 extern "C" int jsp_pick_pair(jspf::PairOut* out);
@@ -230,6 +231,11 @@ int g_pick_trace = 0, g_pick_scene = 0;
 uint32_t g_room_tg[4] = { 0x00292090u, 0x00290FF4u, 0, 0 };
 std::atomic<unsigned long long> g_room_ms{0};
 std::atomic<unsigned long long> g_load_ms{0};   /* FIX (mapping run U4): when the online loading scene's update 0x002ECD30 last ran */
+/* ENHANCEMENT (JSP_PICK_NATIVE_SELECT=1): the room's Battle settings page (the game's own character select in the room): its per-frame update
+ * targets (jsps::kPageTg, JSP_PICK_PAGE_TG) and when one last ran. With JSP_PICK_TRACE=1 the room scene object's state words (+0x84, +0x8C)
+ * are logged on change, for the mapping run (TODO-MAPPING P1: a state value that marks the page would be a second signal). */
+uint32_t g_page_tg[4] = { jsps::kPageTg[0], jsps::kPageTg[1], jsps::kPageTg[2], jsps::kPageTg[3] };
+std::atomic<unsigned long long> g_page_ms{0};
 void room_dump(const char* tag, uint32_t R)
 {
     NLOG("[online] %s room data %08X:\n", tag, R);
@@ -362,6 +368,12 @@ int icall(uint32_t target, uint64_t* gpr)
     if (g_pick) {   /* ENHANCEMENT (post-game / pick): the room page's update ran (jsp_native_room_seen_ms); the loading-scene re-apply (JSP_PICK_SCENE_APPLY=1) */
         for (uint32_t k : g_room_tg) if (k && target == k) g_room_ms = t;
         if (target == 0x002ECD30u) g_load_ms = t;   /* FIX (mapping run U4): the online loading scene runs: the next fight is on its way */
+        for (uint32_t k : g_page_tg) if (k && target == k) g_page_ms = t;   /* ENHANCEMENT (JSP_PICK_NATIVE_SELECT=1): the Battle settings page runs */
+        if (target == 0x00292090u && g_pick_trace && plausible_obj(r3)) {   /* TEST (mapping run P1): the room scene's state words, on change */
+            static uint32_t last84 = 0xFFFFFFFFu, last8c = 0xFFFFFFFFu; static int said = 0;
+            const uint32_t a = vm_read32(r3 + 0x84u), b = vm_read32(r3 + 0x8Cu);
+            if ((a != last84 || b != last8c) && said < 400) { said++; last84 = a; last8c = b; NLOG("[ptrace] f=%u t=%.1f room scene %08X state +84 %08X +8C %08X\n", flips(), secs(), r3, a, b); }
+        }
         if (g_pick_scene && target == 0x002ECD30u) pick_roster_apply("loading scene", true);
     }
     if (target == 0x001DE098u) { g_main_obj = r3; g_main_ms = t; if (!g_menu_seen && plausible_obj(r3) && vm_read32(r3) == 0x0087D600u) g_menu_seen = true; }
@@ -763,6 +775,8 @@ void pad(uint32_t port, uint16_t* b, uint16_t* lx, uint16_t* ly)
 extern "C" unsigned long long jsp_native_room_seen_ms(void) { return g_pick ? g_room_ms.load() : 0ull; }
 /* FIX (mapping run U4): when the online loading scene (0x002ECD30) last ran (GetTickCount64; 0 = never or the switch is off). Any thread. */
 extern "C" unsigned long long jsp_native_loading_seen_ms(void) { return g_pick ? g_load_ms.load() : 0ull; }
+/* ENHANCEMENT (JSP_PICK_NATIVE_SELECT=1): when the room's Battle settings page last ran (GetTickCount64; 0 = never or the switch is off). Any thread. */
+extern "C" unsigned long long jsp_native_page_seen_ms(void) { return g_pick ? g_page_ms.load() : 0ull; }
 /* Lift hooks on the battle builder 0x002EEE90..0x002EF788 (lift_game_hooks.json; every PC builds the fight from its own room data R). Enter: the agreed
  * pair's roster write (nothing without JSP_ROLLBACK_PICK=1 or without a pair). JSP_PICK_TRACE=1 dumps R at enter (before and after the write) and at
  * leave, for the mapping run (TODO-MAPPING U6: the records and +0x44 / +0x48 / +0x56.. byte-equal on every PC at the entry; U6b: unchanged at the leave). */
@@ -811,6 +825,9 @@ extern "C" void jsp_register_native_online(void)
             }
             NLOG("[online] post-game / pick on (JSP_ROLLBACK_PICK=1): room page targets %X %X %X %X, loading-scene re-apply %s, trace %s\n", g_room_tg[0], g_room_tg[1], g_room_tg[2], g_room_tg[3],
                  g_pick_scene ? "on" : "off", g_pick_trace ? "on" : "off");
+            if (jsp_setting_get(jsps::kPageTgKey, b, sizeof b) && b[0] && !jsps::parse_targets(b, g_page_tg))   /* TODO-MAPPING (P1): the page's update targets */
+                NLOG("[online] %s='%s' not understood: the default Battle settings page targets stay\n", jsps::kPageTgKey, b);
+            NLOG("[online] Battle settings page targets %X %X %X %X\n", g_page_tg[0], g_page_tg[1], g_page_tg[2], g_page_tg[3]);
         }
     }
     if (!g_trace && !g_role && !g_discord_nav && !g_versus && !g_pick) return;
