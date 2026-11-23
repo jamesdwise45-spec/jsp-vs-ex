@@ -44,6 +44,7 @@ extern "C" unsigned long long jsp_net_presence_room(char* server, int sn) { if (
 #include "jsp_net_pick_flow.h"   // ENHANCEMENT (post-game / pick): the calls of jsp_net_native.cpp, inert here
 extern "C" int jsp_pick_pair(jspf::PairOut*) { return 0; }
 extern "C" int jsp_pick_active(void) { return 0; }
+extern "C" int jsp_pick_pressing(void) { return 0; }
 extern "C" int jsp_pick_enabled(void) { return 0; }
 extern "C" int jsp_pick_choose(int) { return 0; }
 extern "C" int jsp_pick_submit(unsigned, unsigned, int, int) { return 0; }
@@ -2650,6 +2651,13 @@ extern "C" int jsp_pick_pair(jspf::PairOut* out)
 }
 // 1 while a pair is active (versus_apply stays out of the teams then). A plain atomic read: versus_apply runs on every room / loading scene update.
 extern "C" int jsp_pick_active(void) { return g_pick_active.load(); }
+// FIX (pick8 in-game run s1a, test path only): the drive's press pick_pad adds to port 0 right now (0: none), for the AUTO_ONLINE autopilot's pad
+// filter, which pick_pad calls after its own decision (jspd::autopilot_pad). Any thread.
+extern "C" int jsp_pick_pressing(void)
+{
+    if (g.phase.load() == Phase::Running) return 0;   // pick_pad is inert while a match runs
+    return jspd::live_press(g_pk_capture.load() != 0, g_pk_block.load() != 0, (uint16_t)g_pk_press.load(), GetTickCount64() < g_pk_press_until.load());
+}
 // AUTO_ONLINE steps (test tooling): the prompt's choice (1 Fight again, 2 Select character, 3 Leave) and the pick (ids, 1 = together, 1 = lock). 1 = taken.
 extern "C" int jsp_pick_choose(int choice)
 {

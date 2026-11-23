@@ -74,11 +74,13 @@ extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*);
 #include "jsp_discord.h"
 #include "jsp_net_lobby.h"   // ENHANCEMENT (AUTO_ONLINE post-fight phase): jsp_net_lobby_phase for the over / run conditions
 #include "jsp_net_pick_flow.h"   // ENHANCEMENT (post-game / pick, JSP_ROLLBACK_PICK=1): the agreed pair's roster write (apply_pair)
+#include "jsp_net_pick_drive.h"  // FIX (pick8 run s1a): jspd::autopilot_pad, the after-match drive's press kept outside a match
 #include "jsp_net_pick_own.h"    // FIX (pick7): the fighter map the coming session will build (predict_map, the planned seats)
 extern "C" int jsp_setting_get(const char* key, char* out, int n);
 /* jsp_net_game.cpp (ENHANCEMENT, post-game / pick): the pair the coming build applies, whether one is active, the switch, and the AUTO_ONLINE steps */
 extern "C" int jsp_pick_pair(jspf::PairOut* out);
 extern "C" int jsp_pick_active(void);
+extern "C" int jsp_pick_pressing(void);   /* FIX (pick8 run s1a): the after-match drive's live press (0: none) */
 extern "C" int jsp_pick_enabled(void);
 extern "C" int jsp_pick_choose(int choice);
 extern "C" int jsp_pick_submit(unsigned fighter, unsigned support, int together, int lock);
@@ -701,7 +703,9 @@ void auto_pad(uint16_t* b, uint16_t* lx, uint16_t* ly)
         return;
     }
     if (g_rb_phase == JSP_LOBBY_RUNNING) return;   /* ENHANCEMENT (post-fight phase): a running rollback match owns the fight's input: pad untouched */
-    *b = now < g_press_until ? g_button : 0;
+    /* FIX (pick8 in-game run s1a): pick_pad (installed later, so it runs first and calls this filter) has OR-ed the after-match drive's press into
+     * *b; writing 0 here erased it (the host's start never reached the game). Keep that press; the player's own buttons stay out as before. */
+    *b = jspd::autopilot_pad(now < g_press_until, g_button, g_pick ? (uint16_t)jsp_pick_pressing() : 0);
     *lx = 128; *ly = 128;
 }
 

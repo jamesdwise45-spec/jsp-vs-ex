@@ -51,6 +51,44 @@ static void test_pad_gate()
     CHECK(o.buttons == kBtnCross);
 }
 
+// FIX (pick8 in-game run s1a): the AUTO_ONLINE autopilot's pad filter runs after pick_pad (pick_pad calls it) and used to write 0 outside a
+// match. live_press must be exactly what pad_gate added to a released pad, and the autopilot must keep it (its own scripted press wins). Then the
+// s1a hand-off: the host's start Cross every 2.5 s for 60 s through the chain pick_pad -> autopilot reaches the game; with the old autopilot none did.
+static void test_autopilot_pad()
+{
+    const uint16_t presses[] = { 0, kBtnCross, kBtnSquare, kBtnCircle, (uint16_t)(kBtnCross | kBtnUp) };
+    int n = 0;
+    for (int c = 0; c < 2; c++) for (int bl = 0; bl < 2; bl++) for (int live = 0; live < 2; live++) for (uint16_t pr : presses) {
+        uint16_t prev = 0;
+        const PadOut o = pad_gate(0, &prev, c, bl, pr, live);
+        const uint16_t lp = live_press(c, bl, pr, live);
+        CHECK(lp == o.buttons);                              // what pick_pad added to a released pad, nothing else
+        CHECK(autopilot_pad(false, 0, lp) == o.buttons);     // the autopilot between its own presses keeps it
+        CHECK(autopilot_pad(true, kBtnDown, lp) == kBtnDown); // its own scripted press wins while live
+        n++;
+    }
+    CHECK(n == 40);
+    // the s1a timeline: room page up, the host's start presses (120 ms live, one every 2500 ms), the game reads each 33 ms frame
+    int reach_new = 0, reach_old = 0; bool was_new = false, was_old = false; uint64_t press_until = 0;
+    for (uint64_t t = 0; t < 60000; t += 33) {
+        if (t % 2500 < 33) press_until = t + 150;
+        uint16_t prev = 0;
+        const bool live = t < press_until;
+        const uint16_t after_pick = pad_gate(0, &prev, false, false, kBtnCross, live).buttons;   // pick_pad's decision (the player's pad is idle)
+        const uint16_t game_new = autopilot_pad(false, 0, live_press(false, false, kBtnCross, live));
+        const uint16_t game_old = 0;   // the old autopilot: *b = scripted ? button : 0
+        CHECK(game_new == after_pick);
+        const bool dn = (game_new & kBtnCross) != 0, dold = (game_old & kBtnCross) != 0;
+        if (dn && !was_new) reach_new++;
+        if (dold && !was_old) reach_old++;
+        was_new = dn; was_old = dold;
+    }
+    CHECK(reach_new == 24);   // 60 s / 2.5 s: every start Cross reaches the game
+    CHECK(reach_old == 0);    // the stuck hand-off of run s1a
+    // the host's late-pick block still holds the start back through the autopilot
+    CHECK(autopilot_pad(false, 0, live_press(false, true, kBtnCross, true)) == 0);
+}
+
 // ---- 2. the notice-box Cross ----
 static BoxIn reached_hidden(uint64_t room_since)
 {
@@ -318,11 +356,12 @@ int main()
     test_ownership();
     test_ownership_mapper();
     test_pad_gate();
+    test_autopilot_pad();
     test_box_basic();
     test_box_gates();
     test_join_ready();
     test_map1();
     if (fails) { std::printf("net pick drive: %d check(s) FAILED\n", fails); return 1; }
-    std::printf("net pick drive: pad gate (capture, late-pick start block, injected presses), notice-box Cross (timing, cap, gates, loading), joiner's Ready, map1 timelines, ownership after the roster write (2000 rooms), ownership after Select character through the flow and the fighter map's planned seats (500 rooms + refusals) ok\n");
+    std::printf("net pick drive: pad gate (capture, late-pick start block, injected presses), the AUTO_ONLINE autopilot keeps the drive's press, notice-box Cross (timing, cap, gates, loading), joiner's Ready, map1 timelines, ownership after the roster write (2000 rooms), ownership after Select character through the flow and the fighter map's planned seats (500 rooms + refusals) ok\n");
     return 0;
 }
