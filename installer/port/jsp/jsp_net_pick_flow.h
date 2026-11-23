@@ -654,7 +654,7 @@ inline std::string fighter_text(uint16_t id)
 }
 inline std::string support_text(uint16_t id)
 {
-    if (id == jspk::kRandom) return "room's support";
+    if (id == jspk::kRandom) return "Room setting";   // the support the room already has
     const char* n = jnames::support_name(id);
     return n ? std::string(n) : "No. " + std::to_string((unsigned)id);
 }
@@ -674,7 +674,7 @@ template <class Width> std::string fit_text(const std::string& in, float max_w, 
     }
     return "...";
 }
-// One player's pick for everyone to see: "P2: Goku + Rukia, locked" ("P1 (you): Random + room's support, choosing").
+// One player's pick for everyone to see: "P2: Goku + Rukia, locked" ("P1 (you): Random + Room setting, choosing").
 inline std::string pick_line(int player, int me, const jspk::Pick& p, bool locked)
 {
     return "P" + std::to_string(player + 1) + (player == me ? " (you)" : "") + ": " + fighter_text(p.fighter) + " + " + support_text(p.support) +

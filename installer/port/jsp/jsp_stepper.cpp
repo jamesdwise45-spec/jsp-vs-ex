@@ -338,25 +338,28 @@ extern "C" void ps3_hle_thread_census(uint32_t* kind, uint32_t* id, uint32_t* ob
 namespace {
 std::mutex g_hz_mu;
 jph::Clock g_hz;
+// JSP_HITCH_DIAG=0: none of the notes below run (no QPC reads, no mutex, no census); the drain itself still runs (hz_drain).
+bool hz_on() { static const bool v = jph::diag_on_env(std::getenv("JSP_HITCH_DIAG")); return v; }
 bool g_hz_ready_seen = false; int g_hz_sampled_flip = 0;   // frame clock thread only: per flip (lockstep_take_flip clears them)
 long long g_hz_out = 0;                                    // frame clock thread only: QPC when the last lockstep pass gave the loop back to main.cpp
 double hz_ms(long long dq) { static LARGE_INTEGER f{}; if (!f.QuadPart) QueryPerformanceFrequency(&f); return (double)dq * 1000.0 / (double)f.QuadPart; }
 void hz_note_drain(long long dq)
 {
-    if (!g_lockstep.load(std::memory_order_relaxed)) return;
+    if (!hz_on() || !g_lockstep.load(std::memory_order_relaxed)) return;
     const double ms = hz_ms(dq);
     std::lock_guard<std::mutex> lk(g_hz_mu); if (ms > g_hz.drain_max_ms) g_hz.drain_max_ms = ms;
 }
 void hz_drain(int rsx_ok)   // the lockstep pass's FIFO drain, timed
 {
     if (!rsx_ok) return;
+    if (!hz_on()) { cellGcm_rsx_process_fifo(); return; }
     LARGE_INTEGER a, b; QueryPerformanceCounter(&a); cellGcm_rsx_process_fifo(); QueryPerformanceCounter(&b);
     hz_note_drain(b.QuadPart - a.QuadPart);
 }
 // The guest's flip became ready (first pass that sees it): how late against its deadline `next` (0 = no schedule yet).
 void hz_ready(long long now, long long next)
 {
-    if (g_hz_ready_seen || !next) return;
+    if (!hz_on() || g_hz_ready_seen || !next) return;
     g_hz_ready_seen = true;
     const double late = hz_ms(now - next);
     std::lock_guard<std::mutex> lk(g_hz_mu); if (late > g_hz.ready_late_ms) g_hz.ready_late_ms = late;
@@ -365,7 +368,7 @@ void hz_ready(long long now, long long next)
 // Only the first late flip of a gap is sampled (jph::Clock::kSamples censuses at most per gap).
 void hz_maybe_sample(long long now, long long next)
 {
-    if (g_hz_sampled_flip >= jph::Clock::kSamples || g_hz_ready_seen || !next) return;
+    if (!hz_on() || g_hz_sampled_flip >= jph::Clock::kSamples || g_hz_ready_seen || !next) return;
     const double late = hz_ms(now - next);
     if (late < jph::kLateMs * (1 + 2 * g_hz_sampled_flip)) return;
     const int slot = g_hz_sampled_flip++;
@@ -383,13 +386,14 @@ void hz_maybe_sample(long long now, long long next)
 void hz_take(long long now, long long deadline, bool restart)   // lockstep_take_flip
 {
     g_hz_ready_seen = false; g_hz_sampled_flip = 0;
+    if (!hz_on()) return;
     std::lock_guard<std::mutex> lk(g_hz_mu);
     g_hz.flips++; if (restart) g_hz.restarts++;
     if (deadline) { const double late = hz_ms(now - deadline); if (late > g_hz.take_late_ms) g_hz.take_late_ms = late; }
 }
 int hz_out(int r)   // a lockstep pass returns to main.cpp (present, drain, pump) when r == 2
 {
-    if (r == 2 && g_lockstep.load(std::memory_order_relaxed)) { LARGE_INTEGER t; QueryPerformanceCounter(&t); g_hz_out = t.QuadPart; }
+    if (r == 2 && hz_on() && g_lockstep.load(std::memory_order_relaxed)) { LARGE_INTEGER t; QueryPerformanceCounter(&t); g_hz_out = t.QuadPart; }
     return r;
 }
 void hz_in()   // a pass starts: the stretch main.cpp spent since the last one
@@ -400,9 +404,22 @@ void hz_in()   // a pass starts: the stretch main.cpp spent since the last one
     std::lock_guard<std::mutex> lk(g_hz_mu); if (ms > g_hz.outside_max_ms) g_hz.outside_max_ms = ms;
 }
 }  // namespace
+// The diagnostic's switch for the other files (main.cpp, jsp_net_game.cpp): 1 = on (JSP_HITCH_DIAG unset or not 0).
+extern "C" int jsp_hitch_diag_on(void) { return hz_on() ? 1 : 0; }
+// main.cpp, frame clock thread, after a lockstep pass's outer cadence: how long its present, FIFO drain and window pump took (ms). Only while the lockstep
+// clock runs; the maxima of the gap go into the line, so a "present-pump" stretch says which of the three it was.
+extern "C" void jsp_stepper_hitch_outer(double present_ms, double drain_ms, double pump_ms)
+{
+    if (!hz_on() || !g_lockstep.load(std::memory_order_relaxed)) return;
+    std::lock_guard<std::mutex> lk(g_hz_mu);
+    if (present_ms > g_hz.out_present_ms) g_hz.out_present_ms = present_ms;
+    if (drain_ms > g_hz.out_drain_ms) g_hz.out_drain_ms = drain_ms;
+    if (pump_ms > g_hz.out_pump_ms) g_hz.out_pump_ms = pump_ms;
+}
 // Main thread, at each presented frame (jsp_net_game.cpp): the frame clock's view of the gap that just ended; the next gap starts empty.
 extern "C" void jsp_stepper_hitch_take(jph::Clock* out)
 {
+    if (!hz_on()) { *out = jph::Clock(); return; }
     std::lock_guard<std::mutex> lk(g_hz_mu);
     *out = g_hz; g_hz = jph::Clock();
 }

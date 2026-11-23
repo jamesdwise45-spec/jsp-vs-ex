@@ -404,7 +404,7 @@ static void test_texts()
     // the longest picker row and pick line at the widest plausible glyph (22 px, the cap height at scale 1) stay readable when cut
     jspk::Pick p; p.fighter = 31; p.support = 206;
     CHECK(pick_line(1, 0, p, true) == "P2: Arale & Gatchan + Kagura & Sadaharu, locked");
-    CHECK(pick_line(0, 0, jspk::Pick(), false) == "P1 (you): Random + room's support, choosing");
+    CHECK(pick_line(0, 0, jspk::Pick(), false) == "P1 (you): Random + Room setting, choosing");
     const std::string cut = fit_text(pick_line(1, 0, p, true), 560, [](const std::string& s) { return 22.0f * 0.7f * (float)s.size(); });
     CHECK(cut.size() >= 20 && cut.compare(cut.size() - 3, 3, "...") == 0);
 }

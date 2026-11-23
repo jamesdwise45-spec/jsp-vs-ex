@@ -271,7 +271,7 @@ public:
         case PICKING: return locked_count() == n_ - 1 ? (n_ == 2 ? "Opponent is ready" : "Everyone else is ready") : "Choose your fighter";
         case LOCKED: return n_ == 2 ? "Waiting for opponent..." : "Waiting for the other players...";
         case READY: return "Everyone is ready";
-        case LOST: return reason_ == R_PEER_TIMEOUT ? "A player did not pick: back to the lobby" : "Connection lost: back to the lobby";
+        case LOST: return reason_ == R_PEER_TIMEOUT ? "A player did not pick: back to the lobby" : "The other player left or the connection was lost: back to the lobby";
         default: return "";
         }
     }

@@ -187,9 +187,10 @@ public:
         v.mine = mine_; v.peer = peer_; v.locked = locked(); v.outcome = outcome_; v.reason = reason_;
         v.sel = (locked() || outcome_ != PENDING) && mine_ != NONE ? (int)mine_ - 1 : (sel < 0 ? 0 : sel >= kRows ? kRows - 1 : sel);
         if (outcome_ != PENDING) { v.status = outcome_text(outcome_, reason_); return v; }
-        if (peer_ == REMATCH) v.peer_line = "Opponent wants a rematch";
-        else if (peer_ == CHARSELECT) v.peer_line = "Opponent wants to change characters";
-        v.status = mine_ != NONE ? "Waiting for opponent..." : peer_ != NONE ? "Choose: your opponent has picked" : "Choose what to do next";
+        // the rows' own words (the game's end-of-fight menu: PAU_011, PAU_009)
+        if (peer_ == REMATCH) v.peer_line = "Opponent chose Fight again";
+        else if (peer_ == CHARSELECT) v.peer_line = "Opponent chose Re-select character(s)";
+        v.status = mine_ != NONE ? "Waiting for opponent..." : peer_ != NONE ? "Your opponent has chosen" : "Choose what to do next";
         if (!locked()) {
             const uint64_t el = now - t0_;
             const uint64_t left = el >= cfg_.idle_ms ? 0 : cfg_.idle_ms - el;
@@ -205,7 +206,8 @@ public:
         if (o == O_REMATCH) return "Rematch: same characters and stage";
         if (o == O_CHARSELECT) return "Back to character select";
         if (o != O_LEAVE) return "";
-        return r == R_PEER_LEFT ? "Opponent left" : r == R_LINK_LOST ? "Connection lost: back to the lobby"
+        // R_LINK_LOST: also what a peer sees when the other side left on purpose and closed the link before its LEAVE arrived
+        return r == R_PEER_LEFT ? "Opponent left" : r == R_LINK_LOST ? "The other player left or the connection was lost: back to the lobby"
              : r == R_IDLE ? "No choice in time: back to the lobby" : "Back to the lobby";
     }
 

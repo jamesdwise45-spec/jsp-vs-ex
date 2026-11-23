@@ -26,6 +26,9 @@ inline constexpr double kHitchMs = 50.0;       // the same threshold as jpperf::
 inline constexpr uint32_t kMaxLines = 60;      // lines per match; later hitches are only counted
 inline constexpr double kGuestNominalMs = 22.0;   // guest time of an ordinary tick (33.3 ms minus a ~11 ms boundary): only the excess competes as a cause
 inline constexpr double kLateMs = 8.0;         // a flip this late (ready after its deadline) counts as a late guest; also when the clock samples the main thread
+// JSP_HITCH_DIAG=0 turns every part of the per-hitch diagnostic off (the frame clock's notes and samples, its mutex, the main thread's stage timing,
+// the lines, the snapshot gate split); default on. One read per process (the environment is set before the game starts).
+inline bool diag_on_env(const char* v) { return !(v && v[0] == '0'); }
 inline constexpr double kRenderMs = 20.0;      // a FIFO drain or present/pump stretch this long counts as the frame clock's own delay
 
 enum Part { Session, Snapshot, Hold, Audio, Files, Server, Other, Guest, Replay, kParts };   // Snapshot is inside Session (the caller files the hold loop's
@@ -37,6 +40,9 @@ struct Clock {
     double take_late_ms = -1e9;    // the latest a flip was taken after its deadline
     double drain_max_ms = 0;       // longest single cellGcm_rsx_process_fifo call in the lockstep clock
     double outside_max_ms = 0;     // longest stretch between two lockstep passes (main.cpp: present, drain, window pump)
+    // main.cpp's outer cadence, timed part by part (jsp_stepper_hitch_outer): the longest present (both present calls of a pass), FIFO drain and window pump.
+    // In a lockstep match the outer drain does nearly all of the FIFO work (the pass's own drain finds it empty: test7 lines say "drain max 0.0").
+    double out_present_ms = 0, out_drain_ms = 0, out_pump_ms = 0;
     uint32_t flips = 0, restarts = 0;
     // Where the main thread was while the first late flip of the gap was not ready: sampled at kLateMs and at 3 x kLateMs past its deadline.
     // stage: g_jsp_main_stage (0 guest code, 1.. boundary stages). tid: the main guest thread's id, 0 = unknown (no id yet, or not alive in the census): then
@@ -81,7 +87,10 @@ inline int cause(const Gap& g, const Clock& c)
     for (int i = 1; i < (int)(sizeof v / sizeof v[0]); i++) if (v[i].ms > v[best].ms) best = i;
     if (v[best].ms <= 0) return CNone;
     if (v[best].c != CGuest) return v[best].c;
-    if (c.drain_max_ms >= kRenderMs || c.outside_max_ms >= kRenderMs) return c.drain_max_ms >= c.outside_max_ms ? CDrain : CPresent;
+    if (c.drain_max_ms >= kRenderMs || c.outside_max_ms >= kRenderMs) {   // the outer stretch's own split decides when it is the bigger one
+        if (c.drain_max_ms >= c.outside_max_ms) return CDrain;
+        return c.out_drain_ms > c.out_present_ms && c.out_drain_ms > c.out_pump_ms ? CDrain : CPresent;
+    }
     if (c.ready_late_ms >= kLateMs) return CGuestLate;
     return CGuest;
 }
@@ -139,7 +148,8 @@ inline std::string close_gap(Match& m, double gap_ms, uint32_t tick, const Clock
                 gap_ms - bnd - g.part[Guest] - g.part[Replay]);
             if (c.ready_late_ms > -1e8) put(" | clock: flip ready %+.1f ms", c.ready_late_ms); else put("%s", " | clock: no flip ready");
             if (c.take_late_ms > -1e8) put(", taken %+.1f ms", c.take_late_ms); else put("%s", ", not taken");
-            put(", drain max %.1f ms, present/pump max %.1f ms, %u flips, %u restarts", c.drain_max_ms, c.outside_max_ms, c.flips, c.restarts);
+            put(", drain max %.1f ms, present/pump max %.1f ms (present %.1f, drain %.1f, pump %.1f), %u flips, %u restarts", c.drain_max_ms, c.outside_max_ms,
+                c.out_present_ms, c.out_drain_ms, c.out_pump_ms, c.flips, c.restarts);
             for (int i = 0; i < c.samples && i < Clock::kSamples; i++) {
                 const Clock::Sample& x = c.s[i];
                 put("%s at %+.0f ms main was in %s", i ? "," : ";", x.late_ms, stage_name(x.stage));

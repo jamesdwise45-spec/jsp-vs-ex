@@ -160,8 +160,8 @@ static bool inside(const jpskin::Frame& f) { return f.x >= 0 && f.y >= 0 && f.x 
 static size_t opaque(const jpskin::Frame& f) { size_t n = 0; for (size_t i = 3; i < f.pic.size(); i += 4) n += f.pic[i] > 0; return n; }
 static jpskin::View prompt_view()
 {
-    jpskin::View v; v.kind = jpskin::MENU; v.title = "Match over"; v.rows = { { "Fight again", "" }, { "Select character", "" } }; v.sel = 1;
-    v.lines = { { "Choose what to do next", jpskin::WHITE }, { "Opponent wants a rematch", jpskin::GREY }, { "Returning to lobby in 12 s", jpskin::AMBER } };
+    jpskin::View v; v.kind = jpskin::MENU; v.title = "Match Over"; v.rows = { { "Fight again", "" }, { "Select character", "" } }; v.sel = 1;
+    v.lines = { { "Choose what to do next", jpskin::WHITE }, { "Opponent chose Fight again", jpskin::GREY }, { "Returning to lobby in 12 s", jpskin::AMBER } };
     v.guide = { { jpart::PG_CROSS, -1, "Confirm" }, { jpart::PG_CIRCLE, -1, "Leave" } };
     return v;
 }
@@ -173,10 +173,10 @@ static void test_fallback()
         const jpskin::Frame f = jpskin::menu(P, v, open, 1.0f);
         CHECK(inside(f) && f.pw >= jpskin::kMenuW);
         CHECK(open == 0.0f ? opaque(f) == 0 : opaque(f) > size_t(f.pw) * size_t(f.ph) / 2);
-        CHECK(!f.text.empty() && f.text[0].s == "Match over");   // the header in the overlay font, then the body texts (no game font)
+        CHECK(!f.text.empty() && f.text[0].s == "Match Over");   // the header in the overlay font, then the body texts (no game font)
         size_t n = 0; for (const auto& t : f.text) n += t.s == "Fight again"; CHECK(n == 1);   // the guide is its own bar now
     }
-    jpskin::View p; p.kind = jpskin::MENU; p.title = "Select character"; p.sel = 0;
+    jpskin::View p; p.kind = jpskin::MENU; p.title = "Character Select"; p.sel = 0; p.room = true;
     p.rows = { { "Battle Character", "Naruto Uzumaki" }, { "Support Character", "Random" }, { "Teams", "versus, each with a COM" } };
     for (int i = 0; i < 6; i++) p.lines.push_back({ "line", jpskin::WHITE });
     const jpskin::Frame fp = jpskin::menu(P, p, 1.0f, 0.3f);
@@ -192,6 +192,21 @@ static void test_fallback()
     const jpskin::Frame fg = jpskin::guide_bar(P, v.guide);   // the guide bar at the game's place, above nothing else of ours
     CHECK(inside(fg) && opaque(fg) > 0 && fg.y >= fb.y + fb.ph);
     for (const jpskin::Frame& m : { jpskin::menu(P, v, 1.0f, 1.0f), fp, fd }) CHECK(m.y + m.ph <= fg.y);   // panels end above the guide bar
+    // over the fight: the guide is compact and low (under the subtitles, left of the ping counter), the band above the subtitles;
+    // in the room: the band top left under the room's header
+    const jpskin::Frame gf = jpskin::guide_bar(P, v.guide, false), bf = jpskin::band(P, nullptr, "x", false), br = jpskin::band(P, nullptr, "x", true);
+    CHECK(inside(gf) && gf.y == jpskin::kFightGuideY && gf.y >= 640 && gf.pw < 600 && gf.x + gf.pw < 1100);
+    CHECK(bf.y + bf.ph <= 584 && br.y < 200);
+    // fixed tops: a panel grows downward, and the locked picker (no rows) keeps the picker's width and place
+    jpskin::View v2 = v; v2.lines.pop_back();
+    CHECK(jpskin::menu(P, v2, 1.0f, 1.0f).y == jpskin::menu(P, v, 1.0f, 1.0f).y);
+    jpskin::View lk; lk.kind = jpskin::MENU; lk.title = "Character Select"; lk.room = true; lk.lines = { { "x", jpskin::WHITE } };
+    const jpskin::Frame fk = jpskin::menu(P, lk, 1.0f, 1.0f);
+    CHECK(fk.x == fp.x && fk.y == fp.y && fk.pw == fp.pw);
+    // chosen: the other row dims (a DIM body text in the overlay fallback = half alpha)
+    jpskin::View ch = v; ch.chosen = true; ch.sel = 0;
+    const jpskin::Frame fc = jpskin::menu(P, ch, 1.0f, 1.0f);
+    for (const auto& t : fc.text) if (t.s == "Select character") CHECK((t.rgba >> 24) < 200);
     CHECK(v.key() != p.key() && v.key() == prompt_view().key());
 }
 
@@ -281,18 +296,25 @@ static int desk(const char* data, const char* dir, const char* bgp, const char* 
     { const auto t0 = std::chrono::steady_clock::now(); for (int i = 0; i < 10; i++) (void)jpskin::menu(P, v, 1.0f, 1.0f);
       std::printf("[pickui] menu paint: %.2f ms\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / 10); }
     const std::string d0 = std::string(dir) + "/";
-    preview(d0 + "prompt.ppm", { jpskin::menu(P, v, 1.0f, 1.0f), jpskin::guide_bar(P, v.guide) }, bg, bw, bh);
+    v.title = "Match Over";
+    preview(d0 + "prompt.ppm", { jpskin::menu(P, v, 1.0f, 1.0f), jpskin::guide_bar(P, v.guide, false) }, bg, bw, bh);
+    { jpskin::View c2 = v; c2.sel = 0; c2.chosen = true; c2.lines = { { "Waiting for opponent...", jpskin::WHITE } };
+      c2.guide = { { jpart::PG_CIRCLE, -1, art.word("BUT_017", "Leave") } };
+      preview(d0 + "prompt_chosen.ppm", { jpskin::menu(P, c2, 1.0f, 1.0f), jpskin::guide_bar(P, c2.guide, false) }, bg, bw, bh); }
     v.sel = 0;
-    { jpskin::Frame half = jpskin::menu(P, v, 1.0f, 1.0f), gb = jpskin::guide_bar(P, v.guide);   // the fade at 50 % as the glue blits it (alpha scaled, 6 px lift)
+    { jpskin::Frame half = jpskin::menu(P, v, 1.0f, 1.0f), gb = jpskin::guide_bar(P, v.guide, false);   // the fade at 50 % as the glue blits it (alpha scaled, 6 px lift)
       for (jpskin::Frame* f : { &half, &gb }) { for (size_t i = 3; i < f->pic.size(); i += 4) f->pic[i] = uint8_t(f->pic[i] / 2); for (auto& t : f->text) t.rgba = (t.rgba & 0xFFFFFFu) | (t.rgba >> 25) << 24; }
       half.y += 6; preview(d0 + "prompt_sel0_open50.ppm", { half, gb }, bg, bw, bh); }
-    jpskin::View p; p.kind = jpskin::MENU; p.title = "Select character"; p.sel = 1;
-    p.rows = { { "Battle Character", "Gintoki Sakata" }, { "Support Character", "Random" }, { "Teams", "P1 + COM vs P2 + COM" } };
-    p.lines = { { "Pick your character", jpskin::WHITE }, { "P1 (you): Gintoki Sakata + Random, choosing", jpskin::GREY }, { "P2: Random + Random, choosing", jpskin::GREY }, { "Your pick locks in 21 s", jpskin::AMBER } };
+    jpskin::View p; p.kind = jpskin::MENU; p.title = "Character Select"; p.sel = 1; p.room = true;
+    p.rows = { { "Battle Character", "Gintoki Sakata" }, { "Support Character", "Room setting" }, { "Teams", "P1 + COM vs P2 + COM" } };
+    p.lines = { { "Pick your character", jpskin::WHITE }, { "P1 (you): Gintoki Sakata + Room setting, choosing", jpskin::GREY }, { "P2: Random + Room setting, choosing", jpskin::GREY }, { "Your pick locks in 21 s", jpskin::AMBER } };
     p.guide = { { jpart::PG_LEFT, jpart::PG_RIGHT, "Change" }, { jpart::PG_CROSS, -1, "Ready" } };
     preview(d0 + "picker.ppm", { jpskin::menu(P, p, 1.0f, 1.0f), jpskin::guide_bar(P, p.guide) }, bg, bw, bh);
+    { jpskin::View l = p; l.rows.clear(); l.sel = -1; l.guide.clear(); l.lines = { { "Everyone is ready", jpskin::WHITE }, { "P1 (you): Gintoki Sakata + Room setting, locked", jpskin::GREY }, { "P2: Random + Room setting, locked", jpskin::GREY } };
+      preview(d0 + "picker_locked.ppm", { jpskin::menu(P, l, 1.0f, 1.0f) }, bg, bw, bh);
+      preview(d0 + "band_room.ppm", { jpskin::band(P, &art, "Starting the next fight...", true) }, bg, bw, bh); }
     jpskin::View d; d.kind = jpskin::DIALOG; d.title = "Leave the match?"; d.rows = { { art.word("BUT_017", "Leave"), "" } };
-    d.lines = { { "Rollback ends for you.", jpskin::GREY }, { "Then leave the room with Circle.", jpskin::GREY } };
+    d.lines = { { "You will return to the room.", jpskin::GREY }, { "Press Circle there to go back to the lobby.", jpskin::GREY } };
     d.guide = { { jpart::PG_CROSS, -1, art.word("BUT_017", "Leave") }, { jpart::PG_CIRCLE, -1, art.word("BUT_013", "Back") } };
     preview(d0 + "leave.ppm", { jpskin::dialog(P, &art, d, 1.0f), jpskin::guide_bar(P, d.guide) }, bg, bw, bh);
     preview(d0 + "band.ppm", { jpskin::band(P, &art, art.word("PAU_011", "Fight again") + ": back to the room...") }, bg, bw, bh);
@@ -302,9 +324,9 @@ static int desk(const char* data, const char* dir, const char* bgp, const char* 
       r.rows = { { art.word("PAU_011", "Fight again"), "" }, { art.word("PAU_009", "Re-select character(s)"), "" }, { "View replay", "" }, { "Save Replay", "" }, { "Return to main menu", "" } };
       jpskin::Frame f = jpskin::menu(P, r, 1.0f, 1.0f), plate;
       if (art.title_plate.ok()) { plate.x = f.x + 20; plate.y = f.y + 9;   /* where our header sits */ plate.pw = art.title_plate.w; plate.ph = art.title_plate.h; plate.pic = art.title_plate.px; }
-      preview(d0 + "game_endmenu_recon.ppm", { f, plate, jpskin::guide_bar(P, v.guide) }, bg, bw, bh); }
+      preview(d0 + "game_endmenu_recon.ppm", { f, plate, jpskin::guide_bar(P, v.guide, false) }, bg, bw, bh); }
     const jpskin::Painter F(nullptr, [](const std::string& t, float sc) { return g_jmf_ok ? g_jmf.width(t, sc) : 0.0f; });
-    preview(d0 + "fallback_prompt.ppm", { jpskin::menu(F, prompt_view(), 1.0f, 1.0f), jpskin::guide_bar(F, prompt_view().guide) }, bg, bw, bh);
+    preview(d0 + "fallback_prompt.ppm", { jpskin::menu(F, prompt_view(), 1.0f, 1.0f), jpskin::guide_bar(F, prompt_view().guide, false) }, bg, bw, bh);
     preview(d0 + "fallback_band.ppm", { jpskin::band(F, nullptr, "Fight again: back to the room...") }, bg, bw, bh);
     return art.any() ? 0 : 1;
 }

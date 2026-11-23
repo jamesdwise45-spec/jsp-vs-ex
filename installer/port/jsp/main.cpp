@@ -211,6 +211,9 @@ static void present_guest_frame(void)
     InterlockedIncrement(&g_frames_presented);
 }
 
+extern "C" void jsp_stepper_hitch_outer(double present_ms, double drain_ms, double pump_ms);   /* jsp_stepper.cpp: DIAGNOSTIC (per-hitch line) */
+extern "C" int jsp_hitch_diag_on(void);                                                         /* jsp_stepper.cpp: JSP_HITCH_DIAG, default 1 */
+static double hz_qms(void) { LARGE_INTEGER f, c; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&c); return (double)c.QuadPart * 1000.0 / (double)f.QuadPart; }
 extern "C" int jsp_rollback_clock_turbo(int rsx_ok);   /* jsp_stepper.cpp (experimental rollback netcode, JSP_ROLLBACK=1 only): a rollback replay runs without the 60 Hz grid and presents nothing; 1 = this pass was handled */
 static DWORD WINAPI frame_clock(LPVOID)
 {
@@ -239,10 +242,12 @@ static DWORD WINAPI frame_clock(LPVOID)
     if (vqpc) fprintf(stderr, "[rsx] VBLANK_QPC: vblank tick from QPC, %.4f ms\n", q_period);
 
     int turbo_left = 0, turbo_reset = 0;
+    int hz_lockstep = 0;   /* DIAGNOSTIC (per-hitch line): this pass came from the lockstep clock, so its outer cadence is timed part by part */
     for (;;) {
+        hz_lockstep = 0;
         { const int tr = jsp_rollback_clock_turbo(rsx_ok);
           if (tr == 1) { turbo_left = 1; continue; }
-          if (tr == 2) { turbo_left = 1; goto outer_cadence; } }   /* the lockstep clock of a rollback match: present / drain / pump below */
+          if (tr == 2) { turbo_left = 1; hz_lockstep = jsp_hitch_diag_on(); goto outer_cadence; } }   /* the lockstep clock of a rollback match: present / drain / pump below */
         if (turbo_left) {   /* leaving a replay: restart both clocks from now, or the grid fires its missed ticks in a burst */
             turbo_left = 0;
             QueryPerformanceCounter(&qn);
@@ -381,13 +386,18 @@ outer_cadence:
          * those at 16 ms apiece paces the guest into single-figure frame rates.
          * The real RSX writes them in microseconds. */
         if (rsx_ok) {
+            const double hz0 = hz_lockstep ? hz_qms() : 0.0;
             if (cellGcm_take_flip_pending()) {
                 present_guest_frame();
                 last_flip = cellGcm_flip_request_count();
             }
+            const double hz1 = hz_lockstep ? hz_qms() : 0.0;
             cellGcm_rsx_process_fifo();
+            const double hz2 = hz_lockstep ? hz_qms() : 0.0;
 
-            if (rsx_backend_pump() != 0) {
+            const int hz_pumped = rsx_backend_pump();
+            const double hz3 = hz_lockstep ? hz_qms() : 0.0;
+            if (hz_pumped != 0) {
                 rsx_ok = 0;              /* window closed */
                 /* ...so quit, as the console's Quit Game does, instead of
                  * leaving the game running with no window. */
@@ -404,6 +414,7 @@ outer_cadence:
             } else if (fc == 0) {
                 rsx_backend_present();
             }
+            if (hz_lockstep) { const double hz4 = hz_qms(); jsp_stepper_hitch_outer((hz1 - hz0) + (hz4 - hz3), hz2 - hz1, hz3 - hz2); }
         }
     }
     return 0;
