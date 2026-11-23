@@ -52,7 +52,7 @@ static void test_pad_gate()
     // capture wins over block
     o = pad_gate(kBtnCircle, &prev, true, true, 0, false);
     CHECK(o.buttons == 0 && o.centre && o.edges == kBtnCircle);
-    // late-pick block (the host's start): the player's own Cross is swallowed, other buttons pass, and NO injected press goes through
+    // late-pick block (the host's start): the player's own Cross is swallowed, other buttons pass, and NO injected Cross goes through
     prev = 0;
     o = pad_gate(kBtnCross | kBtnSquare, &prev, false, true, kBtnCross, true);
     CHECK(o.buttons == kBtnSquare && !o.centre && o.edges == (kBtnCross | kBtnSquare));
@@ -60,6 +60,15 @@ static void test_pad_gate()
     CHECK(o.buttons == 0);
     o = pad_gate(kBtnCircle, &prev, false, true, kBtnCross, true);
     CHECK(o.buttons == kBtnCircle);   // Leave stays possible in the room (Circle) while the start is blocked
+    // test8 mapping run: the page step's injected Square goes through the block (the host's Battle settings page must open); a Cross in it does not
+    o = pad_gate(0, &prev, false, true, kBtnSquare, true);
+    CHECK(o.buttons == kBtnSquare);
+    o = pad_gate(0, &prev, false, true, kBtnSquare, false);
+    CHECK(o.buttons == 0);
+    o = pad_gate(0, &prev, false, true, (uint16_t)(kBtnSquare | kBtnCross), true);
+    CHECK(o.buttons == 0);
+    o = pad_gate(kBtnCross, &prev, false, true, kBtnSquare, true);
+    CHECK(o.buttons == kBtnSquare);
     // block lifted: the injected Cross reaches the game again
     o = pad_gate(0, &prev, false, false, kBtnCross, true);
     CHECK(o.buttons == kBtnCross);
@@ -101,6 +110,14 @@ static void test_autopilot_pad()
     CHECK(reach_old == 0);    // the stuck hand-off of run s1a
     // the host's late-pick block still holds the start back through the autopilot
     CHECK(autopilot_pad(false, 0, live_press(false, true, kBtnCross, true)) == 0);
+    // ... and the host's page Square reaches the game through the autopilot under the block (test8 mapping run: it never did)
+    CHECK(autopilot_pad(false, 0, live_press(false, true, kBtnSquare, true)) == kBtnSquare);
+    // live_press is what pad_gate adds to a released pad, under every gate
+    for (int cap = 0; cap < 2; cap++) for (int blk = 0; blk < 2; blk++) for (int lv = 0; lv < 2; lv++)
+        for (uint16_t pr : { (uint16_t)0, kBtnCross, kBtnSquare, (uint16_t)(kBtnCross | kBtnSquare) }) {
+            uint16_t pv = 0;
+            CHECK(pad_gate(0, &pv, cap, blk, pr, lv).buttons == live_press(cap, blk, pr, lv));
+        }
 }
 
 // ---- 2. the notice-box Cross ----
@@ -135,6 +152,25 @@ static void test_box_basic()
     in.room_now = false; n = 0;
     for (uint64_t t = 41000; t < 60000; t += 50) if (b.step(in, t, press_t, &back) == BoxCross::PRESS) { press_t = t; n++; }
     CHECK(n == BoxCross::kMax);
+}
+// review N1: by hand after the to-room timeout with no room page ever seen: no Cross; by hand after the start timed out (room seen): Crosses
+static void test_box_by_hand()
+{
+    CHECK(jspd::box_reached(true, false, false) && jspd::box_reached(true, false, true));
+    CHECK(!jspd::box_reached(false, true, false) && jspd::box_reached(false, true, true));
+    CHECK(!jspd::box_reached(false, false, true));
+    int back = 0;
+    {
+        BoxCross b; BoxIn in = reached_hidden(0); in.reached = jspd::box_reached(false, true, false);
+        for (uint64_t t = 1000; t < 60000; t += 50) CHECK(b.step(in, t, 0, &back) == BoxCross::NONE);
+        CHECK(b.away_n == 0);
+    }
+    {
+        BoxCross b; BoxIn in = reached_hidden(0); in.reached = jspd::box_reached(false, true, true);
+        int n = 0; uint64_t press_t = 0;
+        for (uint64_t t = 1000; t < 60000; t += 50) if (b.step(in, t, press_t, &back) == BoxCross::PRESS) { press_t = t; n++; }
+        CHECK(n == BoxCross::kMax);
+    }
 }
 static void test_box_gates()
 {
@@ -373,9 +409,10 @@ int main()
     test_autopilot_pad();
     test_box_basic();
     test_box_gates();
+    test_box_by_hand();
     test_join_ready();
     test_map1();
     if (fails) { std::printf("net pick drive: %d check(s) FAILED\n", fails); return 1; }
-    std::printf("net pick drive: pad gate (capture, late-pick start block, injected presses), the AUTO_ONLINE autopilot keeps the drive's press, notice-box Cross (timing, cap, gates, loading), joiner's Ready, map1 timelines, ownership after the roster write (2000 rooms), ownership after Select character through the flow and the fighter map's planned seats (500 rooms + refusals) ok\n");
+    std::printf("net pick drive: pad gate (capture, late-pick start block, injected presses), the AUTO_ONLINE autopilot keeps the drive's press, notice-box Cross (timing, cap, gates, loading, by hand only after the room was seen), joiner's Ready, map1 timelines, ownership after the roster write (2000 rooms), ownership after Select character through the flow and the fighter map's planned seats (500 rooms + refusals) ok\n");
     return 0;
 }

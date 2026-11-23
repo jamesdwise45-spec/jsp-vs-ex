@@ -217,6 +217,8 @@ __pycache__/
 !/installer/tools/net_pick_drive_test.sh
 !/installer/tools/net_pick_match_test.cpp
 !/installer/tools/net_pick_match_test.sh
+!/installer/tools/net_pick_page_test.cpp
+!/installer/tools/net_pick_page_test.sh
 !/installer/tools/pick_art_test.cpp
 !/installer/tools/pick_art_test.sh
 !/installer/tools/net_report_test.cpp

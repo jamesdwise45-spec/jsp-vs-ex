@@ -32,6 +32,10 @@ inline uint16_t stick_dirs(uint16_t lx, uint16_t ly)
     if (lx < 64) d |= kBtnLeft; else if (lx > 192) d |= kBtnRight;
     return d;
 }
+// FIX (test8 mapping run, JSP_PICK_NATIVE_SELECT=1): the block holds back the host's start, which is a Cross. The page step's Square for the
+// Battle settings page is injected while the block is on (a pick round runs, so the host's start is not safe yet); the block dropped it and the
+// host's page never opened (two Squares, then the port picker). Under the block an injected press without Cross still goes through.
+inline uint16_t blocked_press(uint16_t press, bool press_live) { return press_live && !(press & kBtnCross) ? press : 0; }
 inline PadOut pad_gate(uint16_t raw, uint16_t* prev, bool capture, bool block, uint16_t press, bool press_live, uint16_t dirs = 0)
 {
     PadOut o;
@@ -40,7 +44,7 @@ inline PadOut pad_gate(uint16_t raw, uint16_t* prev, bool capture, bool block, u
     *prev = seen;
     o.buttons = raw;
     if (capture) { o.buttons = 0; o.centre = true; }
-    else if (block) o.buttons = (uint16_t)(raw & ~kBtnCross);
+    else if (block) o.buttons = (uint16_t)((raw | blocked_press(press, press_live)) & ~kBtnCross);
     else if (press_live) o.buttons = (uint16_t)(raw | press);
     return o;
 }
@@ -50,14 +54,17 @@ inline PadOut pad_gate(uint16_t raw, uint16_t* prev, bool capture, bool block, u
 // scripted press passed), which erased every press the after-match drive had just OR-ed in (the to-room Cross, the host's start Cross, the
 // notice-box Cross, the joiner's Ready). In run s1a the host's start never reached the game and the drive went "by hand" after 60 s. On a player's
 // PC there is no autopilot; nothing changes there.
-// live_press: the drive's press that pad_gate adds to a released pad right now (none while capture or block, or when not live).
+// live_press: the drive's press that pad_gate adds to a released pad right now (none while capture or not live; under block, none with Cross).
 // autopilot_pad: the autopilot's buttons outside a match: its own scripted press while live, else the drive's live press, else nothing.
-inline uint16_t live_press(bool capture, bool block, uint16_t press, bool press_live) { return capture || block || !press_live ? 0 : press; }
+inline uint16_t live_press(bool capture, bool block, uint16_t press, bool press_live) { return capture || !press_live ? 0 : block ? blocked_press(press, true) : press; }
 inline uint16_t autopilot_pad(bool scripted_live, uint16_t scripted, uint16_t pick_live) { return scripted_live ? scripted : pick_live; }
 
 // The notice-box Cross. One per post-game drive; step() once per main-thread frame.
+// box_reached: BoxIn::reached from the drive. In the room or starting: yes. By hand: only when the room page was seen in this round (the start
+// timed out); after the 45 s to-room timeout with no room page ever seen, no notice-box Crosses go to whatever screen is up.
+inline bool box_reached(bool in_room_or_starting, bool by_hand, bool room_seen) { return in_room_or_starting || (by_hand && room_seen); }
 struct BoxIn {
-    bool reached = false;          // the drive reached the room (in the room, starting, or by hand)
+    bool reached = false;          // the drive reached the room (in the room, starting, or by hand after the room was seen): box_reached
     bool room_now = false;         // a room page update target ran in the last 500 ms and no fight HUD for 1.5 s
     bool fight_now = false;        // a fight HUD is drawn
     bool capture = false;          // the prompt / picker holds the pad
