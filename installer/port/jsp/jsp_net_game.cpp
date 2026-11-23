@@ -333,8 +333,8 @@ struct State {
     jpskin::View pk;
     std::string pk_key;
     uint64_t pk_open_ms = 0;
-    std::string pk_pic_key, pk_band_key;
-    jpskin::Frame pk_pic, pk_band_pic;
+    std::string pk_pic_key, pk_band_key, pk_guide_key;
+    jpskin::Frame pk_pic, pk_band_pic, pk_guide_pic;
 } g;
 // FIX (a missed KO): the KO / time-up winner of EVERY saved tick (commit and hash_only, predicted or not), keyed by tick; a re-save after a
 // rollback overwrites its entry and a rollback drops the entries after its target. The boundary ends the match on the earliest recorded winner whose tick is
@@ -442,14 +442,25 @@ void pk_prepare(const jpskin::View& k)
         const std::string key = tag + k.key();
         if (key != g.pk_pic_key) { g.pk_pic_key = key; g.pk_pic = k.kind == jpskin::DIALOG ? jpskin::dialog(P, art, k, 1.0f) : jpskin::menu(P, k, 1.0f, 1.0f); }
     }
+    if (!k.guide.empty()) {   // the guide bar where the game's menus have theirs (the foot of the screen)
+        std::string key = tag;
+        for (const jpskin::Guide& q : k.guide) key += std::to_string(q.glyph) + ',' + std::to_string(q.glyph2) + q.s + '\x1f';
+        if (key != g.pk_guide_key) { g.pk_guide_key = key; g.pk_guide_pic = jpskin::guide_bar(P, k.guide); }
+    }
     if (!k.band.empty()) {
         const std::string key = tag + k.band;
-        if (key != g.pk_band_key) { g.pk_band_key = key; g.pk_band_pic = jpskin::band(P, k.band); }
+        if (key != g.pk_band_key) { g.pk_band_key = key; g.pk_band_pic = jpskin::band(P, art, k.band); }
     }
+}
+// The game's own string `id` (its message tables: PAU_011 "Fight again", BUT_000 "Confirm", ...) once the art is read, else `dflt`.
+std::string pk_word(const char* id, const char* dflt)
+{
+    const jpart::Art* a = g_pk_art.load(std::memory_order_acquire);
+    return a ? a->word(id, dflt) : std::string(dflt);
 }
 void pk_draw(const jpskin::View& k)
 {
-    if (k.kind != jpskin::NONE) { const float open = pk_open_t(); pk_blit(g.pk_pic, open, (int)((1.0f - open) * 12.0f)); }
+    if (k.kind != jpskin::NONE) { const float open = pk_open_t(); pk_blit(g.pk_pic, open, (int)((1.0f - open) * 12.0f)); if (!k.guide.empty()) pk_blit(g.pk_guide_pic, open, 0); }
     if (!k.band.empty()) pk_blit(g.pk_band_pic, 1.0f, 0);
 }
 
@@ -2523,35 +2534,38 @@ void pick_frame()
     using jpskin::Guide; using jpskin::Line;
     if (u.drive == PkDrive::Prompt) {
         if (u.leave_ask && !v.locked && v.outcome == jspg::PENDING) {
-            pn.kind = jpskin::DIALOG; pn.title = "Leave the match?"; pn.rows = { { "Leave", "" } }; pn.sel = 0;
+            pn.kind = jpskin::DIALOG; pn.title = "Leave the match?"; pn.rows = { { pk_word("BUT_017", "Leave"), "" } }; pn.sel = 0;
             pn.lines = { Line{ "Rollback ends for you.", jpskin::GREY }, Line{ "Then leave the room with Circle.", jpskin::GREY } };
-            pn.guide = { Guide{ jpart::PG_CROSS, -1, "Leave" }, Guide{ jpart::PG_CIRCLE, -1, "Back" } };
+            pn.guide = { Guide{ jpart::PG_CROSS, -1, pk_word("BUT_017", "Leave") }, Guide{ jpart::PG_CIRCLE, -1, pk_word("BUT_013", "Back") } };
         } else {
-            pn.kind = jpskin::MENU; pn.title = "Match over"; pn.rows = { { "Fight again", "" }, { "Select character", "" } }; pn.sel = v.sel <= 1 ? v.sel : -1;
+            // the rows say what the game's own end-of-fight menu says (PAU_011, PAU_009)
+            pn.kind = jpskin::MENU; pn.title = "Match over"; pn.rows = { { pk_word("PAU_011", "Fight again"), "" }, { pk_word("PAU_009", "Re-select character(s)"), "" } };
+            pn.sel = v.sel <= 1 ? v.sel : -1;
             pn.lines.push_back(Line{ v.status, jpskin::WHITE });
             if (!v.peer_line.empty()) pn.lines.push_back(Line{ v.peer_line, jpskin::GREY });
             if (!v.countdown.empty()) pn.lines.push_back(Line{ v.countdown, jpskin::AMBER });
-            if (!v.locked && v.outcome == jspg::PENDING) pn.guide = { Guide{ jpart::PG_CROSS, -1, "Confirm" }, Guide{ jpart::PG_CIRCLE, -1, "Leave" } };
+            if (!v.locked && v.outcome == jspg::PENDING) pn.guide = { Guide{ jpart::PG_CROSS, -1, pk_word("BUT_000", "Confirm") }, Guide{ jpart::PG_CIRCLE, -1, pk_word("BUT_017", "Leave") } };
         }
     } else if (u.drive == PkDrive::Room && capture) {
         pn.kind = jpskin::MENU; pn.title = "Select character"; pn.sel = u.prow;
         pn.rows = { { "Battle Character", jspf::fighter_text(pk_current(u).fighter) }, { "Support Character", jspf::support_text(pk_current(u).support) } };
-        if (host) {   // what jspk::roster_apply makes of the mode (humans in join order): 2 players: 1 + 1 or 2 against the COMs; 3: 2 + 1 (with a COM); 4: 2 + 2
-            const char* t = nplayers == 2 ? (u.together ? "Both of us vs 2 COMs" : "Versus, each with a COM")
-                          : nplayers == 3 ? (u.together ? "1st + 2nd to join vs 3rd + COM" : "1st + 3rd to join vs 2nd + COM")
-                          : (u.together ? "1st + 2nd vs 3rd + 4th to join" : "1st + 3rd vs 2nd + 4th to join");
+        if (host) {   // what jspk::roster_apply makes of the mode (humans in join order): 2 players: 1 + 1 or 2 against the COMs; 3: 2 + 1 (with a COM); 4: 2 + 2.
+            // Written with the P numbers of the pick lines below (jspf::pick_line: P1 = the first to join).
+            const char* t = nplayers == 2 ? (u.together ? "P1 + P2 vs 2 COMs" : "P1 + COM vs P2 + COM")
+                          : nplayers == 3 ? (u.together ? "P1 + P2 vs P3 + COM" : "P1 + P3 vs P2 + COM")
+                          : (u.together ? "P1 + P2 vs P3 + P4" : "P1 + P3 vs P2 + P4");
             pn.rows.push_back({ "Teams", t });
         }
         pn.lines.push_back(Line{ round_status, jpskin::WHITE });
         if (!host) pn.lines.push_back(Line{ "Teams: the host decides", jpskin::GREY });
         for (const std::string& l : who) pn.lines.push_back(Line{ l, jpskin::GREY });
         if (lock_secs >= 0 && lock_secs <= 30) pn.lines.push_back(Line{ "Your pick locks in " + std::to_string(lock_secs) + " s", jpskin::AMBER });
-        pn.guide = { Guide{ jpart::PG_LEFT, jpart::PG_RIGHT, "Change" }, Guide{ jpart::PG_CROSS, -1, "Ready" } };
+        pn.guide = { Guide{ jpart::PG_LEFT, jpart::PG_RIGHT, "Change" }, Guide{ jpart::PG_CROSS, -1, "Ready" } };   // "Ready": the game's own room word (BUT_067)
     } else if (u.drive == PkDrive::Room && !who.empty() && !(native_page == 1 && host && picking && u.page != 9)) {   // locked: everyone's picks until the fight
         pn.kind = jpskin::MENU; pn.title = "Select character";
         pn.lines.push_back(Line{ round_status, jpskin::WHITE });
         for (const std::string& l : who) pn.lines.push_back(Line{ l, jpskin::GREY });
-    } else if (u.drive == PkDrive::ToRoom) pn.band = rematch ? "Fight again: back to the room..." : "Select character: back to the room...";
+    } else if (u.drive == PkDrive::ToRoom) pn.band = (rematch ? pk_word("PAU_011", "Fight again") : pk_word("PAU_009", "Re-select character(s)")) + ": back to the room...";
     else if (u.drive == PkDrive::Room) pn.band = native_page == 1 && host && picking && u.page != 9 ? "Choose on the Battle settings page, then come back to the room" : round_status;
     else if (u.drive == PkDrive::Start) pn.band = "Starting the next fight...";
     if (now < u.notice_until && (pn.band.empty() || u.drive == PkDrive::Off || u.drive == PkDrive::Manual)) pn.band = u.notice;
@@ -2561,7 +2575,7 @@ void pick_frame()
         if (pn.kind != jpskin::NONE && (pn.kind != g.pk.kind || pn.title != g.pk.title)) g.pk_open_ms = now;   // a new window: its fade-in
         g.pk_key = key; g.pk = pn; redraw();
     } else if (pn.kind != jpskin::NONE && now - g.pk_open_ms < 200) redraw();   // the fade-in's frames
-    else if (g_pk_art.load(std::memory_order_acquire) && ((pn.kind != jpskin::NONE && g.pk_pic_key.rfind('f', 0) == 0) || (!pn.band.empty() && g.pk_band_key.rfind('f', 0) == 0)))
+    else if (g_pk_art.load(std::memory_order_acquire) && ((pn.kind != jpskin::NONE && g.pk_pic_key.rfind('f', 0) == 0) || (!pn.band.empty() && g.pk_band_key.rfind('f', 0) == 0) || (!pn.guide.empty() && g.pk_guide_key.rfind('f', 0) == 0)))
         redraw();   // the game's art arrived while shown: painted again with it
 }
 
