@@ -60,8 +60,11 @@ inline uint16_t live_press(bool capture, bool block, uint16_t press, bool press_
 inline uint16_t autopilot_pad(bool scripted_live, uint16_t scripted, uint16_t pick_live) { return scripted_live ? scripted : pick_live; }
 
 // The notice-box Cross. One per post-game drive; step() once per main-thread frame.
+// box_reached: BoxIn::reached from the drive. In the room or starting: yes. By hand: only when the room page was seen in this round (the start
+// timed out); after the 45 s to-room timeout with no room page ever seen, no notice-box Crosses go to whatever screen is up.
+inline bool box_reached(bool in_room_or_starting, bool by_hand, bool room_seen) { return in_room_or_starting || (by_hand && room_seen); }
 struct BoxIn {
-    bool reached = false;          // the drive reached the room (in the room, starting, or by hand)
+    bool reached = false;          // the drive reached the room (in the room, starting, or by hand after the room was seen): box_reached
     bool room_now = false;         // a room page update target ran in the last 500 ms and no fight HUD for 1.5 s
     bool fight_now = false;        // a fight HUD is drawn
     bool capture = false;          // the prompt / picker holds the pad

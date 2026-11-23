@@ -53,6 +53,8 @@ extern "C" int jsp_pick_submit(unsigned, unsigned, int, int) { return 0; }
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <new>
+#include <stdexcept>
 #include <random>
 #include <array>
 #include <cmath>
@@ -404,11 +406,21 @@ void pk_art_start()
         const uint64_t t0 = GetTickCount64();
         jpart::DirIo io(dir);
         std::vector<std::string> log;
-        const jpart::Art* art = new jpart::Art(jpart::load_art(io, log));   // kept for the process (read by the main thread's redraw)
-        for (const std::string& l : log) std::fprintf(stderr, "[pickui] %s\n", l.c_str());
-        std::fprintf(stderr, "[pickui] game art: %s (%llu ms)%s\n", art->summary().c_str(), (unsigned long long)(GetTickCount64() - t0),
-                     art->any() ? "" : "; the after-match menu draws its fallback shapes");
-        g_pk_art.store(art, std::memory_order_release);
+        // FIX (review S1): a failure here (std::bad_alloc on an odd archive, anything else thrown) must not end the game on this detached
+        // thread: g_pk_art stays null, so the layouts keep their fallback shapes, and one [pickui] line says so.
+        try {
+            const jpart::Art* art = new jpart::Art(jpart::load_art(io, log));   // kept for the process (read by the main thread's redraw)
+            for (const std::string& l : log) std::fprintf(stderr, "[pickui] %s\n", l.c_str());
+            std::fprintf(stderr, "[pickui] game art: %s (%llu ms)%s\n", art->summary().c_str(), (unsigned long long)(GetTickCount64() - t0),
+                         art->any() ? "" : "; the after-match menu draws its fallback shapes");
+            g_pk_art.store(art, std::memory_order_release);
+        } catch (const std::bad_alloc&) {
+            std::fprintf(stderr, "[pickui] game art: out of memory while reading; the after-match menu draws its fallback shapes\n");
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[pickui] game art: not read (%s); the after-match menu draws its fallback shapes\n", e.what());
+        } catch (...) {
+            std::fprintf(stderr, "[pickui] game art: not read (unknown error); the after-match menu draws its fallback shapes\n");
+        }
     }).detach();
 }
 void pk_blit(const jpskin::Frame& f, float alpha, int lift)
@@ -2346,6 +2358,7 @@ struct PkUi {
     PkDrive drive = PkDrive::Off;
     int sel = 0, prow = 0, page = 0;   // prompt row; picker row; native-page step (JSP_PICK_NATIVE_PAGE)
     bool leave_ask = false, joined = false, start_failed = false;
+    bool room_seen = false;                    // the room page was reached in this round's drive (for the notice-box Cross when it goes by hand)
     uint64_t since = 0, press_t = 0, room_since = 0, page_t = 0, page_back = 0, start_t = 0;
     jspd::BoxCross box;                        // FIX (mapping run U4): the room page reached, then hidden (a notice box over it): since when, Crosses sent, loading seen
     jsps::PageStep ps;                         // ENHANCEMENT (JSP_PICK_NATIVE_SELECT=1): this PC's step on the game's own Battle settings page
@@ -2419,7 +2432,7 @@ void pick_frame()
             const bool pg_open = f.postgame().on() && f.postgame().outcome() == jspg::PENDING;
             if (pg_open && u.drive != PkDrive::Prompt) { pk_drive(PkDrive::Prompt); u.sel = 0; u.leave_ask = false; }
             if (act == jspf::Act::Rematch || act == jspf::Act::CharSelect) {
-                pk_drive(PkDrive::ToRoom); u.room_since = 0; u.page = 0; u.joined = false; u.start_failed = false; u.prow = 0;
+                pk_drive(PkDrive::ToRoom); u.room_since = 0; u.room_seen = false; u.page = 0; u.joined = false; u.start_failed = false; u.prow = 0;
                 pk_lists(u);
                 const jspk::Pick m = f.round().mine();
                 u.fi = pk_index(u.fighters, m.fighter); u.si = pk_index(u.supports, m.support); u.together = m.mode == jspk::TOGETHER;
@@ -2448,7 +2461,7 @@ void pick_frame()
             }
             // to the room, then in the room
             if (u.drive == PkDrive::ToRoom || u.drive == PkDrive::Manual) {
-                if (room_now) { if (!u.room_since) u.room_since = now; if (now - u.room_since >= 1000) { pk_drive(PkDrive::Room); if (!u.ps.active()) f.in_room(true); } }
+                if (room_now) { if (!u.room_since) u.room_since = now; if (now - u.room_since >= 1000) { pk_drive(PkDrive::Room); u.room_seen = true; if (!u.ps.active()) f.in_room(true); } }
                 else u.room_since = 0;
             }
             picking = f.picking() && !rematch;
@@ -2616,7 +2629,7 @@ void pick_frame()
     // no more Crosses this round (BoxCross::loading; a Cross there could skip a screen on one PC only).
     {   // jspd::BoxCross (host-tested)
         jspd::BoxIn bi;
-        bi.reached = u.drive == PkDrive::Room || u.drive == PkDrive::Start || u.drive == PkDrive::Manual;
+        bi.reached = jspd::box_reached(u.drive == PkDrive::Room || u.drive == PkDrive::Start, u.drive == PkDrive::Manual, u.room_seen);   // FIX (review N1)
         bi.room_now = room_now; bi.fight_now = fight_now; bi.capture = capture; bi.blocked = block && open; bi.room_since = u.room_since; bi.loading_seen = jsp_native_loading_seen_ms();
         bi.own_page = (native_page == 1 && host && (u.page == 1 || u.page == 2)) || u.ps.on_page() || now - g_pk_square_t.load() < 30000;
         int back_n = 0;

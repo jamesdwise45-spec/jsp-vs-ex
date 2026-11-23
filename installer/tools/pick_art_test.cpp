@@ -1,6 +1,7 @@
 // Host test of the after-match menu's game-art reader and painter (installer/port/jsp/jsp_pick_art.h, jsp_pick_skin.h): the $CMP
 // decoder (LZ, raw, Huffman chunks), STPK and SRD parsing, DXT1 / DXT5 / Morton ARGB decoding, the SpFt glyph table, and that every
-// layout paints with no art at all (the fallback) inside its picture. Synthetic data only: no game files, no GPU.
+// layout paints with no art at all (the fallback) inside its picture, and that malformed input (truncated, oversized sizes, bad offsets,
+// flipped bytes) is refused cleanly. Synthetic data only: no game files, no GPU.
 //
 // Desk use (NOT in CI, needs the player's own disc folder; writes nothing but the previews asked for):
 //   pick_art_test --data <disc>/PS3_GAME/USRDIR/data/PS3 [--preview DIR] [--bg picture.ppm] [--font menu_font.jmf]
@@ -153,6 +154,133 @@ static void test_font()
     CHECK(f.width("AB", 1.0f) == 4.0f && f.width("AB", 2.0f) == 8.0f);
     Bytes cut(s.begin(), s.begin() + 0x30);
     CHECK(!jpart::spft_parse(cut, tex, f));
+}
+
+// ---- malformed input: refused, no crash, no huge allocation -----------------------------------------------------------------------------
+static uint32_t g_rng = 12345;
+static uint32_t rnd() { g_rng = g_rng * 1664525u + 1013904223u; return g_rng >> 8; }
+// every proper prefix and a few hundred random byte flips of `b` through `fn`; returns how many proper prefixes were accepted
+template <class Fn> static int mangle(const Bytes& b, Fn fn)
+{
+    int accepted = 0;
+    for (size_t k = 0; k < b.size(); k++) { Bytes t(b.begin(), b.begin() + k); accepted += fn(t) ? 1 : 0; }
+    for (int i = 0; i < 400; i++) {
+        Bytes t = b;
+        for (int j = 0, m = 1 + int(rnd() % 4); j < m && !t.empty(); j++) t[rnd() % t.size()] = uint8_t(rnd());
+        fn(t);
+    }
+    return accepted;
+}
+// An Io whose every archive is the bytes `d` (the CPK reader then refuses it or finds nothing).
+class MemIo : public jmods::Io {
+public:
+    explicit MemIo(Bytes d) : d_(std::move(d)) {}
+    bool mod_size(const std::string&, uint64_t&) override { return false; }
+    size_t mod_read(const std::string&, uint64_t, void*, size_t) override { return 0; }
+    bool archive_size(const std::string&, uint64_t& n) override { n = d_.size(); return true; }
+    size_t archive_read(const std::string&, uint64_t off, void* dst, size_t n) override
+    {
+        if (off >= d_.size()) return 0;
+        const size_t k = std::min<size_t>(n, d_.size() - size_t(off));
+        std::memcpy(dst, d_.data() + off, k);
+        return k;
+    }
+private:
+    Bytes d_;
+};
+static jpskin::View prompt_view();
+static bool inside(const jpskin::Frame& f);
+static void test_malformed()
+{
+    Bytes out;
+    // $CMP: an LZ chunk that writes past its declared size is stopped at the write (claims 2, would give 9)
+    Bytes lz = { uint8_t(3 << 1), 'a', 'b', 'c', uint8_t(1 | (6 << 1)), 3 };
+    Bytes over = cmp_file({ chunk("$CL0", 2, lz) }, 9);
+    CHECK(!jpart::cmp_decode(over.data(), over.size(), out) && out.size() <= 2);
+    // one 2-byte copy token of 31 bytes past the chunk's size: refused before the copy
+    Bytes runaway = { uint8_t(3 << 1), 'a', 'b', 'c', uint8_t(1 | (31 << 1)), 1 };
+    Bytes fr = cmp_file({ chunk("$CL0", 4, runaway) }, 4);
+    CHECK(!jpart::cmp_decode(fr.data(), fr.size(), out) && out.size() <= 4);
+    // a chunk claiming more than the stated total; raw and Huffman chunks longer than they claim
+    Bytes ct = cmp_file({ chunk("$CR0", 100, Bytes{ 'x', 'y' }) }, 2);
+    CHECK(!jpart::cmp_decode(ct.data(), ct.size(), out));
+    Bytes cr = cmp_file({ chunk("$CR0", 1, Bytes{ 'x', 'y' }) }, 2);
+    CHECK(!jpart::cmp_decode(cr.data(), cr.size(), out));
+    Bytes hh = huff_block(Bytes{ 'h', 'e', 'l', 'l', 'o' }); hh[7] = 4;   // the $CH0 chunk gives 4 of the stated 5
+    Bytes chl = cmp_file({ hh }, 5);
+    CHECK(!jpart::cmp_decode(chl.data(), chl.size(), out));
+    // header totals: past the 256 MB cap, and a 256 MB claim on a tiny file (a refusal, no big allocation)
+    Bytes huge = cmp_file({ chunk("$CR0", 2, Bytes{ 'x', 'y' }) }, 0xFFFFFFFFu);
+    CHECK(!jpart::cmp_decode(huge.data(), huge.size(), out));
+    Bytes big = cmp_file({ chunk("$CR0", 2, Bytes{ 'x', 'y' }) }, 256u << 20);
+    Bytes outb;
+    CHECK(!jpart::cmp_decode(big.data(), big.size(), outb) && outb.capacity() < (1u << 20));
+    // a chunk size past the end, and a size under the chunk header
+    Bytes bsz = cmp_file({ chunk("$CR0", 2, Bytes{ 'x', 'y' }) }, 2); bsz[0x20 + 10] = 0x40;
+    CHECK(!jpart::cmp_decode(bsz.data(), bsz.size(), out));
+    bsz[0x20 + 10] = 0; bsz[0x20 + 11] = 4; CHECK(!jpart::cmp_decode(bsz.data(), bsz.size(), out));
+    // truncated and flipped: no crash, and no proper prefix is accepted
+    Bytes good = cmp_file({ chunk("$CL0", 9, lz), chunk("$CR0", 2, Bytes{ 'x', 'y' }) }, 11);
+    Bytes hb = cmp_file({ chunk("$CLH", 9, huff_block(chunk("$CL0", 9, lz))) }, 9);
+    Bytes h1 = cmp_file({ huff_block(Bytes(7, 'z'), true) }, 7);
+    auto dec = [](Bytes& t) { Bytes o; return jpart::cmp_decode(t.data(), t.size(), o); };
+    CHECK(mangle(good, dec) == 0);
+    CHECK(mangle(hb, dec) == 0);
+    CHECK(mangle(h1, dec) == 0);
+
+    // STPK: an entry offset or size past the end, an absurd count, truncation
+    Bytes pk = stpk({ { "a.srd", Bytes{ 1, 2, 3 } } });
+    Bytes po = pk; po[0x10] = 0x7F; CHECK(!jpart::stpk_get(po, "a.srd", out));
+    Bytes ps = pk; ps[0x14] = 0x7F; CHECK(!jpart::stpk_get(ps, "a.srd", out));
+    Bytes pc = pk; pc[8] = 0xFF; CHECK(!jpart::stpk_get(pc, "a.srd", out));
+    CHECK(mangle(pk, [](Bytes& t) { Bytes o; return jpart::stpk_get(t, "a.srd", o); }) == 0);
+
+    // textures: sizes over the 4096 cap are refused before allocating, even with enough pixel data
+    {
+        const int w = 4100, h = 4;
+        Bytes px(size_t((w + 3) / 4) * size_t((h + 3) / 4) * 16, 0xAB);
+        CHECK(!jpart::decode_dxt(px.data(), px.size(), w, h, false).ok());
+        CHECK(!jpart::decode_dxt(px.data(), px.size(), w, h, true).ok());
+        CHECK(!jpart::decode_dxt(px.data(), px.size(), 4, 65535, false).ok());
+        CHECK(jpart::decode_dxt(px.data(), px.size(), 4096, 4, true).ok());   // the cap itself still decodes
+        CHECK(!jpart::decode_dxt(px.data(), px.size(), 0, 4, false).ok() && !jpart::decode_dxt(px.data(), px.size(), 4, -4, false).ok());
+        Bytes lin(size_t(5000) * 4, 1);
+        CHECK(!jpart::decode_argb_linear(lin.data(), lin.size(), 5000, 1).ok());
+        CHECK(jpart::decode_argb_linear(lin.data(), lin.size(), 4096, 1).ok());
+        Bytes mor(size_t(8192) * 4, 1);
+        CHECK(!jpart::decode_argb_morton(mor.data(), mor.size(), 8192, 1).ok());
+    }
+    // an SRD with a 65535 x 65535 texture and a length past the .srdv, an offset past it, an unknown format, then a good one
+    Bytes s; tag(s, "$CFH"); put32(s, 0); put32(s, 0); put32(s, 1);
+    srd_tex(s, "big.png", 65535, 65535, 0x0F, 0, 0x7FFFFFFF);
+    srd_tex(s, "off.png", 4, 4, 0x0F, 0x0FFFFFF0u, 8);
+    srd_tex(s, "fmt.png", 4, 4, 0x77, 0, 8);
+    srd_tex(s, "ok.png", 4, 4, 0x0F, 0, 8);
+    Bytes v(64, 0x11);
+    CHECK(!jpart::srd_image(s, v, "big.png").ok() && !jpart::srd_image(s, v, "off.png").ok() && !jpart::srd_image(s, v, "fmt.png").ok());
+    CHECK(jpart::srd_image(s, v, "ok.png").ok());
+    Bytes sb = s; sb[4] = 0x7F;   // the first block's data size past the end: the walk stops
+    CHECK(jpart::srd_textures(sb).empty());
+    mangle(s, [&v](Bytes& t) { for (const auto& ti : jpart::srd_textures(t)) (void)jpart::decode_tex(ti, v); return false; });
+
+    // the font table: truncated and flipped
+    Bytes fs(0x50 + 95 * 8, 0x22); std::fill(fs.begin(), fs.begin() + 0x50, 0); std::memcpy(fs.data(), "SpFt", 4);
+    fs[0x17] = 95; fs[0x1B] = 0x50; fs[0x1F] = 0x40; fs[0x24] = 46;
+    for (int k = 4; k < 16; k++) fs[0x40 + k] = 0xFF;
+    jpart::Image tex; tex.w = 64; tex.h = 64; tex.px.assign(size_t(64) * 64 * 4, 255);
+    mangle(fs, [&tex](Bytes& t) { jpart::Font fo; return jpart::spft_parse(t, tex, fo); });
+
+    // the whole reader over archives that are not CPKs (empty, garbage, a bare CPK magic, a CPK magic then 0xFF): every piece missing and
+    // logged, and the menu still paints from the fallback
+    Bytes cpk_ff = { 'C', 'P', 'K', ' ' }; cpk_ff.resize(4096, 0xFF);
+    for (const Bytes& d : { Bytes(), Bytes(37, 0x5A), Bytes{ 'C', 'P', 'K', ' ' }, cpk_ff }) {
+        MemIo io(d);
+        std::vector<std::string> log;
+        const jpart::Art art = jpart::load_art(io, log);
+        CHECK(!art.any() && !log.empty());
+        const jpskin::Painter P(&art, [](const std::string& t, float sc) { return float(t.size()) * 15.0f * sc; });
+        CHECK(inside(jpskin::menu(P, prompt_view(), 1.0f, 1.0f)));
+    }
 }
 
 // ---- the painter with no art (the fallback) ---------------------------------------------------------------------------------------------
@@ -341,7 +469,7 @@ int main(int argc, char** argv)
         else if (!std::strcmp(argv[i], "--font")) font = argv[i + 1];
     }
     if (data) return desk(data, dir, bg, font);
-    test_cmp(); test_stpk_srd(); test_font(); test_fallback();
+    test_cmp(); test_stpk_srd(); test_font(); test_fallback(); test_malformed();
     if (fails) { std::printf("pick_art_test: %d failure(s)\n", fails); return 1; }
     std::printf("pick_art_test: all passed\n");
     return 0;
