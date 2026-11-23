@@ -2417,8 +2417,9 @@ void pick_frame()
                 if (!pv.locked) {
                     if (u.leave_ask) { if (edges & kBtnCross) f.choose(jspg::LEAVE, nm); else if (edges & kBtnCircle) u.leave_ask = false; }
                     else {
-                        if (edges & kBtnUp) u.sel = 0;
-                        if (edges & kBtnDown) u.sel = 1;
+                        // FIX (test7 runs): Up did not bring the cursor back in two runs (cause not found; Down worked). With two rows, Up and
+                        // Down each move to the other row (the menu wraps, like the game's own lists), so either press always gets back.
+                        if (edges & (kBtnUp | kBtnDown)) u.sel = u.sel == 0 ? 1 : 0;
                         if (edges & kBtnCross) f.choose(u.sel == 0 ? jspg::REMATCH : jspg::CHARSELECT, nm);
                         if (edges & kBtnCircle) u.leave_ask = true;
                     }
