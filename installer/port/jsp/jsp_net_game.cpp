@@ -2383,7 +2383,7 @@ void pick_frame()
     const uint32_t edges = g_pk_edges.exchange(0);
     const unsigned long long rs = jsp_native_room_seen_ms();
     const bool fight_now = g_hud_idle < 5, room_now = rs && now - rs < 500 && g_hud_idle >= kHudIdleFrames;
-    static const int skip = pk_setting("JSP_PICK_SKIP", 1), host_start = pk_setting("JSP_PICK_HOST_START", 1), join_ready = pk_setting("JSP_PICK_JOIN_READY", 1),
+    static const int skip = pk_setting("JSP_PICK_SKIP", 1), host_start = pk_setting("JSP_PICK_HOST_START", 1), join_ready = pk_setting("JSP_PICK_JOIN_READY", 2),
                      native_page = pk_setting("JSP_PICK_NATIVE_PAGE", 0);
     jspf::Act act = jspf::Act::None;
     bool open = false, host = false, picking = false, start_ok = false, rematch = false, capture = false, block = false; int nplayers = 2;
