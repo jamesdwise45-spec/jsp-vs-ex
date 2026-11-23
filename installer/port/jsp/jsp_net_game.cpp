@@ -2315,7 +2315,8 @@ void pick_pad(uint32_t port, uint16_t* b, uint16_t* lx, uint16_t* ly)
         // and no injected press either; else the injected press (jspd::pad_gate, host-tested)
         static uint16_t prev = 0;
         const uint64_t now = GetTickCount64();
-        const jspd::PadOut o = jspd::pad_gate(*b, &prev, g_pk_capture.load() != 0, g_pk_block.load() != 0, (uint16_t)g_pk_press.load(), now < g_pk_press_until.load());
+        const jspd::PadOut o = jspd::pad_gate(*b, &prev, g_pk_capture.load() != 0, g_pk_block.load() != 0, (uint16_t)g_pk_press.load(), now < g_pk_press_until.load(),
+                                                jspd::stick_dirs(*lx, *ly));
         if (o.edges & kBtnSquare) g_pk_square_t = now;   // FIX (mapping run U4): the player's own Square (Battle settings): no notice-box Cross for a while
         // FIX (desk review, pick6): the player's own Circle on a free pad (leaving the room opens the game's own confirmation over the room page): no
         // notice-box Cross for a while either, so the port never answers that box for the player. Circle inside the prompt (captured) is the prompt's.

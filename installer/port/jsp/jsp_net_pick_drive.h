@@ -23,11 +23,21 @@ constexpr uint16_t kBtnCross = 0x4000, kBtnCircle = 0x2000, kBtnSquare = 0x8000,
 // block: Cross is taken out of the player's buttons, and an injected press is NOT added (the host's own start must wait: Flow::block_start).
 // press / press_live: the drive's injected buttons, OR-ed in while live (only when neither capture nor block).
 struct PadOut { uint16_t buttons = 0; uint16_t edges = 0; bool centre = false; };
-inline PadOut pad_gate(uint16_t raw, uint16_t* prev, bool capture, bool block, uint16_t press, bool press_live)
+// FIX (test7 screenshot run): the menus read only the D-pad; a player on the left stick could not move the cursor. stick_dirs: the left stick
+// as D-pad bits (beyond about half of its travel), used for the menus' edges only; the game's own buttons never get them.
+inline uint16_t stick_dirs(uint16_t lx, uint16_t ly)
+{
+    uint16_t d = 0;
+    if (ly < 64) d |= kBtnUp; else if (ly > 192) d |= kBtnDown;
+    if (lx < 64) d |= kBtnLeft; else if (lx > 192) d |= kBtnRight;
+    return d;
+}
+inline PadOut pad_gate(uint16_t raw, uint16_t* prev, bool capture, bool block, uint16_t press, bool press_live, uint16_t dirs = 0)
 {
     PadOut o;
-    o.edges = (uint16_t)(raw & ~*prev);
-    *prev = raw;
+    const uint16_t seen = (uint16_t)(raw | dirs);
+    o.edges = (uint16_t)(seen & ~*prev);
+    *prev = seen;
     o.buttons = raw;
     if (capture) { o.buttons = 0; o.centre = true; }
     else if (block) o.buttons = (uint16_t)(raw & ~kBtnCross);

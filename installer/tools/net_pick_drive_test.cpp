@@ -35,6 +35,20 @@ static void test_pad_gate()
     CHECK(o.buttons == 0 && o.edges == 0);
     o = pad_gate(kBtnCross | kBtnDown, &prev, true, false, 0, false);
     CHECK(o.buttons == 0 && o.edges == kBtnDown);
+    // the left stick moves the menus' cursor (edges only), never the game's buttons
+    CHECK(stick_dirs(128, 128) == 0 && stick_dirs(128, 0) == kBtnUp && stick_dirs(128, 255) == kBtnDown && stick_dirs(0, 128) == kBtnLeft && stick_dirs(255, 128) == kBtnRight);
+    CHECK(stick_dirs(100, 160) == 0);   // small deflections do nothing
+    prev = 0;
+    o = pad_gate(0, &prev, true, false, 0, false, stick_dirs(128, 0));
+    CHECK(o.buttons == 0 && o.centre && o.edges == kBtnUp);
+    o = pad_gate(0, &prev, true, false, 0, false, stick_dirs(128, 10));
+    CHECK(o.edges == 0);   // held up: once
+    o = pad_gate(0, &prev, true, false, 0, false, stick_dirs(128, 128));
+    o = pad_gate(0, &prev, true, false, 0, false, stick_dirs(128, 250));
+    CHECK(o.edges == kBtnDown);
+    o = pad_gate(0, &prev, false, false, 0, false, stick_dirs(128, 0));
+    CHECK(o.buttons == 0 && !o.centre);   // free pad: the stick never becomes a D-pad press for the game
+    prev = 0;
     // capture wins over block
     o = pad_gate(kBtnCircle, &prev, true, true, 0, false);
     CHECK(o.buttons == 0 && o.centre && o.edges == kBtnCircle);
