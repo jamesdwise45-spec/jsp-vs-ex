@@ -254,6 +254,8 @@ static const KV kDefaults[] = {
     {"JSP_ROLLBACK_SKIP_FINAL", "1"},
     // FORK TEST BUILD ONLY (not for upstream): the after-match menu (Fight again / Select character) on by default for the testers; JSP_ROLLBACK_PICK=0 turns it off.
     {"JSP_ROLLBACK_PICK", "1"},
+    // FORK TEST BUILD ONLY (not for upstream): Re-select character(s) opens the game's own character-select page on both PCs; JSP_PICK_NATIVE_SELECT=0 = the port's picker.
+    {"JSP_PICK_NATIVE_SELECT", "1"},
     // A restore waits (at most JSP_SNAPSHOT_SITE_MS, 50 ms) until every helper thread is parked where it was at the target's save (jsp_snapshot_sync.h, SiteMoved). Soak
     // 2026-11-21 (replay-driven depth 2, ~3,200 restores): a CRI loader worker was caught inside its file read at a restore; 0 desyncs, restore 10.7 ms avg (no cost).
     {"JSP_SNAPSHOT_SITE", "1"},
