@@ -348,7 +348,7 @@ static void test_source_guard(const char* dir)
     const std::string n = slurp((std::string(dir) + "/../port/jsp/jsp_net_native.cpp").c_str());
     if (g.empty() || n.empty()) { std::printf("FAIL: sources not found from %s\n", dir); fails++; return; }
     // the "in the room" flag waits for the page step (the host's start waits for every page)
-    CHECK(g.find("pk_drive(PkDrive::Room); if (!u.ps.active()) f.in_room(true);") != std::string::npos);
+    CHECK(g.find("pk_drive(PkDrive::Room); u.room_seen = true; if (!u.ps.active()) f.in_room(true);") != std::string::npos);
     // the lock and the fallback say "in the room"; the give-up closes the link without giving the room up
     CHECK(g.find("pick locked from the Battle settings page") != std::string::npos);
     CHECK(g.find("if (g_nat.link) native_close(\"post-game: still on the Battle settings page at the round's deadline\");") != std::string::npos);
