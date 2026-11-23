@@ -105,6 +105,7 @@ jobs:
           - In the first match only the host picks characters (the game's own Friendly Match room); the joiner is on Random Select. After a match, Re-select character(s) lets both players pick.
           - To host, keep Object draw distance, Model detail and Shadow range at their defaults in the settings window: other values make the room refuse to start (not fixed in code yet).
           - The after-match menu takes the D-pad or the left stick; Up or Down moves to the other choice. If anything in the menu misbehaves, tell us and send a support bundle (JSP_ROLLBACK_PICK=0 in play_settings.txt turns the menu off).
+          - If the game shows a notice over the room after a match (for example "You got a new title."), the game's character select may not open for that round: the port's own picker appears instead. It still works; the next round uses the game's page again.
           - Sudden freezes in the connection itself (100+ ms with no data) can still cause a short hitch.
 
           If something goes wrong, run \`support-bundle.cmd\` in the install folder and send the file it makes. Everyone in a match must use this same build (the main menu shows $VERSION). SHA256SUMS lists each file's hash. Full guide and troubleshooting: ONLINE-GUIDE.md in the install folder. No game data is included: the game is built on your PC from your own copy.
