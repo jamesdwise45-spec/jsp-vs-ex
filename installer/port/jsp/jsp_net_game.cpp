@@ -2687,7 +2687,7 @@ void pick_frame()
     } else if (u.drive == PkDrive::Room && u.ps.active()) {   // ENHANCEMENT (JSP_PICK_NATIVE_SELECT=1): one line over the game's own page, nothing that covers it
         // test8: the game writes the page's pick only on Start (Finish); Circle (Back) discards it
         pn.band = u.ps.on_page() && u.ps.state() != jsps::St::SQUARE
-                ? (host ? "Choose your fighter, then press Start to finish" : "Choose your fighter, then press Start to finish (the host picks the stage and music)")
+                ? "Choose your fighter, then press Start to finish"   // the same for host and joiner (which stage wins is not proven)
                 : u.ps.unsaved() ? (now - u.ps_unsaved_t < 6000 ? "Your pick was not saved: press Square to open it again, then finish with Start"
                                                                  : "Press Square to choose your fighter, then finish with Start")
                 : "Opening the character select...";
