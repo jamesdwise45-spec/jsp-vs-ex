@@ -17,7 +17,7 @@ Output only (blocks mixed, read index and notify events are exactly as in 3005; 
 - tests: libs/audio/tests/test_audio_lock_race.c adds a steady 0.5, 1 and 2 ms stretch on a 150 ms fake device in virtual time, on and off (on: no
   concealed gap after the start, the level at the cushion, the feedback not pinned; off: concealed gaps) and the 8% cap; audio_lock_measure.c
   publishes each scenario's stretch as the game does and adds 1 and 2 ms scenarios, a "field hitches" scenario (76 ms about every 11 s, every
-  third one 150-300 ms, as test6 matches logged them) and a scenario filter (second argument).
+  third one 150-300 ms, as test6 matches logged them; one line per hitch says whether it concealed a gap) and a scenario filter (second argument).
 
 diff --git a/libs/audio/cellAudio.c b/libs/audio/cellAudio.c
 index e4a2d9e..9c11183 100644
@@ -111,7 +111,7 @@ index e4a2d9e..9c11183 100644
      if (!s_lk_smooth) {   /* patch 3005 as it was, counted */
          if (rm >= (int)LK_N) { audio_backend_submit(s_mix_buffer, LK_N); s_lk_have_last = 1; } else s_lk_drops++;
 diff --git a/libs/audio/tests/audio_lock_measure.c b/libs/audio/tests/audio_lock_measure.c
-index 640f006..dea11f1 100644
+index 640f006..2237077 100644
 --- a/libs/audio/tests/audio_lock_measure.c
 +++ b/libs/audio/tests/audio_lock_measure.c
 @@ -6,8 +6,10 @@
@@ -137,18 +137,20 @@ index 640f006..dea11f1 100644
  
  static double s_lat_ms;
  static void stats(const char* what, double* v, int n)
-@@ -52,13 +56,19 @@ static void run(const scenario* sc, double seconds, IAudioClock* clk, UINT64 clk
+@@ -52,13 +56,21 @@ static void run(const scenario* sc, double seconds, IAudioClock* clk, UINT64 clk
      clk->lpVtbl->GetPosition(clk, &p0, &qpc0);
      const double t_start = now_ms(); double next = t_start, last_stall = t_start;
      long long blocks = 0; int tick = 0;
 +    if (seconds < sc->min_s) seconds = sc->min_s;
-+    int hitches = 0; double gap_s = sc->stall_every_s - 1.0 + 2.0 * rnd();
++    int hitches = 0, hid = 0; unsigned long long gaps_before = 0, gaps0 = 0; double hitch_ms = 0.0, lvl0 = 0.0, gap_s = sc->stall_every_s - 1.0 + 2.0 * rnd();
      while (now_ms() - t_start < seconds * 1000.0) {
          /* the tick boundary: 1/30 s, plus this scenario's lateness */
          double due = next + rnd() * sc->jitter_ms;
          if (sc->stall_ms > 0 && due - last_stall >= sc->stall_every_s * 1000.0) { due += sc->stall_ms; last_stall = due; }
 +        if (sc->stall_ms < 0 && due - last_stall >= gap_s * 1000.0) {
-+            due += ++hitches % 3 ? 76.0 : 150.0 + 150.0 * rnd(); last_stall = due; gap_s = sc->stall_every_s - 1.0 + 2.0 * rnd();
++            hitch_ms = ++hitches % 3 ? 76.0 : 150.0 + 150.0 * rnd(); due += hitch_ms; last_stall = due; gap_s = sc->stall_every_s - 1.0 + 2.0 * rnd();
++            if (hitches == 1) gaps_before = s_lk_conceals;   /* the gaps of the start (an empty device) */
++            gaps0 = s_lk_conceals; lvl0 = (lk_cap_frames() - audio_backend_room()) / 48.0;
 +        }
          while (now_ms() < due) { lk_idle_tail(); Sleep(1); }   /* the mix thread's 2 ms idle waits (timeBeginPeriod(1)) */
          const int rm0 = audio_backend_room(), cap = lk_cap_frames();
@@ -157,15 +159,28 @@ index 640f006..dea11f1 100644
          const long long want = (long long)(tick + 1) * 25 / 4;   /* 6.25 blocks per tick */
          for (; blocks < want; blocks++) {
              for (int i = 0; i < CELL_AUDIO_BLOCK_SAMPLES; i++) s_mix_buffer[i * 2] = s_mix_buffer[i * 2 + 1] = 0.25f * sinf((float)(blocks * 256 + i) * 0.0576f);
-@@ -75,6 +85,7 @@ static void run(const scenario* sc, double seconds, IAudioClock* clk, UINT64 clk
+@@ -66,6 +78,10 @@ static void run(const scenario* sc, double seconds, IAudioClock* clk, UINT64 clk
+         }
+         const int rm1 = audio_backend_room();
+         if (rm0 >= 0 && rm1 >= 0 && nd < 20000) { before[nd] = (cap - rm0) / 48.0; after[nd] = (cap - rm1) / 48.0; nd++; }
++        if (hitches != hid) {   /* the burst after a hitch: did the hitch conceal a gap? */
++            hid = hitches;
++            printf("  hitch %d: %.0f ms, level when it began %.1f ms, concealed gaps +%llu\n", hitches, hitch_ms, lvl0, s_lk_conceals - gaps0);
++        }
+         tick++; next += 1000.0 / 30.0 + sc->stretch_ms;
+         if (now_ms() - next > 1000.0 / 60.0) next = now_ms();   /* the stepper restarts its schedule after a flip more than half a period late */
+     }
+@@ -74,7 +90,9 @@ static void run(const scenario* sc, double seconds, IAudioClock* clk, UINT64 clk
+     printf("%-24s output delay:", sc->name);
      stats("oldest frame of a burst", before, nd); stats("newest", after, nd);
      printf(" %d ticks; played-clock lag %.1f ms over %.1f s\n", nd, wall - played_ms, wall / 1000.0);
++    if (hitches) printf("  %d hitches; concealed gaps before the first (the start): %llu\n", hitches, gaps_before);
      fflush(stdout);
 +    g_ps3_audio_lock_stretch_us = 0;
      lk_end();   /* the game's "[audio-lock] lock ended" line, on stderr */
      while (lk_cap_frames() - audio_backend_room() > 0) Sleep(5);   /* let the device run empty before the next scenario */
  }
-@@ -98,12 +109,24 @@ int main(int argc, char** argv)
+@@ -98,12 +116,24 @@ int main(int argc, char** argv)
      printf("device: buffer %u frames (%.1f ms), free-running fill %d ms, stream latency %.1f ms, device period %.1f ms (min %.1f ms), clock %llu Hz\n",
             (unsigned)s_wasapi_buf_frames, s_wasapi_buf_frames / 48.0, s_lk_fill_ms, lat / 10000.0, per_def / 10000.0, per_min / 10000.0, (unsigned long long)freq);
      static const scenario sc[] = {
