@@ -27,6 +27,7 @@
 #include "jsp_step_effects.h"
 #include "jsp_step_input.h"
 #include "jsp_stall_rule.h"
+#include "jsp_hitch.h"   // DIAGNOSTIC (per-hitch line): jph::Clock, the frame clock's part of it
 #include "cellPad.h"   // toolkit libs/input (CMakeLists: this file only): CellPadInfo2 and patch 7915's g_cellpad_canon_hook / g_cellpad_info_hook
 
 extern "C" {
@@ -233,6 +234,7 @@ uint32_t g_ack_before = 0;
 long long g_ack_wait_qpc = 0, g_ack_drain_qpc = 0;   // this vblank's waiting time outside / inside the drains (QPC units)
 uint32_t g_ack_logs = 0;
 std::atomic<int> g_ls_failed{0};            // the lockstep clock gave up on the guest (kAckFailMs): read by jsp_stepper_lockstep_failed
+void hz_note_drain(long long dq);           // DIAGNOSTIC (per-hitch line), below: the longest FIFO drain of the gap
 }  // namespace
 static jsr::State g_lf;                     // frame clock thread only (and jsp_stepper_lockstep): the lost-flip rule and its failure timers (jsp_stall_rule.h)
 namespace {
@@ -274,6 +276,7 @@ bool vblank_ack(int rsx_ok, bool resumable = false)
         if (rsx_ok) cellGcm_rsx_process_fifo();
         QueryPerformanceCounter(&b);
         g_ack_drain_qpc += b.QuadPart - a.QuadPart; slice += b.QuadPart - a.QuadPart;
+        if (rsx_ok) hz_note_drain(b.QuadPart - a.QuadPart);   // DIAGNOSTIC (per-hitch line; counted only while the lockstep clock runs)
         if (cellGcm_vblank_delivered() != g_ack_before) continue;   // re-checked after every drain, before any time counts
         cellGcm_fifo_kick_wait(1);
         QueryPerformanceCounter(&c);
@@ -327,6 +330,77 @@ extern "C" int jsp_stepper_lockstep_stretch_us(uint32_t us)
     return 1;
 }
 static bool guest_in_step3_without_flip();                       // below (frame clock thread only)
+// DIAGNOSTIC (per-hitch line, jsp_hitch.h; always on while the lockstep clock runs): the frame clock's view of the current presented-frame gap. The frame
+// clock thread notes into g_hz under g_hz_mu (uncontended: the main thread only takes it once per presented frame, jsp_stepper_hitch_take). Timing only.
+extern "C" volatile int g_jsp_main_stage;
+extern "C" { volatile uint32_t g_jsp_main_tid = 0; }   // jsp_net_game.cpp (boundary): the guest thread id of the game's main thread, for the late-flip sample
+extern "C" void ps3_hle_thread_census(uint32_t* kind, uint32_t* id, uint32_t* obj, uint32_t* lr, uint8_t* alive, uint8_t* unreliable, uint32_t* overflows, uint32_t* unbalanced);
+namespace {
+std::mutex g_hz_mu;
+jph::Clock g_hz;
+bool g_hz_ready_seen = false, g_hz_sampled_flip = false;   // frame clock thread only: per flip (lockstep_take_flip clears them)
+long long g_hz_out = 0;                                    // frame clock thread only: QPC when the last lockstep pass gave the loop back to main.cpp
+double hz_ms(long long dq) { static LARGE_INTEGER f{}; if (!f.QuadPart) QueryPerformanceFrequency(&f); return (double)dq * 1000.0 / (double)f.QuadPart; }
+void hz_note_drain(long long dq)
+{
+    if (!g_lockstep.load(std::memory_order_relaxed)) return;
+    const double ms = hz_ms(dq);
+    std::lock_guard<std::mutex> lk(g_hz_mu); if (ms > g_hz.drain_max_ms) g_hz.drain_max_ms = ms;
+}
+void hz_drain(int rsx_ok)   // the lockstep pass's FIFO drain, timed
+{
+    if (!rsx_ok) return;
+    LARGE_INTEGER a, b; QueryPerformanceCounter(&a); cellGcm_rsx_process_fifo(); QueryPerformanceCounter(&b);
+    hz_note_drain(b.QuadPart - a.QuadPart);
+}
+// The guest's flip became ready (first pass that sees it): how late against its deadline `next` (0 = no schedule yet).
+void hz_ready(long long now, long long next)
+{
+    if (g_hz_ready_seen || !next) return;
+    g_hz_ready_seen = true;
+    const double late = hz_ms(now - next);
+    std::lock_guard<std::mutex> lk(g_hz_mu); if (late > g_hz.ready_late_ms) g_hz.ready_late_ms = late;
+}
+// No flip ready yet: once per flip, at jph::kLateMs past the deadline, where the main thread is (boundary stage, or the guest's HLE call and call site).
+void hz_maybe_sample(long long now, long long next)
+{
+    if (g_hz_sampled_flip || g_hz_ready_seen || !next || hz_ms(now - next) < jph::kLateMs) return;
+    g_hz_sampled_flip = true;
+    { std::lock_guard<std::mutex> lk(g_hz_mu); if (g_hz.sampled) return; }   // the first late flip of the gap names it
+    static uint32_t kind[65], id[65], obj[65], lr[65]; static uint8_t alive[65], unrel[65]; uint32_t ov = 0, ub = 0;
+    const int stage = g_jsp_main_stage;
+    const uint32_t t = g_jsp_main_tid;
+    uint32_t k = 0, i = 0, l = 0;
+    if (t >= 1 && t < 65) { ps3_hle_thread_census(kind, id, obj, lr, alive, unrel, &ov, &ub); if (alive[t]) { k = kind[t]; i = id[t]; l = lr[t]; } }
+    std::lock_guard<std::mutex> lk(g_hz_mu);
+    g_hz.sampled = 1; g_hz.stage = stage; g_hz.kind = k; g_hz.id = i; g_hz.lr = l; g_hz.sample_late_ms = hz_ms(now - next);
+}
+void hz_take(long long now, long long deadline, bool restart)   // lockstep_take_flip
+{
+    g_hz_ready_seen = false; g_hz_sampled_flip = false;
+    std::lock_guard<std::mutex> lk(g_hz_mu);
+    g_hz.flips++; if (restart) g_hz.restarts++;
+    if (deadline) { const double late = hz_ms(now - deadline); if (late > g_hz.take_late_ms) g_hz.take_late_ms = late; }
+}
+int hz_out(int r)   // a lockstep pass returns to main.cpp (present, drain, pump) when r == 2
+{
+    if (r == 2 && g_lockstep.load(std::memory_order_relaxed)) { LARGE_INTEGER t; QueryPerformanceCounter(&t); g_hz_out = t.QuadPart; }
+    return r;
+}
+void hz_in()   // a pass starts: the stretch main.cpp spent since the last one
+{
+    if (!g_hz_out) return;
+    LARGE_INTEGER t; QueryPerformanceCounter(&t);
+    const double ms = hz_ms(t.QuadPart - g_hz_out); g_hz_out = 0;
+    std::lock_guard<std::mutex> lk(g_hz_mu); if (ms > g_hz.outside_max_ms) g_hz.outside_max_ms = ms;
+}
+}  // namespace
+// Main thread, at each presented frame (jsp_net_game.cpp): the frame clock's view of the gap that just ended; the next gap starts empty.
+extern "C" void jsp_stepper_hitch_take(jph::Clock* out)
+{
+    std::lock_guard<std::mutex> lk(g_hz_mu);
+    *out = g_hz; g_hz = jph::Clock();
+}
 static void log_rerun_stall(const char* what, ULONGLONG gap_ms);   // below
 static bool lost_flip_pass(ULONGLONG last_flip_ms);                // below (frame clock thread only): true = a lost flip was written off
 static int g_ls_ack_site = 0;       // frame clock thread only: the open vblank (g_ack_open) is the one before a flip (1: the flip follows it) or another (0)
@@ -342,8 +416,11 @@ static void lockstep_take_flip()
     const uint32_t st = std::min(g_ls_stretch_us.exchange(0), kStretchMaxUs);
     g_ls_stretch_total_us += st;
     const long long step = period + (long long)st * f / 1000000;
+    const long long deadline = g_ls_next;
+    const bool restart = g_ls_next && now.QuadPart - g_ls_next > period / 2;
     if (!g_ls_next || now.QuadPart - g_ls_next > period / 2) { if (g_ls_next) g_ls_restarts++; g_ls_next = now.QuadPart + step; }   // over half a period late: restart
     else g_ls_next += step;                                                                                                         // on (or near) the schedule
+    hz_take(now.QuadPart, deadline, restart);   // DIAGNOSTIC (per-hitch line)
     g_ls_last = now.QuadPart; g_ls_last_ms = GetTickCount64();
     g_ls_second = 1; g_ls_flips++; g_ls_wait_logs = 0;
     jsr::flip_taken(g_lf);
@@ -360,11 +437,12 @@ static int lockstep_resume(int rsx_ok)
 static int lockstep_pass(int rsx_ok)
 {
     if (g_ack_open) return lockstep_resume(rsx_ok);
-    if (g_ls_second) { if (rsx_ok) cellGcm_rsx_process_fifo(); g_ls_second = 0; g_ls_ack_site = 0; (void)vblank_ack(rsx_ok, true); return 2; }   // the vblank after the flip (after its present)
-    if (rsx_ok) cellGcm_rsx_process_fifo();
+    if (g_ls_second) { hz_drain(rsx_ok); g_ls_second = 0; g_ls_ack_site = 0; (void)vblank_ack(rsx_ok, true); return 2; }   // the vblank after the flip (after its present)
+    hz_drain(rsx_ok);   // cellGcm_rsx_process_fifo, timed (DIAGNOSTIC, per-hitch line)
     LARGE_INTEGER now; QueryPerformanceCounter(&now);
     const long long f = g_ls_qf.QuadPart;
     if (cellGcm_flip_ready()) {
+        hz_ready(now.QuadPart, g_ls_next);   // DIAGNOSTIC (per-hitch line): how late the guest's flip became ready
         if (g_ls_next && now.QuadPart < g_ls_next) {   // hold to the schedule: sleep in whole ms to ~1.5 ms before the deadline, then spin
             const long long left_us = (g_ls_next - now.QuadPart) * 1000000 / f;
             if (left_us > 2500) { cellGcm_fifo_kick_wait((unsigned)((left_us - 1500) / 1000)); return 2; }   // a kick wakes it early: main.cpp drains, we come back
@@ -378,6 +456,7 @@ static int lockstep_pass(int rsx_ok)
     }
     cellGcm_fifo_kick_wait(1);
     QueryPerformanceCounter(&now);
+    hz_maybe_sample(now.QuadPart, g_ls_next);   // DIAGNOSTIC (per-hitch line): a flip kLateMs late names where the main thread is
     // FIX (rollback determinism: the idle vblank was wall-clock timed): a vblank with no flip goes ONLY to a guest that is provably in its frame
     // pacing step 3 (main thread in an HLE wait at lr 0x006508A0, the vblank counter below N) with no flip outstanding (queued = reached = completed, no
     // direct flip), the test owed_vblank_pass uses; one per pass, each observed, until the counter reaches N and step 3 lets go. Before, any 500 ms without a
@@ -532,8 +611,9 @@ extern "C" int jsp_rollback_clock_turbo(int rsx_ok)
                      (unsigned long long)(jsr::kReleaseMs / 1000));
         g_lockstep.store(0);
     }
-    if (g_ack_open) return lockstep_resume(rsx_ok);          // FIX (never off mid-match): only the lockstep clock leaves one open; it comes first
-    if (!g_turbo.load(std::memory_order_relaxed)) return g_lockstep.load(std::memory_order_relaxed) ? lockstep_pass(rsx_ok) : 0;
+    hz_in();   // DIAGNOSTIC (per-hitch line): main.cpp's present / drain / pump since the last lockstep pass
+    if (g_ack_open) return hz_out(lockstep_resume(rsx_ok));          // FIX (never off mid-match): only the lockstep clock leaves one open; it comes first
+    if (!g_turbo.load(std::memory_order_relaxed)) return g_lockstep.load(std::memory_order_relaxed) ? hz_out(lockstep_pass(rsx_ok)) : 0;
     if (rsx_ok) {                                            // executes what the guest queued, including its flip command ("reached")
         LARGE_INTEGER a, b, qf; QueryPerformanceCounter(&a);
         cellGcm_rsx_process_fifo();

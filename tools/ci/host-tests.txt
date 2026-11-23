@@ -41,6 +41,7 @@ posix   | installer/tools/version_line_test.sh
 posix   | installer/tools/net_badge_test.sh
 posix   | installer/tools/net_delay_rule_test.sh
 posix   | installer/tools/net_perf_test.sh
+posix   | installer/tools/hitch_test.sh
 posix   | installer/tools/discord_test.sh
 posix   | installer/tools/native_fight_test.sh
 posix   | installer/tools/fight_setup_rule_test.sh
@@ -88,6 +89,7 @@ exclude | installer/tools/version_line_test.cpp | compiled and run by version_li
 exclude | installer/tools/net_badge_test.cpp | compiled and run by net_badge_test.sh
 exclude | installer/tools/net_delay_rule_test.cpp | compiled and run by net_delay_rule_test.sh
 exclude | installer/tools/net_perf_test.cpp | compiled and run by net_perf_test.sh
+exclude | installer/tools/hitch_test.cpp | compiled and run by hitch_test.sh
 exclude | installer/tools/discord_test.cpp | compiled and run by discord_test.sh
 exclude | installer/tools/native_fight_test.cpp | compiled and run by native_fight_test.sh
 exclude | installer/tools/fight_setup_rule_test.cpp | compiled and run by fight_setup_rule_test.sh

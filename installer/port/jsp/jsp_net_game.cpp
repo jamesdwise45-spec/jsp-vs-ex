@@ -59,6 +59,7 @@ extern "C" unsigned long long jsp_net_presence_room(char* server, int sn) { if (
 #include "jsp_net_badge.h"
 #include "jsp_net_delay_rule.h"   // ENHANCEMENT (adaptive input delay, rule 2): the decision, shared with the host simulator
 #include "jsp_net_perf.h"   // ENHANCEMENT (match perf summary): input latency, rollback depth, hitches, replay shown; five [perf] lines per match
+#include "jsp_hitch.h"      // DIAGNOSTIC (per-hitch line): one [perf] hitch line per gap over 50 ms, with where the main thread's time went
 #include "jsp_net_ko_rule.h"      // FIX (review of PR 248): the KO / time-up end rules and the live confirmation watermark, shared with net_session_test
 #include "jsp_net_repsn_client.h"
 #include "jsp_net_glue.h"
@@ -456,6 +457,9 @@ void adapt_delay(uint64_t now)
 void log_status() { g.bv.path = path_word(); std::fprintf(stderr, "[net] %s\n", jpnb::log_line(g.bv).c_str()); }
 // ENHANCEMENT (match perf summary, jsp_net_perf.h): per match (reset_match), main thread; from the first fight HUD draw, never in the bench.
 jpperf::Match g_perf; int64_t g_perf_t0 = 0;
+// DIAGNOSTIC (per-hitch line, jsp_hitch.h; always on with the perf summary): per match (reset_match), main thread. g_hz_exit = QPC when the last armed
+// boundary ended (0 = none yet), g_hz_after_rerun = that boundary granted a re-run tick (the guest stretch after it is replay time).
+jph::Match g_hz; int64_t g_hz_exit = 0; bool g_hz_after_rerun = false;
 double perf_now() { if (!g_perf_t0) g_perf_t0 = qpc_now(); return qpc_ms(g_perf_t0, qpc_now()); }
 bool perf_on() { return !g.bench && g.fight_seen; }
 void perf_log()
@@ -464,6 +468,7 @@ void perf_log()
     const std::string s = jpperf::lines(g_perf, path_word().c_str(), g.rrz ? "re-psn" : "direct IP", g.host ? "host" : "join", g.match_k,
                                         (double)(GetTickCount64() - g.started_ms) / 1000.0);
     std::fputs(s.c_str(), stderr);
+    std::fputs(jph::summary(g_hz).c_str(), stderr);   // DIAGNOSTIC (per-hitch line): the hitches per cause
 }
 
 uint64_t rz_rejected() { if (auto* d = dynamic_cast<DirectRendezvous*>(g.rz.get())) return d->rejected_hello; return g.rrz ? g.rrz->rejected_members : 0; }
@@ -822,6 +827,7 @@ void reset_match()
     g.record = false; g.match_winner = 0; ko_clear();
     g_ad = jpdr::State();   // ENHANCEMENT (adaptive input delay): per match
     g_perf = jpperf::Match();   // ENHANCEMENT (match perf summary): per match
+    g_hz = jph::Match(); g_hz_exit = 0; g_hz_after_rerun = false;   // DIAGNOSTIC (per-hitch line): per match
     g_audio_waits = g_audio_timeouts = 0; g_audio_wait_ms = 0;
     g_hold_ms = 0; g_holds = g_hold_renders = 0;
     g_regs_saved = g_regs_restored = g_regs_skipped = 0;
@@ -1108,6 +1114,7 @@ public:
         jpnb::note_rollback(g.bv, (int64_t)g.done_now - (int64_t)tick);
         adapt_note_rollback((int64_t)g.done_now - (int64_t)tick);   // ENHANCEMENT (adaptive input delay, rule 2): the depth trigger
         if (perf_on()) jpperf::on_rollback(g_perf, perf_now(), (int64_t)g.done_now - (int64_t)tick);   // ENHANCEMENT (match perf summary)
+        if (perf_on()) jph::add_rollback(g_hz.gap, g.done_now - tick);   // DIAGNOSTIC (per-hitch line)
         g_rep.rollback(g.done_now - g.base, g.done_now - tick);
         // the audio goes back with the tick (the mix thread is idle here). FIX (audio rewind dropped blocks): the save of tick T is taken at the boundary BEFORE that boundary raises
         // the audio to blocks_at(T), so the snapshot holds the guest's audio at blocks_at(T - 1): rewinding to blocks_at(T) dropped 6-7 blocks per rollback
@@ -1532,10 +1539,45 @@ extern "C" int32_t jsp_net_vblank_counter(void)
     return (p >= 0x10000u && p < 0xC0000000u) ? (int32_t)vm_read32(p) : -1;
 }
 struct MainStage { MainStage() { g_jsp_main_stage = 1; } ~MainStage() { g_jsp_main_stage = 0; } };   // 1 = in the boundary; 0 = back in guest code
+// DIAGNOSTIC (per-hitch line, jsp_hitch.h): one boundary's stage times, filed into the current gap. Armed at the perf point (hitch_frame: a synchronized
+// session after the fight HUD); the destructor (every way out of the boundary) files them and starts the guest stretch. The stage times are differences of
+// the running totals the end-of-match lines already keep (hold, audio lock, file barrier, sound server) and of jsp_snapshot.cpp's snapshot sums.
+extern "C" void jsp_stepper_hitch_take(jph::Clock* out);   // jsp_stepper.cpp: the frame clock's view of the gap that ended (the next one starts empty)
+extern "C" volatile uint32_t g_jsp_main_tid;               // jsp_stepper.cpp: the guest id of the main thread, for its late-flip sample
+extern "C" void jsp_snapshot_ext_cost_sum(double* real_ms, double* gate_ms, uint32_t* ops);   // jsp_snapshot.cpp: running sums of every commit / rollback
+struct HitchScope {
+    int64_t in; bool armed = false, rerun = false; double session = 0;
+    double hold0, audio0, fs0, cri0, snap0 = 0, gate0 = 0; uint32_t ops0 = 0;
+    HitchScope() : in(qpc_now()), hold0(g_hold_ms), audio0(g_audio_wait_ms), fs0(g_fs_wait_ms), cri0(g_cri_wait_ms) { jsp_snapshot_ext_cost_sum(&snap0, &gate0, &ops0); }
+    ~HitchScope()
+    {
+        if (!armed || !perf_on()) return;   // not armed, or the match ended in this boundary (reset_match ran)
+        const int64_t out = qpc_now();
+        double sn = 0, gt = 0; uint32_t ops = 0; jsp_snapshot_ext_cost_sum(&sn, &gt, &ops);
+        jph::add_boundary(g_hz.gap, session, sn - snap0, gt - gate0, ops - ops0, g_hold_ms - hold0, g_audio_wait_ms - audio0, g_fs_wait_ms - fs0, g_cri_wait_ms - cri0,
+                          qpc_ms(in, out));
+        g_hz_exit = out; g_hz_after_rerun = rerun;
+    }
+};
+// At the perf point, before jpperf::on_frame: the guest stretch since the last boundary joins the gap; a presented frame closes it, with one line if it was
+// a hitch (jph::close_gap: over 50 ms, the first kMaxLines of the match).
+void hitch_frame(HitchScope& hz, double pn)
+{
+    hz.armed = true;
+    if (g.ctx) g_jsp_main_tid = (uint32_t)g.ctx->thread_id;
+    if (g_hz_exit) jph::add_guest(g_hz.gap, qpc_ms(g_hz_exit, hz.in), g_hz_after_rerun);
+    g_hz_exit = 0;
+    if (g.was_replaying) return;   // this iteration presents nothing (jpperf::on_frame: not shown): the gap goes on
+    jph::Clock ck; jsp_stepper_hitch_take(&ck);
+    if (g_perf.last_frame < 0) { g_hz.gap = jph::Gap(); return; }   // the first presented frame of the match: nothing before it to measure
+    const std::string line = jph::close_gap(g_hz, pn - g_perf.last_frame, g.done_now - g.base, ck);
+    if (!line.empty()) std::fputs(line.c_str(), stderr);
+}
 void boundary(ppu_context* c)
 {
     g_toc.store((uint32_t)c->gpr[2], std::memory_order_relaxed);
     const MainStage stage_mark;
+    HitchScope hz;   // DIAGNOSTIC (per-hitch line): armed at the perf point below
     { const uint32_t hc = g_hud_calls; if (hc != g_hud_last) { g_hud_last = hc; g_hud_idle = 0; } else if (g_hud_idle < 0x7FFFFFFFu) g_hud_idle++; }
     if (!g.bench) { native_poll(); match_poll(); }   // may open, close or re-arm the link: the phase is read below
     JspTickState ts; jsp_fight_hash_get_state(&ts);
@@ -1586,9 +1628,12 @@ void boundary(ppu_context* c)
     if (jpno::cancel_held(cancel_key(), GetTickCount64(), g.cancel_since)) { g.sess.abort("match ended by the player"); end_with("Match ended"); return; }   // End match: F9 held 1.5 s
     if (g.path_until && GetTickCount64() > g.path_until) { g.path_until = 0; if (g.shown == g.path_line) show(""); }   // never blanks a later message (a reconnect or an end line)
     if (perf_on() && g.sess.synced()) {   // ENHANCEMENT (match perf summary): the frame the last iteration presented (none after a replay tick)
-        const double pn = perf_now(); jpperf::on_frame(g_perf, pn, !g.was_replaying, g.bv.delay);
+        const double pn = perf_now();
+        hitch_frame(hz, pn);   // DIAGNOSTIC (per-hitch line): before on_frame moves last_frame
+        jpperf::on_frame(g_perf, pn, !g.was_replaying, g.bv.delay);
         if (jpperf::wants_ack(g_perf)) jpperf::on_ack(g_perf, pn, g.sess.stats().acked_frame);
     }
+    const int64_t hz_s0 = qpc_now();   // DIAGNOSTIC (per-hitch line): the session part (GekkoNet update, the save or restore it calls, the time-sync stretch)
     const uint64_t u0 = g.glue->updates();
     jsx::Op op = g.glue->iteration(true);   // update is called whenever the stepper has nothing queued (skipping it for pacing stalled both peers in a two-copy test)
     // FIX (time sync, smoothness audit cause 4): GekkoNet's frames-ahead slowdown was a Sleep here, swallowed by the lockstep clock's 33.3 ms hold, so the
@@ -1602,6 +1647,7 @@ void boundary(ppu_context* c)
         if (g.bench || !jsp_stepper_lockstep_stretch_us(us)) { if (const uint32_t ms = g.sess.pace_sleep_ms(33)) Sleep(ms); }
     }
     else g.sess.poll();   // replay / regrant / stall iterations: the network is still serviced
+    hz.session = qpc_ms(hz_s0, qpc_now());
     // FIX (rollback determinism: a render-only frame flipped): an iteration where no tick may run still ran the game's frame outside the simulation phases and flipped, and every
     // flip is 2 vblanks the game counts; how many such iterations a PC has depends on its timing. While the session is synchronized, the main thread now waits
     // here (polling, asking the session again every millisecond) for up to 400 ms before a render-only frame is let through (below the 500 ms idle vblank).
@@ -1680,6 +1726,7 @@ void boundary(ppu_context* c)
     if (op.kind == jsx::OpKind::Run && !op.regrant) { g_jsp_main_stage = 4; cri_cycle(); }   // FIX (sound server lock): one cycle at this tick's time, after the audio blocks
     g_jsp_main_stage = 5;
     if (op.kind == jsx::OpKind::Run && op.replay && !op.regrant) jsp_stepper_rerun_tick(op.tick, (!g.bench && tick_log()) ? 1 : 0);   // DIAGNOSTIC (re-run stalls)
+    hz.rerun = op.kind == jsx::OpKind::Run && op.replay && !op.regrant;   // DIAGNOSTIC (per-hitch line): the guest stretch after this boundary is replay time
     const bool rep = g.stepper.replaying();
     if (g.was_replaying && !rep) jsp_stepper_replay(0, g.done_now);   // the replay's last tick is done: fast clock and effect gate off
     g.was_replaying = rep;

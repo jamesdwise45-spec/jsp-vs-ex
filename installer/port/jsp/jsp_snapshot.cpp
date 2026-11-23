@@ -209,6 +209,7 @@ Clock::time_point g_t_rb; bool g_t_rb_valid = false; double g_replay_saves = 0, 
 double g_replay_w = 0, g_last_rb_w = 0;   // the gate wait W inside the replay's commits / the rollback (recovery incl. W)
 // Toolhelp audits of the thread registry: cost and count; the audit ms of an operation is part of its real cost.
 uint32_t g_audits = 0; double g_audit_sum = 0, g_audit_max = 0, g_audit_pending_ms = 0;
+double g_hz_real_ms = 0, g_hz_gate_ms = 0; uint32_t g_hz_ops = 0;   // DIAGNOSTIC (per-hitch line): running sums, jsp_snapshot_ext_cost_sum
 // cost switches (see the header) and the cost counters of the `[snap] ww` lines and the soak line.
 bool g_thr_registry = false;        // JSP_SNAPSHOT_THREADS=registry
 uint32_t g_audit_every = 60;        // JSP_SNAPSHOT_THREADS_AUDIT (0 = baseline only)
@@ -1570,6 +1571,7 @@ bool ww_transaction(uint32_t k, ppu_context* c, uint32_t restore_to)
                   g_thr_registry ? "registry" : "toolhelp", nthr, layout_ms, close_ms, audit_ms, real_ms, g_gate_ev ? "ev" : "poll", op.gr.prechecks, op.gr.freezes, op.gr.wakes, op.gr.wake_timeouts, op.gr.retry_waits, op.gr.retry_timeouts, op.gr.retry_immediate,
                   op.presample_ms, op.gate_wait_ms, op.frozen_ms, g_ring_mode == jss::RingMode::PagePtr ? "ptr" : "copy2", op.gr.first_reasons, op.gr.first_notes);
     (restore_to == kNoTick ? g_cost_commit : g_cost_rb).add(save_ms, prep_ms, layout_ms, close_ms, audit_ms, op.presample_ms, op.gate_wait_ms, op.frozen_ms, op.collect_ms, op.apply_ms, op.gr, (uint32_t)nthr);
+    g_hz_real_ms += real_ms; g_hz_gate_ms += op.suspend_ms; g_hz_ops++;   // DIAGNOSTIC (per-hitch line): jsp_snapshot_ext_cost_sum
     if (g_ext && result.ok()) {   // ENHANCEMENT (measurement): the `[snap] cost window` percentiles (threads running)
         g_cw.note_op(restore_to == kNoTick, real_ms, op.presample_ms + op.gate_wait_ms, op.apply_ms, op.gr.freezes);
         if (restore_to != kNoTick) g_cw.rollback_done(real_ms);
@@ -1994,6 +1996,9 @@ extern "C" uint64_t jsp_snapshot_ext_pool_evicted(void)
 // hook that polls the session while a commit waits (so a long frame cannot starve the peer's disconnect timer).
 extern "C" void jsp_snapshot_ext_set_budget_ms(unsigned ms) { g_sync_ms = ms; g_gate_used_ms = 0; }
 extern "C" void jsp_snapshot_ext_budget_reset(void) { g_gate_used_ms = 0; }
+// DIAGNOSTIC (per-hitch line, jsp_hitch.h): the running sums of every commit and rollback of this process (main thread): real ms (what the main thread paid,
+// as the [snap] ww lines' real=), of it the gate (suspend=), and the operation count. The caller takes differences.
+extern "C" void jsp_snapshot_ext_cost_sum(double* real_ms, double* gate_ms, uint32_t* ops) { *real_ms = g_hz_real_ms; *gate_ms = g_hz_gate_ms; *ops = g_hz_ops; }
 extern "C" void jsp_snapshot_ext_set_idle_hook(void (*fn)()) { g_idle_hook = fn; }
 extern "C" void jsp_snapshot_ext_guard_summary(void)   // session end: how often RSX-side writes into saved memory happened (the log-only measurement)
 {
