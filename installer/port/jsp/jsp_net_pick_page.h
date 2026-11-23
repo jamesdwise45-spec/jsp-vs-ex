@@ -24,7 +24,8 @@
 //   UNSAVED  (test8) the page closed but this PC's pick block did not change (the player backed out with Circle = Back, which discards the
 //            page's edits; only Start = Finish writes them, test8 mapping run): the notice says so, the player may open the page again with
 //            their own Square (then OPEN again: the "in the room" flag still waits); no automatic Square. When the round's idle lock has locked
-//            this PC's pick (In::own_locked) the step is DONE with that pick, as with the port's picker
+//            this PC's pick (In::own_locked) the step is DONE with that pick, as with the port's picker. Only the first unchanged close
+//            is UNSAVED: a second one locks the block as it is (the same fighter picked again, or Random again, leaves it unchanged too)
 //   DONE     the pick is locked; this PC's "in the room" flag may go out (the host's start waits for every PC's flag, so it never presses
 //            "Go to battle" while another player is still on its page)
 //   FALLBACK the page could not be opened or tracked: the port's list picker, as with JSP_PICK_NATIVE_SELECT=0
@@ -118,7 +119,7 @@ struct Out {
 
 class PageStep {
 public:
-    void start(uint64_t now, const Cfg& c) { cfg_ = c; st_ = St::WAIT; t0_ = t_ = now; room_seen_ = false; room_t_ = 0; open_t_ = 0; back_t_ = 0; squares_ = 0; opens_ = 0; }
+    void start(uint64_t now, const Cfg& c) { cfg_ = c; st_ = St::WAIT; t0_ = t_ = now; room_seen_ = false; room_t_ = 0; open_t_ = 0; back_t_ = 0; squares_ = 0; opens_ = 0; unsaved_n_ = 0; }
     void stop() { st_ = St::OFF; }
     St state() const { return st_; }
     // The page step owns the pad's meaning: no notice-box Cross, no Ready Cross, no picker capture while it may be on the page.
@@ -169,7 +170,9 @@ public:
             if (!in.room_now) { back_t_ = in.now; break; }                     // a notice box or a transition: wait for the room page
             if (in.now - back_t_ < cfg_.back_ms) break;
             if (back_t_ - open_t_ < cfg_.min_open_ms && opens_ < cfg_.tries) { st_ = St::WAIT; room_seen_ = false; o.retry = true; break; }
-            if (!in.saved && !in.own_locked) { st_ = St::UNSAVED; o.unsaved = true; break; }   // Circle = Back: nothing written
+            // Circle = Back: nothing written. FIX (test8 review S1): a player who picks the same fighter again (or Random again) and finishes
+            // with Start also leaves the block unchanged; the second unchanged close takes the block as it is (no second notice, no 120 s wait)
+            if (!in.saved && !in.own_locked && unsaved_n_ == 0) { st_ = St::UNSAVED; o.unsaved = true; unsaved_n_++; break; }
             st_ = St::DONE; o.lock = true;
             break;
         case St::UNSAVED:
@@ -185,7 +188,7 @@ private:
     Cfg cfg_;
     St st_ = St::OFF;
     uint64_t t0_ = 0, t_ = 0, room_t_ = 0, open_t_ = 0, back_t_ = 0;
-    int squares_ = 0, opens_ = 0;
+    int squares_ = 0, opens_ = 0, unsaved_n_ = 0;
     bool room_seen_ = false;
 };
 
