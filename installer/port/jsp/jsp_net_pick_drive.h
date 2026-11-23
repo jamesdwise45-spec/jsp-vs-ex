@@ -9,6 +9,7 @@
 //                Never while the prompt / picker holds the pad or the host's start block is on (FIX, host test: the block swallowed all 8 Crosses of a
 //                long pick round and the box stayed until the 60 s start timeout), never on the player's own Battle settings page, never once the online loading scene
 //                ran after the room was reached (the start worked; a Cross there could skip a screen on one PC only).
+//   live_press / autopilot_pad   FIX (pick8 in-game run s1a, test path only): the AUTO_ONLINE autopilot's pad outside a match keeps the drive's press.
 //   join_ready   TODO-MAPPING (U7): the joiner's Ready Cross in the room (JSP_PICK_JOIN_READY: 0 never, 1 once per round, 2 once and then every 5 s).
 #pragma once
 #include <cstdint>
@@ -33,6 +34,16 @@ inline PadOut pad_gate(uint16_t raw, uint16_t* prev, bool capture, bool block, u
     else if (press_live) o.buttons = (uint16_t)(raw | press);
     return o;
 }
+
+// FIX (pick8 in-game run s1a, test path only): the AUTO_ONLINE autopilot (jsp_net_native.cpp, JSP_NATIVE_TRACE / AUTO_ONLINE) installs its pad filter
+// before pick_pad, so pick_pad runs first and then calls it; the autopilot wrote 0 to the pad on every step outside a running match (only its own
+// scripted press passed), which erased every press the after-match drive had just OR-ed in (the to-room Cross, the host's start Cross, the
+// notice-box Cross, the joiner's Ready). In run s1a the host's start never reached the game and the drive went "by hand" after 60 s. On a player's
+// PC there is no autopilot; nothing changes there.
+// live_press: the drive's press that pad_gate adds to a released pad right now (none while capture or block, or when not live).
+// autopilot_pad: the autopilot's buttons outside a match: its own scripted press while live, else the drive's live press, else nothing.
+inline uint16_t live_press(bool capture, bool block, uint16_t press, bool press_live) { return capture || block || !press_live ? 0 : press; }
+inline uint16_t autopilot_pad(bool scripted_live, uint16_t scripted, uint16_t pick_live) { return scripted_live ? scripted : pick_live; }
 
 // The notice-box Cross. One per post-game drive; step() once per main-thread frame.
 struct BoxIn {
