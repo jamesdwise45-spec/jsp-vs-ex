@@ -240,31 +240,13 @@ public:
         }
         return w;
     }
-    // a menu title: the game's system font in the treatment of its own title plates (chrome white-to-grey, black rim, italic lean);
-    // the overlay font when the game's font is not there
-    void title(Canvas& c, int fx, int fy, float x, float base, const std::string& s, float scale, float al, std::vector<TextOp>& ops) const
+    // a menu title, as the game's title plates ("Pause Menu", "Main Menu"): the overlay's heavy-italic menu-label font in its "off" style
+    // (white-to-grey letters, black rim, the italic lean), at the plate's cap height (kTitleCap); (x, top) = the top-left of the capitals
+    void title(float x, float top, const std::string& s, float al, std::vector<TextOp>& ops) const
     {
-        if (!font()) { ops.push_back({ fx + x, fy + base - 21.0f * 1.1f, s, 1.1f, rgba(255, 255, 255, al), 0 }); return; }
-        const jpart::Font& f = a_->font;
-        const int pad = 6, tw_ = int(f.width(s, scale)) + 2 * pad + 16, th = int(f.line * scale) + 2 * pad;
-        Canvas t; t.make(tw_, th);
-        t.text(f, float(pad), pad + f.base * scale, s, scale, 255, 255, 255, 1.0f);
-        const float top = pad + (f.base - f.cap) * scale, bot = pad + f.base * scale, lean = 0.2f;
-        auto cov = [&t](int x, int y) { return x < 0 || y < 0 || x >= t.w || y >= t.h ? 0.0f : t.c[(size_t(y) * t.w + x) * 4 + 3]; };
-        const float ox = x - pad, oy = base - (pad + f.base * scale);
-        for (int y = 0; y < th; y++) {
-            const float sh = (bot - y) * lean;
-            const float g = std::clamp((y - top) / std::max(1.0f, bot - top), 0.0f, 1.0f), v = 1.0f - 0.45f * g * g;   // white -> grey, like the plates
-            for (int xx = 0; xx < tw_; xx++) {
-                float rim = 0;
-                for (int dy = -2; dy <= 2; dy++) for (int dx = -2; dx <= 2; dx++) if (dx * dx + dy * dy <= 5) rim = std::max(rim, cov(xx + dx, y + dy));
-                const float a = cov(xx, y);
-                const int X = int(ox + xx + sh), Y = int(oy + y);
-                if (rim > 0) { c.over(X + 1, Y + 2, 0, 0, 0, rim * al * 0.9f); c.over(X, Y, 0, 0, 0, rim * al); }   // the drop and the rim
-                if (a > 0) c.over(X, Y, v * a * al, v * a * al, v * a * al, a * al);
-            }
-        }
+        ops.push_back({ x, top, s, kTitleCap / 21.0f, rgba(255, 255, 255, al), 0 });
     }
+    static constexpr float kTitleCap = 31.0f;   // the "Pause Menu" plate's capitals at 720p (its letters, rim included, span 37 px)
     // the dotted rule of the game's notice window (else a faint line)
     void dots(Canvas& c, float x, float y, float W, float al) const
     {
@@ -295,7 +277,7 @@ inline Frame menu(const Painter& P, const View& v, float open, float sweep)
     f.x = std::min(kMenuX, 1280 - 40 - W); f.y = int((kGuideY - H) / 2 + lift);
     Canvas c; c.make(W, H);
     P.panel(c, 0, 0, float(W), float(H), 64, al);
-    P.title(c, f.x, f.y, 30, 43, v.title, 1.05f, al, f.text);   // the header inside the panel's black top band
+    P.title(float(f.x + 24), float(f.y + 14), v.title, al, f.text);   // where the game's plate sits: the panel's black top band
     P.rule(c, 26, 52, float(W - 52), al);
     for (int i = 0; i < nrows; i++) {
         const float y = 70.0f + i * kRowH;

@@ -301,7 +301,7 @@ static int desk(const char* data, const char* dir, const char* bgp, const char* 
     { jpskin::View r; r.kind = jpskin::MENU; r.title = ""; r.sel = 0;
       r.rows = { { art.word("PAU_011", "Fight again"), "" }, { art.word("PAU_009", "Re-select character(s)"), "" }, { "View replay", "" }, { "Save Replay", "" }, { "Return to main menu", "" } };
       jpskin::Frame f = jpskin::menu(P, r, 1.0f, 1.0f), plate;
-      if (art.title_plate.ok()) { plate.x = f.x + 18; plate.y = f.y - 4; plate.pw = art.title_plate.w; plate.ph = art.title_plate.h; plate.pic = art.title_plate.px; }
+      if (art.title_plate.ok()) { plate.x = f.x + 20; plate.y = f.y + 9;   /* where our header sits */ plate.pw = art.title_plate.w; plate.ph = art.title_plate.h; plate.pic = art.title_plate.px; }
       preview(d0 + "game_endmenu_recon.ppm", { f, plate, jpskin::guide_bar(P, v.guide) }, bg, bw, bh); }
     const jpskin::Painter F(nullptr, [](const std::string& t, float sc) { return g_jmf_ok ? g_jmf.width(t, sc) : 0.0f; });
     preview(d0 + "fallback_prompt.ppm", { jpskin::menu(F, prompt_view(), 1.0f, 1.0f), jpskin::guide_bar(F, prompt_view().guide) }, bg, bw, bh);
