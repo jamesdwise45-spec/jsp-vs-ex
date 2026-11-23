@@ -35,6 +35,13 @@ inline uint16_t stick_dirs(uint16_t lx, uint16_t ly)
 // FIX (test8 mapping run, JSP_PICK_NATIVE_SELECT=1): the block holds back the host's start, which is a Cross. The page step's Square for the
 // Battle settings page is injected while the block is on (a pick round runs, so the host's start is not safe yet); the block dropped it and the
 // host's page never opened (two Squares, then the port picker). Under the block an injected press without Cross still goes through.
+// FIX (test8 review M2): on the game's own Battle settings page (JSP_PICK_NATIVE_SELECT=1) Cross is Confirm, and the start block (on while
+// this PC's page step runs, since the host's start waits for it) stripped the player's own Cross there: a human host could not pick. The
+// block is for the room page, where the host's Cross is "Go to battle": while this PC's page ran in the last kPageOpenMs (about 3 frames)
+// the player's own Cross passes; in the room (waiting, back, not saved) the block holds as before.
+constexpr uint64_t kPageOpenMs = 100;
+inline bool page_open(uint64_t page_seen_ms, uint64_t now) { return page_seen_ms && now >= page_seen_ms && now - page_seen_ms < kPageOpenMs; }
+inline bool own_block(bool block, uint64_t page_seen_ms, uint64_t now) { return block && !page_open(page_seen_ms, now); }
 inline uint16_t blocked_press(uint16_t press, bool press_live) { return press_live && !(press & kBtnCross) ? press : 0; }
 inline PadOut pad_gate(uint16_t raw, uint16_t* prev, bool capture, bool block, uint16_t press, bool press_live, uint16_t dirs = 0)
 {

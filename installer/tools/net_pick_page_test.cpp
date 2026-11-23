@@ -88,12 +88,16 @@ static void test_unsaved_step()
     in.now += 5000; r.p.step(in);
     in.page_now = false; in.saved = true; in.now += 100; CHECK(r.p.step(in).closed);
     in.now += 1100; o = r.p.step(in); CHECK(o.lock && r.p.state() == St::DONE && r.p.finished());
-    // a second Back on the reopened page: UNSAVED again (a notice each time)
+    // review S1: the same fighter picked again (or Random again) with Start leaves the block unchanged too: the first unchanged close is
+    // UNSAVED (a notice), the second takes the block as it is (lock, no second notice, no wait for the idle lock)
     Run q; q.start(); q.t = 1500; q.step(true, false); q.t = 1800; q.step(true, true);
     In k; k.room_now = true; k.saved = false; k.now = 6000; k.page_now = false; q.p.step(k); k.now = 7100; CHECK(q.p.step(k).unsaved);
-    k.page_now = true; k.now = 9000; CHECK(q.p.step(k).opened); k.page_now = false; k.now = 12000; q.p.step(k); k.now = 13100; CHECK(q.p.step(k).unsaved);
+    k.page_now = true; k.now = 9000; CHECK(q.p.step(k).opened); k.page_now = false; k.now = 12000; q.p.step(k); k.now = 13100;
+    o = q.p.step(k); CHECK(o.lock && !o.unsaved && q.p.state() == St::DONE && q.p.finished());
     // the round's idle lock while UNSAVED: DONE with that pick
-    k.own_locked = true; k.now = 20000; o = q.p.step(k); CHECK(o.lock && q.p.state() == St::DONE);
+    Run v; v.start(); v.t = 1500; v.step(true, false); v.t = 1800; v.step(true, true);
+    In e; e.room_now = true; e.saved = false; e.now = 6000; v.p.step(e); e.now = 7100; CHECK(v.p.step(e).unsaved);
+    e.own_locked = true; e.now = 20000; o = v.p.step(e); CHECK(o.lock && v.p.state() == St::DONE);
     // nothing saved but the round already locked this PC's pick when the page closed: lock at once, no notice
     Run w; w.start(); w.t = 1500; w.step(true, false); w.t = 1800; w.step(true, true);
     In m; m.room_now = true; m.saved = false; m.own_locked = true; m.now = 6000; w.p.step(m); m.now = 7100; o = w.p.step(m); CHECK(o.lock && !o.unsaved);

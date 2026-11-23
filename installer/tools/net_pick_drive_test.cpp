@@ -69,6 +69,17 @@ static void test_pad_gate()
     CHECK(o.buttons == 0);
     o = pad_gate(kBtnCross, &prev, false, true, kBtnSquare, true);
     CHECK(o.buttons == kBtnSquare);
+    // review M2: the player's own Cross on the game's own Battle settings page (Confirm there) passes the block while the page ran in the
+    // last kPageOpenMs; in the room (the page stale, or never seen) the block strips it as before
+    CHECK(!own_block(true, 1000, 1050) && !own_block(true, 1000, 1099) && own_block(true, 1000, 1100) && own_block(true, 0, 1050));
+    CHECK(!own_block(false, 0, 1050) && !own_block(false, 1000, 5000));
+    CHECK(own_block(true, 2000, 1000));   // a page time ahead of now (a clock read out of order): blocked
+    o = pad_gate(kBtnCross, &prev, false, own_block(true, 5000, 5033), 0, false);
+    CHECK(o.buttons == kBtnCross);         // the host on its page: Cross confirms there
+    o = pad_gate(kBtnCross, &prev, false, own_block(true, 5000, 5400), 0, false);
+    CHECK(o.buttons == 0);                 // the host back in the room, the start not safe yet: its Cross is still swallowed
+    o = pad_gate(kBtnCross, &prev, false, own_block(false, 0, 5400), 0, false);
+    CHECK(o.buttons == kBtnCross);         // the joiner (never blocked): its Cross passes on the page and in the room
     // block lifted: the injected Cross reaches the game again
     o = pad_gate(0, &prev, false, false, kBtnCross, true);
     CHECK(o.buttons == kBtnCross);
