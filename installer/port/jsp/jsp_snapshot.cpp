@@ -1578,7 +1578,8 @@ bool ww_transaction(uint32_t k, ppu_context* c, uint32_t restore_to)
                   op.presample_ms, op.gate_wait_ms, op.frozen_ms, g_ring_mode == jss::RingMode::PagePtr ? "ptr" : "copy2", op.gr.first_reasons, op.gr.first_notes);
     {   // DIAGNOSTIC (per-hitch line): where a slow gate went (test6: the joiner's 36-86 ms gates with 1 freeze and 1-54 prechecks could not be split)
         const size_t tl = std::strlen(tail);
-        std::snprintf(tail + tl, sizeof tail - tl, " spin=%.3f freeze_call=%.3f", op.spin_ms, op.freeze_call_ms);
+        static const bool on = [] { const char* e = std::getenv("JSP_HITCH_DIAG"); return !(e && e[0] == '0'); }();   // JSP_HITCH_DIAG=0: the ww line as before
+        if (on) std::snprintf(tail + tl, sizeof tail - tl, " spin=%.3f freeze_call=%.3f", op.spin_ms, op.freeze_call_ms);
     }
     (restore_to == kNoTick ? g_cost_commit : g_cost_rb).add(save_ms, prep_ms, layout_ms, close_ms, audit_ms, op.presample_ms, op.gate_wait_ms, op.frozen_ms, op.collect_ms, op.apply_ms, op.gr, (uint32_t)nthr);
     g_hz_real_ms += real_ms; g_hz_gate_ms += op.suspend_ms; g_hz_ops++;   // DIAGNOSTIC (per-hitch line): jsp_snapshot_ext_cost_sum

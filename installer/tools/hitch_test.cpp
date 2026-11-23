@@ -113,6 +113,21 @@ int main()
         const std::string s = jph::close_gap(m, 1e300, 1, c);
         CHECK(s.size() <= 1024); CHECK(s.size() > 900); CHECK(s.back() == '\n' && s.find('\n') == s.size() - 1);
     }
+    // test7: the outer cadence's own split decides a long present/pump stretch: its FIFO drain is fifo-drain, a present or a pump stays present-pump;
+    // the line names the three parts; JSP_HITCH_DIAG parsing (unset / other = on, "0" = off)
+    {
+        jph::Match m; ordinary(m.gap); m.gap.part[jph::Guest] += 45.0;
+        jph::Clock c; c.ready_late_ms = 40.0; c.take_late_ms = 41.0; c.outside_max_ms = 55.0; c.out_present_ms = 3.0; c.out_drain_ms = 50.0; c.out_pump_ms = 1.0;
+        const std::string s = jph::close_gap(m, 80.0, 1, c);
+        CHECK(has(s, "cause fifo-drain")); CHECK(has(s, "present/pump max 55.0 ms (present 3.0, drain 50.0, pump 1.0)"));
+        ordinary(m.gap); m.gap.part[jph::Guest] += 45.0;
+        jph::Clock p = c; p.out_present_ms = 50.0; p.out_drain_ms = 3.0;
+        CHECK(has(jph::close_gap(m, 80.0, 2, p), "cause present-pump"));
+        ordinary(m.gap); m.gap.part[jph::Guest] += 45.0;
+        jph::Clock u = c; u.out_pump_ms = 50.0; u.out_drain_ms = 3.0;
+        CHECK(has(jph::close_gap(m, 80.0, 3, u), "cause present-pump"));
+        CHECK(jph::diag_on_env(nullptr)); CHECK(jph::diag_on_env("1")); CHECK(jph::diag_on_env("")); CHECK(!jph::diag_on_env("0"));
+    }
     // a rollback: the re-run ticks' time is replay; the rollback is counted; no flip ready in the gap is said
     {
         jph::Match m;

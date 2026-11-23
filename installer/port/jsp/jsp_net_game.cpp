@@ -580,6 +580,8 @@ jpperf::Match g_perf; int64_t g_perf_t0 = 0;
 // DIAGNOSTIC (per-hitch line, jsp_hitch.h; always on with the perf summary): per match (reset_match), main thread. g_hz_exit = QPC when the last armed
 // boundary ended (0 = none yet), g_hz_after_rerun = that boundary granted a re-run tick (the guest stretch after it is replay time).
 jph::Match g_hz; int64_t g_hz_exit = 0; bool g_hz_after_rerun = false;
+extern "C" int jsp_hitch_diag_on(void);   // jsp_stepper.cpp: JSP_HITCH_DIAG (default 1); 0 = no stage timing, no lines
+bool hitch_on() { static const bool v = jsp_hitch_diag_on() != 0; return v; }
 double perf_now() { if (!g_perf_t0) g_perf_t0 = qpc_now(); return qpc_ms(g_perf_t0, qpc_now()); }
 bool perf_on() { return !g.bench && g.fight_seen; }
 void perf_log()
@@ -588,7 +590,7 @@ void perf_log()
     const std::string s = jpperf::lines(g_perf, path_word().c_str(), g.rrz ? "re-psn" : "direct IP", g.host ? "host" : "join", g.match_k,
                                         (double)(GetTickCount64() - g.started_ms) / 1000.0);
     std::fputs(s.c_str(), stderr);
-    std::fputs(jph::summary(g_hz).c_str(), stderr);   // DIAGNOSTIC (per-hitch line): the hitches per cause
+    if (hitch_on()) std::fputs(jph::summary(g_hz).c_str(), stderr);   // DIAGNOSTIC (per-hitch line): the hitches per cause
 }
 
 uint64_t rz_rejected() { if (auto* d = dynamic_cast<DirectRendezvous*>(g.rz.get())) return d->rejected_hello; return g.rrz ? g.rrz->rejected_members : 0; }
@@ -1280,7 +1282,7 @@ public:
         jpnb::note_rollback(g.bv, (int64_t)g.done_now - (int64_t)tick);
         adapt_note_rollback((int64_t)g.done_now - (int64_t)tick);   // ENHANCEMENT (adaptive input delay, rule 2): the depth trigger
         if (perf_on()) jpperf::on_rollback(g_perf, perf_now(), (int64_t)g.done_now - (int64_t)tick);   // ENHANCEMENT (match perf summary)
-        if (perf_on()) jph::add_rollback(g_hz.gap, g.done_now - tick);   // DIAGNOSTIC (per-hitch line)
+        if (perf_on() && hitch_on()) jph::add_rollback(g_hz.gap, g.done_now - tick);   // DIAGNOSTIC (per-hitch line)
         g_rep.rollback(g.done_now - g.base, g.done_now - tick);
         // the audio goes back with the tick (the mix thread is idle here). FIX (audio rewind dropped blocks): the save of tick T is taken at the boundary BEFORE that boundary raises
         // the audio to blocks_at(T), so the snapshot holds the guest's audio at blocks_at(T - 1): rewinding to blocks_at(T) dropped 6-7 blocks per rollback
@@ -1716,7 +1718,7 @@ struct HitchScope {
     int64_t in; bool armed = false, rerun = false; double session = 0;
     double hold_updates = 0;   // the hold loop's own session updates (and the save or restore they call): session, not hold (review of diag/hitch, S3)
     double hold0, audio0, fs0, cri0, snap0 = 0, gate0 = 0; uint32_t ops0 = 0;
-    HitchScope() : in(qpc_now()), hold0(g_hold_ms), audio0(g_audio_wait_ms), fs0(g_fs_wait_ms), cri0(g_cri_wait_ms) { jsp_snapshot_ext_cost_sum(&snap0, &gate0, &ops0); }
+    HitchScope() : in(0), hold0(g_hold_ms), audio0(g_audio_wait_ms), fs0(g_fs_wait_ms), cri0(g_cri_wait_ms) { if (hitch_on()) { in = qpc_now(); jsp_snapshot_ext_cost_sum(&snap0, &gate0, &ops0); } }
     ~HitchScope()
     {
         if (!armed || !perf_on()) return;   // not armed, or the match ended in this boundary (reset_match ran)
@@ -1731,6 +1733,7 @@ struct HitchScope {
 // a hitch (jph::close_gap: over 50 ms, the first kMaxLines of the match).
 void hitch_frame(HitchScope& hz, double pn)
 {
+    if (!hitch_on()) return;   // JSP_HITCH_DIAG=0: never armed, nothing timed or written
     hz.armed = true;
     if (g.ctx) g_jsp_main_tid = (uint32_t)g.ctx->thread_id;
     if (g_hz_exit) jph::add_guest(g_hz.gap, qpc_ms(g_hz_exit, hz.in), g_hz_after_rerun);
@@ -1803,7 +1806,7 @@ void boundary(ppu_context* c)
         jpperf::on_frame(g_perf, pn, !g.was_replaying, g.bv.delay);
         if (jpperf::wants_ack(g_perf)) jpperf::on_ack(g_perf, pn, g.sess.stats().acked_frame);
     }
-    const int64_t hz_s0 = qpc_now();   // DIAGNOSTIC (per-hitch line): the session part (GekkoNet update, the save or restore it calls, the time-sync stretch)
+    const int64_t hz_s0 = hz.armed ? qpc_now() : 0;   // DIAGNOSTIC (per-hitch line): the session part (GekkoNet update, the save or restore it calls, the time-sync stretch)
     const uint64_t u0 = g.glue->updates();
     jsx::Op op = g.glue->iteration(true);   // update is called whenever the stepper has nothing queued (skipping it for pacing stalled both peers in a two-copy test)
     // FIX (time sync, smoothness audit cause 4): GekkoNet's frames-ahead slowdown was a Sleep here, swallowed by the lockstep clock's 33.3 ms hold, so the
@@ -1820,7 +1823,7 @@ void boundary(ppu_context* c)
     }
     else g.sess.poll();   // replay / regrant / stall iterations: the network is still serviced
     g_ps3_audio_lock_stretch_us = (int)audio_stretch_us;
-    hz.session = qpc_ms(hz_s0, qpc_now());
+    if (hz.armed) hz.session = qpc_ms(hz_s0, qpc_now());
     // FIX (rollback determinism: a render-only frame flipped): an iteration where no tick may run still ran the game's frame outside the simulation phases and flipped, and every
     // flip is 2 vblanks the game counts; how many such iterations a PC has depends on its timing. While the session is synchronized, the main thread now waits
     // here (polling, asking the session again every millisecond) for up to 400 ms before a render-only frame is let through (below the 500 ms idle vblank).
@@ -1830,9 +1833,9 @@ void boundary(ppu_context* c)
         while (op.kind != jsx::OpKind::Run && qpc_ms(h0, qpc_now()) < 400.0 && !g.sess.failed()) {
             Sleep(1); g.sess.poll();
             const uint64_t u1 = g.glue->updates();
-            const int64_t hu0 = qpc_now();   // DIAGNOSTIC (per-hitch line): the update and any save it calls are session time, not hold
+            const int64_t hu0 = hz.armed ? qpc_now() : 0;   // DIAGNOSTIC (per-hitch line): the update and any save it calls are session time, not hold
             op = g.glue->iteration(true);
-            hz.hold_updates += qpc_ms(hu0, qpc_now());
+            if (hz.armed) hz.hold_updates += qpc_ms(hu0, qpc_now());
             if (g.glue->updates() != u1) jsp_snapshot_ext_budget_reset();
         }
         g_hold_ms += qpc_ms(h0, qpc_now()); g_holds++; if (op.kind != jsx::OpKind::Run) g_hold_renders++;
