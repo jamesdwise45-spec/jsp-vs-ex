@@ -52,7 +52,7 @@ static void test_pad_gate()
     // capture wins over block
     o = pad_gate(kBtnCircle, &prev, true, true, 0, false);
     CHECK(o.buttons == 0 && o.centre && o.edges == kBtnCircle);
-    // late-pick block (the host's start): the player's own Cross is swallowed, other buttons pass, and NO injected press goes through
+    // late-pick block (the host's start): the player's own Cross is swallowed, other buttons pass, and NO injected Cross goes through
     prev = 0;
     o = pad_gate(kBtnCross | kBtnSquare, &prev, false, true, kBtnCross, true);
     CHECK(o.buttons == kBtnSquare && !o.centre && o.edges == (kBtnCross | kBtnSquare));
@@ -60,6 +60,15 @@ static void test_pad_gate()
     CHECK(o.buttons == 0);
     o = pad_gate(kBtnCircle, &prev, false, true, kBtnCross, true);
     CHECK(o.buttons == kBtnCircle);   // Leave stays possible in the room (Circle) while the start is blocked
+    // test8 mapping run: the page step's injected Square goes through the block (the host's Battle settings page must open); a Cross in it does not
+    o = pad_gate(0, &prev, false, true, kBtnSquare, true);
+    CHECK(o.buttons == kBtnSquare);
+    o = pad_gate(0, &prev, false, true, kBtnSquare, false);
+    CHECK(o.buttons == 0);
+    o = pad_gate(0, &prev, false, true, (uint16_t)(kBtnSquare | kBtnCross), true);
+    CHECK(o.buttons == 0);
+    o = pad_gate(kBtnCross, &prev, false, true, kBtnSquare, true);
+    CHECK(o.buttons == kBtnSquare);
     // block lifted: the injected Cross reaches the game again
     o = pad_gate(0, &prev, false, false, kBtnCross, true);
     CHECK(o.buttons == kBtnCross);
@@ -101,6 +110,14 @@ static void test_autopilot_pad()
     CHECK(reach_old == 0);    // the stuck hand-off of run s1a
     // the host's late-pick block still holds the start back through the autopilot
     CHECK(autopilot_pad(false, 0, live_press(false, true, kBtnCross, true)) == 0);
+    // ... and the host's page Square reaches the game through the autopilot under the block (test8 mapping run: it never did)
+    CHECK(autopilot_pad(false, 0, live_press(false, true, kBtnSquare, true)) == kBtnSquare);
+    // live_press is what pad_gate adds to a released pad, under every gate
+    for (int cap = 0; cap < 2; cap++) for (int blk = 0; blk < 2; blk++) for (int lv = 0; lv < 2; lv++)
+        for (uint16_t pr : { (uint16_t)0, kBtnCross, kBtnSquare, (uint16_t)(kBtnCross | kBtnSquare) }) {
+            uint16_t pv = 0;
+            CHECK(pad_gate(0, &pv, cap, blk, pr, lv).buttons == live_press(cap, blk, pr, lv));
+        }
 }
 
 // ---- 2. the notice-box Cross ----
