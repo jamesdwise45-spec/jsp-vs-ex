@@ -162,7 +162,7 @@ int main()
         jph::Match m; ordinary(m.gap); jph::close_gap(m, 33.0, 1, jph::Clock());
         warm += 7; cold += 3; ms += 120.0;
         const std::string s = jph::summary(m);
-        CHECK(has(s, " | pipelines: 7 warm, 3 cold (120 ms building)\n"));
+        CHECK(has(s, " | pipelines: 7 warm, 3 cold (120 thread-ms building)\n"));
         CHECK(has(s, "hitch causes: none | 0 lines written, 0 not (cap 60) | pipelines"));
         jph::g_pipeline_counts = nullptr;
     }

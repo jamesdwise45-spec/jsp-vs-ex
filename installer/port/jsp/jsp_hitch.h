@@ -188,7 +188,7 @@ inline std::string summary(const Match& m)
     if (m.pipes0.ok) {   // DIAGNOSTIC (toolkit 2922): pipelines the fight asked for, warm (built ahead) vs cold (built during the fight)
         const Pipes p = pipes_now();
         char pb[128];
-        std::snprintf(pb, sizeof pb, " | pipelines: %ld warm, %ld cold (%.0f ms building)", p.warm - m.pipes0.warm, p.cold - m.pipes0.cold,
+        std::snprintf(pb, sizeof pb, " | pipelines: %ld warm, %ld cold (%.0f thread-ms building)", p.warm - m.pipes0.warm, p.cold - m.pipes0.cold,
                       p.cold_ms - m.pipes0.cold_ms);
         s += pb;
     }

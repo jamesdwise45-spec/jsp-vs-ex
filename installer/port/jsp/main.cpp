@@ -264,25 +264,35 @@ static void log_cpu_topology(void)
         off += size;
     }
     free(buf);
-    char line[512]; int n = 0, classes = 0;
+    char line[512]; size_t n = 0; int classes = 0;
+    /* append, clamped: n never passes the buffer, a full line is cut, never overrun */
+    auto add = [&](const char* fmt, auto... a) {
+        if (n >= sizeof line - 1) return;
+        const int k = snprintf(line + n, sizeof line - n, fmt, a...);
+        if (k > 0) n += (size_t)k < sizeof line - n ? (size_t)k : sizeof line - 1 - n;
+    };
     for (int c = 255; c >= 0; c--) if (cores[c]) classes++;
-    n += snprintf(line + n, sizeof line - n, "[cpu] %u cores, %u logical processors: ", n_cores, n_threads);
-    if (classes <= 1) n += snprintf(line + n, sizeof line - n, "not hybrid (one efficiency class)");
+    add("[cpu] %u cores, %u logical processors: ", n_cores, n_threads);
+    if (classes <= 1) add("%s", "one efficiency class reported (not hybrid, or Windows does not say)");
     else {
-        n += snprintf(line + n, sizeof line - n, "HYBRID,");
-        bool first = true;
-        for (int c = 255; c >= 0 && n < (int)sizeof line - 80; c--) if (cores[c]) {
-            n += snprintf(line + n, sizeof line - n, "%s %u %s (%u threads, class %d)", first ? "" : " +", cores[c], first ? "P-cores" : "E-cores", threads[c], c);
-            first = false;
+        add("%s", "HYBRID,");
+        int rank = 0;   /* the fastest class is P; with 2 classes the other is E; with 3+ the rest are E1, E2, ... (E1 the faster) */
+        for (int c = 255; c >= 0; c--) if (cores[c]) {
+            char lab[16];
+            if (rank == 0) snprintf(lab, sizeof lab, "P-cores");
+            else if (classes == 2) snprintf(lab, sizeof lab, "E-cores");
+            else snprintf(lab, sizeof lab, "E%d-cores", rank);
+            add("%s %u %s (%u threads, class %d)", rank ? " +" : "", cores[c], lab, threads[c], c);
+            rank++;
         }
     }
     SYSTEM_POWER_STATUS ps;
     if (GetSystemPowerStatus(&ps)) {   /* ACLineStatus 0 battery, 1 AC, 255 unknown; byte 3 (SystemStatusFlag, Windows 10+): 1 = battery saver on */
         const unsigned char saver = ((const unsigned char*)&ps)[3];
-        if (ps.ACLineStatus == 1) n += snprintf(line + n, sizeof line - n, "; power: AC");
-        else if (ps.ACLineStatus == 0) n += snprintf(line + n, sizeof line - n, "; power: BATTERY (%u %%)", (unsigned)ps.BatteryLifePercent);
-        else n += snprintf(line + n, sizeof line - n, "; power: unknown");
-        if (saver == 1) n += snprintf(line + n, sizeof line - n, ", battery saver ON");
+        if (ps.ACLineStatus == 1) add("%s", "; power: AC");
+        else if (ps.ACLineStatus == 0) add("; power: BATTERY (%u %%)", (unsigned)ps.BatteryLifePercent);
+        else add("%s", "; power: unknown");
+        if (saver == 1) add("%s", ", battery saver ON");
     }
     fprintf(stderr, "%s\n", line);
 }
@@ -724,23 +734,29 @@ int main(int argc, char** argv)
      * thing. POSIX timers are already fine-grained. */
     const bool timer_ok = timeBeginPeriod(1) == 0;   /* TIMERR_NOERROR */
     const bool hprio = host_prio_on();
-    bool pt_ok = false;
+    int eco_ok = -1, tr_ok = -1;   /* -1 not tried, 0 failed, 1 ok */
     {   /* Windows 11 drops a process's timer resolution back to ~15.6 ms while its window is covered or minimized (power throttling), so every
          * Sleep(1) of the game and of the rollback gate would take a whole timer tick. Opt out of that (the call fails harmlessly on older Windows). */
         /* Looked up at run time: SetProcessInformation and its power-throttling types are Windows 8+/10+ declarations, missing
          * from the headers at the toolkit's default _WIN32_WINNT (the CI syntax check). Values from processthreadsapi.h:
          * ProcessPowerThrottling = 4, PROCESS_POWER_THROTTLING_CURRENT_VERSION = 1, ..._IGNORE_TIMER_RESOLUTION = 0x4. */
-        /* ENHANCEMENT (hybrid CPUs): also ..._EXECUTION_SPEED = 0x1, the EcoQoS opt-out, unless HOST_PRIO=0 (see host_prio_on). */
-        struct { ULONG Version, ControlMask, StateMask; } pt = { 1u, hprio ? 0x5u : 0x4u, 0u };   /* StateMask 0 = never throttle */
+        /* ENHANCEMENT (hybrid CPUs): first ..._EXECUTION_SPEED = 0x1, the EcoQoS opt-out, unless HOST_PRIO=0 (see host_prio_on). Two calls:
+         * IGNORE_TIMER_RESOLUTION is Windows 11 only, and Windows 10 refuses a mask that names it, which would lose the EcoQoS opt-out on the
+         * Windows 10 hybrid laptops this is for. StateMask 0 = never throttle. */
+        struct PT { ULONG Version, ControlMask, StateMask; };
         using SetProcInfo = BOOL (WINAPI*)(HANDLE, int, LPVOID, DWORD);
-        if (const auto set = (SetProcInfo)(void*)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetProcessInformation"))
-            pt_ok = set(GetCurrentProcess(), 4, &pt, (DWORD)sizeof pt) != 0;
+        if (const auto set = (SetProcInfo)(void*)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetProcessInformation")) {
+            if (hprio) { PT pt = { 1u, 0x1u, 0u }; eco_ok = set(GetCurrentProcess(), 4, &pt, (DWORD)sizeof pt) != 0; }
+            PT pt = { 1u, 0x4u, 0u };
+            tr_ok = set(GetCurrentProcess(), 4, &pt, (DWORD)sizeof pt) != 0;
+        }
     }
     /* ENHANCEMENT (hybrid CPUs): what was applied, in one line, and the CPU topology. The audio mix thread is unchanged: it raises itself
      * to time-critical with MMCSS "Pro Audio" (toolkit cellAudio.c) and waits on the device event, and the 1 ms timer above covers its
      * Sleep(1) and short timeouts. */
-    fprintf(stderr, "[host] timer 1 ms %s; process power throttling off for timer resolution%s: %s; HOST_PRIO %s\n", timer_ok ? "ok" : "FAILED",
-            hprio ? " and execution speed (EcoQoS)" : "", pt_ok ? "ok" : "failed (older Windows)",
+    auto res = [](int r) { return r < 0 ? "not tried" : r ? "ok" : "failed"; };
+    fprintf(stderr, "[host] timer 1 ms %s; process EcoQoS (execution speed) off: %s; timer-resolution throttling off: %s%s; HOST_PRIO %s\n",
+            timer_ok ? "ok" : "FAILED", hprio ? res(eco_ok) : "no (HOST_PRIO=0)", res(tr_ok), tr_ok == 0 ? " (Windows 10: expected)" : "",
             hprio ? "on: frame clock and PIPE threads above normal, EcoQoS off (own lines follow)" : "=0: Windows default thread priorities and EcoQoS");
     log_cpu_topology();
     jph::g_pipeline_counts = rsx_d3d12_pipeline_counts;   /* DIAGNOSTIC (toolkit 2922): pipelines warm / cold on the per-match [perf] hitch causes line */
