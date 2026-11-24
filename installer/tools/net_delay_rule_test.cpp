@@ -208,6 +208,18 @@ int main()
         Sim m; m.p.hi = 3; m.p.clamp(); m.rtt = [](uint64_t) { return 400.0; };
         CHECK(m.run(30000) == 3);
     }
+    // time sync stretch: unchanged up to 1.5 frames ahead; steeper beyond; capped; the earlier rule with gain 1000 / max 2000
+    {
+        CHECK(jpdr::timesync_stretch_us(0.0f, 5000, 25000) == 0);
+        CHECK(jpdr::timesync_stretch_us(0.5f, 5000, 25000) == 0);
+        CHECK(jpdr::timesync_stretch_us(1.0f, 5000, 25000) == 500);
+        CHECK(jpdr::timesync_stretch_us(1.5f, 5000, 25000) == 1000);
+        CHECK(jpdr::timesync_stretch_us(-3.0f, 5000, 25000) == 0);
+        CHECK(std::abs((int)jpdr::timesync_stretch_us(4.7f, 5000, 25000) - 17000) <= 1);   // ~4.7 frames ahead holds a 20 ticks/s peer (33.3 + 17 ms a tick)
+        CHECK(jpdr::timesync_stretch_us(8.0f, 5000, 25000) == 25000);
+        for (float a = 0.0f; a < 8.0f; a += 0.25f)   // the earlier rule: min(2000, (a - 0.5) * 1000)
+            CHECK(jpdr::timesync_stretch_us(a, 1000, 2000) == (a > 0.5f ? (uint32_t)std::min(2000.0f, (a - 0.5f) * 1000.0f) : 0u));
+    }
     std::printf("net delay rule: %d checks, %d failed\n", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }

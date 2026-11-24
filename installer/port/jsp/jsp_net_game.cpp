@@ -542,6 +542,8 @@ jpdr::Params g_ad_p;
 // rollback, and so the longest hitch, at N ticks (testers: 8-tick rollbacks). Each PC alone: it only changes when this PC waits, never which inputs a tick
 // simulates. Host simulation (PR #248, Update 3): 6 is neutral to slightly better than 8 on 99-129 ms links; 4 or lower is worse (waits replace hitches).
 int g_ad_pred = 6;
+int g_ts_gain_us = 5000, g_ts_max_us = 25000;   // FIX (time sync can't follow a slow PC): JSP_TIMESYNC_GAIN_US / _MAX_US (jsp_net_delay_rule.h)
+int g_test_slow_ms = 0;                         // TEST: JSP_TEST_SLOW_MS, ms slept at every session update (a slow PC in two-copy runs)
 void adapt_settings()
 {
     if (g_ad_on >= 0) return;
@@ -557,6 +559,10 @@ void adapt_settings()
     num("JSP_INPUT_DELAY_AUTO_DEEP_TICKS", p.deep_ticks); num("JSP_INPUT_DELAY_AUTO_DEEP_COUNT", p.deep_count);
     num("JSP_INPUT_DELAY_AUTO_DEEP_WINDOW_MS", p.deep_window_ms); num("JSP_INPUT_DELAY_AUTO_HOLD_MS", p.hold_ms);
     num("JSP_ROLLBACK_PREDICTION", g_ad_pred);
+    num("JSP_TIMESYNC_GAIN_US", g_ts_gain_us); num("JSP_TIMESYNC_MAX_US", g_ts_max_us); num("JSP_TEST_SLOW_MS", g_test_slow_ms);
+    g_ts_gain_us = std::min(std::max(g_ts_gain_us, 0), 20000); g_ts_max_us = std::min(std::max(g_ts_max_us, 0), 50000); g_test_slow_ms = std::min(std::max(g_test_slow_ms, 0), 100);
+    std::fprintf(stderr, "[net] time sync: up to %d us longer per tick, %d us per frame ahead beyond 1.5 (JSP_TIMESYNC_GAIN_US / _MAX_US)%s\n", g_ts_max_us, g_ts_gain_us,
+                 g_test_slow_ms ? " -- TEST: JSP_TEST_SLOW_MS is set, this copy sleeps at every tick" : "");
     g_ad_pred = std::min(std::max(g_ad_pred, 1), 8);
     if (g_ad_pred != 8) std::fprintf(stderr, "[net] prediction window %d ticks (JSP_ROLLBACK_PREDICTION; 8 = as before)\n", g_ad_pred);
     p.clamp();
@@ -1830,8 +1836,10 @@ void boundary(ppu_context* c)
     uint32_t audio_stretch_us = 0;   // FIX (choppy fight audio): the stretch the lockstep clock took for the next period, for the audio output (0: none, the bench, clock off)
     if (g.glue->updates() != u0) {
         jsp_snapshot_ext_budget_reset();
+        adapt_settings();   // the time-sync switches (read once)
         const float ahead = g.bench ? 0.f : g.sess.frames_ahead();
-        const uint32_t us = ahead > 0.5f ? (uint32_t)std::min(2000.0f, (ahead - 0.5f) * 1000.0f) : 0u;
+        const uint32_t us = jpdr::timesync_stretch_us(ahead, g_ts_gain_us, g_ts_max_us);   // FIX (time sync can't follow a slow PC): jsp_net_delay_rule.h
+        if (g_test_slow_ms > 0) Sleep((DWORD)g_test_slow_ms);   // TEST (JSP_TEST_SLOW_MS): this copy plays a slow PC (two-copy runs only; default 0)
         if (g.bench || !jsp_stepper_lockstep_stretch_us(us)) { if (const uint32_t ms = g.sess.pace_sleep_ms(33)) Sleep(ms); }
         else audio_stretch_us = us;
     }
