@@ -1340,14 +1340,6 @@ void Gekko::MessageSystem::OnDisconnectClaim(NetAddress& addr, NetPacket& pkt)
         return;
     }
 
-    // jsp-vs-ex local addition (claims from a gone sender): a peer this session already marked Disconnected no longer takes part in the
-    // agreement, so its claims about the others are ignored (with 3-4 peers a leaver's late claims dropped live peers on the PCs that remained).
-    for (auto& peer : remotes) {
-        if (peer->address.Equals(addr) && peer->GetStatus() == Disconnected) {
-            return;
-        }
-    }
-
     if (plyr->GetStatus() != Disconnected) {
         MarkActorDisconnected(plyr);
     }
