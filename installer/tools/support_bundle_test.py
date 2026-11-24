@@ -51,6 +51,7 @@ def main():
         w(app / "VERSION.txt", "0.18.0-test\n")
         w(app / "EBOOT.log", "named like an EBOOT\n")
         w(app / "root.sav", "save")
+        w(app / "facts.txt", "GPU: Stray Old GPU 12 GB\n")   # an unpacked earlier bundle's facts.txt beside the game
         w(ad / sb.APPDIR / "play_settings.txt", "FULLSCREEN=0\n")
         w(tmp / "Setup Log 2026-01-01 #001.txt", "Log opened\nAppDir: C:\\Program Files\\JSP Fan Revival\n")
         w(tmp / "Setup Log 2026-01-01 #002.txt", "an unrelated installer\n")
@@ -83,6 +84,20 @@ def main():
         fo = sb.facts(old, {}, [], [], [], [])
         check("jsp.exe: present" not in fo and "JStarsRecomp" not in fo, "facts: only jsp.exe counts as the game")
         check("GPU: Test Adapter 9000" in f, "facts: GPU name from a log line")
+        check("Stray Old GPU" not in f and "facts.txt (an earlier bundle's facts.txt" in f and f.count("\n  facts.txt\n") == 1,
+              "facts: an earlier bundle's facts.txt in the install folder is refused, listed once, and not read for the GPU")
+        dev = b'[D3D12] device (d3d12 backend, adapter by GPU preference): "Test Laptop GPU" vendor=0x10DE device=0x1234 software=0 VRAM 3965 MB\r\n'
+        old_dev = b'[D3D12] device (d3d12 backend, adapter by GPU preference): "Old GPU" vendor=0x10DE device=0x1 software=0 VRAM 12115 MB\n'
+        rg = sb.render_gpu({"facts.txt": b'GPU: "Other GPU" VRAM 12115 MB\n', "a.log": old_dev, "game/run/play_stdout.txt": old_dev + dev})
+        check(rg == ('"Test Laptop GPU" vendor=0x10DE device=0x1234 software=0 VRAM 3965 MB (from game/run/play_stdout.txt)', "Test Laptop GPU", 3965),
+              "GPU: the newer [D3D12] device line, the last one of the last launch's stdout; an old facts.txt and other logs lose")
+        check(sb.gpu_name({"facts.txt": b"GPU: Other GPU\n"}) == "not found in the logs", "GPU: an earlier bundle's facts.txt is never read for the GPU")
+        hm = [{"name": "\\\\.\\DISPLAY1", "adapter": "Intel(R) UHD Graphics", "primary": True, "handle": 11}]
+        hy = sb.hybrid_line("Test Laptop GPU", hm, (11, "1536x864"))
+        check(len(hy) == 1 and "game window's display is driven by Intel(R) UHD Graphics" in hy[0] and "hybrid" in hy[0], "GPU: hybrid note when the window's display is on another adapter")
+        check("primary display (the game was not running)" in sb.hybrid_line("Test Laptop GPU", hm, (None, ""))[0], "GPU: hybrid note falls back to the primary display")
+        check(sb.hybrid_line("Intel UHD Graphics", hm, (11, "")) == [] and sb.hybrid_line("", hm, (11, "")) == [] and sb.hybrid_line("x", [], (None, "")) == [],
+              "GPU: no hybrid note when the adapters match or are unknown")
         g = sb.gpu_name({"a.log": b"[spu] gpu sync: 3 waits\n", "game/run/play_stdout.txt": b"[D3D12] adapter: Test GPU (VRAM 8 MB)\r\n"})
         check(g == "Test GPU (VRAM 8 MB) (from game/run/play_stdout.txt)", "GPU: the [D3D12] adapter line wins over a looser match")
         pm = sb.present_mode({"a.log": b"x\n", "game/run/play_stdout.txt": b"[D3D12] present: no wait for the monitor (default)\r\n[D3D12] present: waits for the monitor's vblank (D3D12_VSYNC=1)\n"})
