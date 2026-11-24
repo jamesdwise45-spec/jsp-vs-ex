@@ -5,6 +5,9 @@
 // What it measures (all wall time on this PC, milliseconds):
 //   input    press -> shown: a button newly pressed on the local pad (local_pad) until the frame that runs the tick with that press is presented (the
 //            first live Advance whose local input holds the press, then the next presented frame). It includes the input delay.
+//            FIX (press->shown under-measured, test10 research: p50 70 ms at delay 4, whose floor is 133 ms): the press's own frame is the first live
+//            Advance at or after the frame the press lands on (the last live frame + 1 + this PC's input delay at the press, as GekkoNet's AddLocalInput
+//            stamps it); a frame before that holding the same button is an earlier press still inside the delay pipeline.
 //            press -> remote ack: until the other PC acknowledged the GekkoNet frame that carries the press (its last_acked_frame, read at each frame
 //            while a press waits: boundary resolution, about 33 ms). One press is followed at a time; presses while one waits are not sampled, a press
 //            not seen within 2 s is dropped (counted as timed out).
@@ -52,6 +55,8 @@ struct Match {
     // input
     uint16_t prev_buttons = 0;
     bool waiting = false; double press_t = 0; uint16_t press_bits = 0; int press_frame = -1; bool applied = false, acked = false;
+    int last_live = -1;    // the newest live (not rolling back) Advance frame seen
+    int press_min = -1;    // the frame the waiting press lands on: earlier frames are not its own
     struct Ack { int frame; double t; } ack[32] = {}; int ack_n = 0; int ack_last = -2;
     uint32_t presses = 0, timeouts = 0; Dist apply, confirm;
 };
@@ -87,14 +92,16 @@ inline void on_rollback(Match& m, double now, int64_t depth)
     if (m.replay_t < 0) m.replay_t = now;
 }
 
-// The local pad's buttons sampled for an update (local player 0). A newly pressed button starts a sample when none waits.
-inline void on_local(Match& m, double now, uint16_t buttons)
+// The local pad's buttons sampled for an update (local player 0), with this PC's input delay now (ticks). A newly pressed button starts a sample when none
+// waits; it lands on the frame after the last live one + the delay (before any live frame was seen: on frame `delay`, as GekkoNet's first one).
+inline void on_local(Match& m, double now, uint16_t buttons, int delay = 0)
 {
     const uint16_t fresh = (uint16_t)(buttons & ~m.prev_buttons);
     m.prev_buttons = buttons;
     press_check(m, now);
     if (!fresh || m.waiting) return;
     m.waiting = true; m.press_t = now; m.press_bits = fresh; m.press_frame = -1; m.applied = m.acked = false; m.ack_n = 0; m.ack_last = -2; m.presses++;
+    m.press_min = m.last_live + 1 + (delay > 0 ? delay : 0);
 }
 
 inline void ack_resolve(Match& m)
@@ -103,10 +110,13 @@ inline void ack_resolve(Match& m)
     for (int i = 0; i < m.ack_n; i++) if (m.ack[i].frame >= m.press_frame) { m.acked = true; m.confirm.add(m.ack[i].t - m.press_t); return; }
 }
 
-// An Advance event for GekkoNet frame `frame` whose input of this PC's local player 0 is `local_buttons`. The first live one holding the press is its frame.
+// An Advance event for GekkoNet frame `frame` whose input of this PC's local player 0 is `local_buttons`. The first live one at or after the frame the press
+// lands on (press_min) and holding the press is its frame.
 inline void on_advance(Match& m, int frame, bool rolling_back, uint16_t local_buttons)
 {
-    if (!m.waiting || m.press_frame >= 0 || rolling_back || (local_buttons & m.press_bits) != m.press_bits) return;
+    if (rolling_back) return;
+    if (frame > m.last_live) m.last_live = frame;
+    if (!m.waiting || m.press_frame >= 0 || frame < m.press_min || (local_buttons & m.press_bits) != m.press_bits) return;
     m.press_frame = frame;
     ack_resolve(m);
 }

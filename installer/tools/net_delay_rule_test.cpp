@@ -1,6 +1,7 @@
 // net_delay_rule_test.cpp -- host test of the adaptive input delay decision (installer/port/jsp/jsp_net_delay_rule.h): rule 1 is the
 // 2026-11-21 formula unchanged, rule 2's percentile trip, high-ping margin, fight-start guard, depth trigger, hold and one-tick lowering, and the RTT
-// sampling fix (only a round trip whose GekkoNet count is new enters the window).
+// sampling fix (only a round trip whose GekkoNet count is new enters the window). test10: the start at 3, the deadband against 2 <-> 3 flapping, no
+// depth trigger while the time sync stretches for a slow peer, and the rematch carry (carry_keep / carry_start).
 // A fake clock and fake stats; no GekkoNet. Run by net_delay_rule_test.sh.
 #include "jsp_net_delay_rule.h"
 
@@ -21,6 +22,7 @@ struct Sim {
     jpdr::Params p; jpdr::State s; int cur = 2; uint64_t t = 100000;
     std::function<double(uint64_t)> rtt = [](uint64_t) { return 100.0; };   // single round trip measured at time t (ms since start)
     double avg = 100, jit = 2;
+    uint32_t stretch = 0;   // Reading::stretch_us
     uint64_t t0 = 0, step_ms = 33, ping_every = 500;
     bool fresh_every_poll = false, pings = true;
     uint32_t seq = 0; double last = -1; uint32_t reads = 0;
@@ -32,7 +34,7 @@ struct Sim {
         reads++;
         if (fresh_every_poll) { seq++; last = rtt(t - t0); }
         else if (pings) { const uint32_t k = (uint32_t)((t - t0) / ping_every) + 1; if (k != seq) { seq = k; last = rtt(t - t0); } }
-        jpdr::Reading r; r.ping_avg = avg; r.jitter = jit; r.last_ping = last; r.rtt_seq = seq; r.cur = cur; return r;
+        jpdr::Reading r; r.ping_avg = avg; r.jitter = jit; r.last_ping = last; r.rtt_seq = seq; r.cur = cur; r.stretch_us = stretch; return r;
     }
     // runs ms of live ticks (one per step_ms); returns the delay
     int run(uint64_t ms)
@@ -219,6 +221,92 @@ int main()
         CHECK(jpdr::timesync_stretch_us(8.0f, 5000, 25000) == 25000);
         for (float a = 0.0f; a < 8.0f; a += 0.25f)   // the earlier rule: min(2000, (a - 0.5) * 1000)
             CHECK(jpdr::timesync_stretch_us(a, 1000, 2000) == (a > 0.5f ? (uint32_t)std::min(2000.0f, (a - 0.5f) * 1000.0f) : 0u));
+    }
+    // test10, the start at 3 (the manifest default): a link that needs less still comes down by the normal votes, one tick at a time
+    {
+        Sim a; a.p.clamp(); a.cur = 3; a.rtt = [](uint64_t) { return 60.0; };   // (60 - 30) / 2 + 8 = 23 ms -> 1
+        CHECK(a.run(11000) == 3);   // readings at 4..10 s: five calm votes are not in yet
+        CHECK(a.run(2000) == 2);    // the fifth at 12 s: one tick down
+        CHECK(a.run(20000) == 1);
+        Sim b; b.p.clamp(); b.cur = 3; b.rtt = [](uint64_t) { return 115.0; };  // 56.8 ms: 2 ticks, and 56.8 + 4 still fits in 2
+        CHECK(b.run(40000) == 2); CHECK(b.changes == 1);
+        // the guard with a start of 3: before 10 s no decision goes above 4
+        Sim c; c.p.clamp(); c.cur = 3; c.rtt = [](uint64_t) { return 400.0; };
+        CHECK(c.run(9900) == 4); CHECK(c.s.start_delay == 3);
+    }
+    // test10, the deadband (4 ms): a need just over a tick boundary keeps the delay; past the band it moves
+    {
+        // median 138 (margin 16): need (138 - 33.3) / 2 + 16 = 68.3 ms, 1.7 ms over 2 ticks: kept at 2 (without the band: 3)
+        Sim a; a.p.clamp(); a.cur = 2; a.rtt = [](uint64_t) { return 138.0; };
+        CHECK(a.run(40000) == 2); CHECK(a.changes == 0);
+        Sim a0; a0.p.deadband_ms = 0; a0.p.clamp(); a0.cur = 2; a0.rtt = [](uint64_t) { return 138.0; };
+        CHECK(a0.run(40000) == 3);
+        // median 146: need 72.3 ms, past 66.7 + 4: up at the first reading
+        Sim b; b.p.clamp(); b.cur = 2; b.rtt = [](uint64_t) { return 146.0; };
+        b.run(4100); CHECK(b.cur == 3);
+        // down from 3 needs the need + 4 inside 2 ticks: median 130 -> 64.3 ms, + 4 = 68.3 > 66.7: kept; median 120 -> 59.3 ms: down
+        Sim c; c.p.clamp(); c.cur = 3; c.rtt = [](uint64_t) { return 130.0; };
+        CHECK(c.run(60000) == 3); CHECK(c.changes == 0);
+        Sim d; d.p.clamp(); d.cur = 3; d.rtt = [](uint64_t) { return 120.0; };
+        CHECK(d.run(30000) == 2);
+        // a delay below MIN still goes up to MIN at once
+        Sim e; e.p.lo = 2; e.p.clamp(); e.cur = 1; e.rtt = [](uint64_t) { return 40.0; };
+        e.run(4100); CHECK(e.cur == 2);
+        // the t8 a / t6-full case: a ~132-137 ms link whose need moves across 66.7 ms (66.3 / 67.6 / 67.8) every 16 s. With the band it stays at 3;
+        // without it, it flaps 3 -> 2 -> 3.
+        auto link = [](uint64_t t) { const uint64_t k = t / 16000; return k % 2 ? 134.0 : (k % 4 == 0 ? 136.6 : 137.0); };
+        Sim f; f.p.clamp(); f.cur = 3; f.rtt = link;
+        CHECK(f.run(180000) == 3); CHECK(f.changes == 0);
+        Sim f0; f0.p.deadband_ms = 0; f0.p.clamp(); f0.cur = 3; f0.rtt = link;
+        f0.run(180000); CHECK(f0.changes >= 4);
+    }
+    // test10, no depth trigger while this PC stretches its ticks for a slow peer (over 3000 us): no raise, no hold; at 3000 us or less it fires as before
+    {
+        Sim m; m.p.clamp(); m.cur = 2; m.rtt = [](uint64_t) { return 60.0; };
+        m.run(5000);
+        m.stretch = 8000;
+        jpdr::note_rollback(m.s, m.p, m.t, 6); m.t += 1000; jpdr::note_rollback(m.s, m.p, m.t, 6);
+        m.run(100);
+        CHECK(m.cur == 2); CHECK(m.s.deep_skips == 1); CHECK(m.s.stretch_us == 8000); CHECK(m.s.hold_until == 0); CHECK(m.s.deep_raises == 0);
+        m.run(30000);
+        CHECK(m.cur == 1);   // and nothing held the trip rule's lowering
+        m.stretch = 3000;
+        jpdr::note_rollback(m.s, m.p, m.t, 6); m.t += 1000; jpdr::note_rollback(m.s, m.p, m.t, 6);
+        m.run(100);
+        CHECK(m.cur == 2); CHECK(std::string(m.last_why) == "rollbacks"); CHECK(m.s.deep_skips == 1);
+        // DEEP_STRETCH_US=0: never skipped
+        Sim n; n.p.deep_stretch_us = 0; n.p.clamp(); n.cur = 2; n.rtt = [](uint64_t) { return 60.0; };
+        n.run(5000); n.stretch = 25000;
+        jpdr::note_rollback(n.s, n.p, n.t, 6); n.t += 1000; jpdr::note_rollback(n.s, n.p, n.t, 6);
+        n.run(100);
+        CHECK(n.cur == 3); CHECK(n.s.deep_skips == 0);
+    }
+    // test10, the rematch carry: the next match on the same link starts where the last one settled; another link, a short match or no key: the default
+    {
+        jpdr::Params p; p.clamp();
+        jpdr::Carry c;
+        CHECK(jpdr::carry_start(c, 0x1234, 3, p) == 3);   // nothing kept yet
+        Sim m1; m1.p.clamp(); m1.cur = 3;
+        m1.rtt = [](uint64_t t) { return t < 6000 ? 200.0 : 240.0; };   // 200: (200 - 33.3) / 2 + 16 = 99.3 ms -> 3; 240: 119.3 ms -> 4
+        for (int i = 0; i < 1200; i++) { m1.run(33); jpdr::note_time(m1.s, m1.t, m1.cur); }
+        CHECK(m1.cur == 4); CHECK(jpdr::settled(m1.s) == 4);
+        jpdr::carry_keep(c, 0x1234, m1.s);
+        CHECK(c.link == 0x1234 && c.delay == 4);
+        CHECK(jpdr::carry_start(c, 0x1234, 3, p) == 4);   // same link and peer
+        CHECK(jpdr::carry_start(c, 0x9999, 3, p) == 3);   // another link, room or peer
+        CHECK(jpdr::carry_start(c, 0, 3, p) == 3);        // no key (no plan)
+        jpdr::Params p3; p3.hi = 3; p3.clamp();
+        CHECK(jpdr::carry_start(c, 0x1234, 2, p3) == 3);  // clamped to MAX
+        // the carried start is the guard's base: a start of 4 may not go above 5 before 10 s (MAX 4 here anyway), and the next match begins there
+        Sim m2; m2.p.clamp(); m2.cur = jpdr::carry_start(c, 0x1234, 3, m2.p); m2.rtt = [](uint64_t) { return 240.0; };
+        CHECK(m2.cur == 4); CHECK(m2.run(30000) == 4); CHECK(m2.changes == 0); CHECK(m2.s.start_delay == 4);
+        // a match under 20 s leaves -1: the next match uses the default
+        jpdr::State short_m; uint64_t t = 1000;
+        for (int i = 0; i < 300; i++, t += 33) jpdr::note_time(short_m, t, 4);
+        jpdr::carry_keep(c, 0x1234, short_m);
+        CHECK(c.delay == -1); CHECK(jpdr::carry_start(c, 0x1234, 3, p) == 3);
+        jpdr::carry_keep(c, 0, m1.s);   // no key: nothing to carry
+        CHECK(c.delay == -1 && jpdr::carry_start(c, 0, 3, p) == 3);
     }
     std::printf("net delay rule: %d checks, %d failed\n", g_checks, g_fail);
     return g_fail ? 1 : 0;

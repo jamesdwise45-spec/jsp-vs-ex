@@ -19,13 +19,20 @@
 // First reading JSP_INPUT_DELAY_AUTO_FIRST_MS (4000) after the sync, then every 2 s; samples are kept from 2 s after the sync. Fight-start guard (the
 // fight's first seconds build pipelines and answer pings late: native-rb1/rb2 read 243-416 ms on a 60 ms link): before 10 s the spread is mirrored from
 // the low side (median - 10th percentile: a stall only makes answers late) and no decision goes above the start delay + 1; from 10 s on, samples taken in
-// the first 5 s are no longer used. A rematch on the same link may start at settled() of the match before (jsp_net_game.cpp, JSP_INPUT_DELAY_AUTO_CARRY).
+// the first 5 s are no longer used. A rematch on the same link starts at settled() of the match before (carry_start; jsp_net_game.cpp, JSP_INPUT_DELAY_AUTO_CARRY).
 // One reading raises (JSP_INPUT_DELAY_AUTO_UP_VOTES, 1); lowering is one tick at a time after five calm readings (10 s).
+// FIX (2 <-> 3 flapping, test10 research: t6 fights changed delay 9-12 times with the need at 66.3-67.8 ms, right on the 2-tick line): a deadband of
+// JSP_INPUT_DELAY_AUTO_DEADBAND_MS (4). A reading raises only when the need is more than the current ticks x 33.3 + 4 ms, and votes to lower only when the
+// lower count covers the need + 4 ms; inside the band it counts as "keep" (the votes reset as before).
 // Rollback depth: rollbacks deeper than JSP_INPUT_DELAY_AUTO_DEEP_TICKS (2) are events (rollbacks within 300 ms of the last one are the same event: the testers'
 // deep rollbacks came in pairs on consecutive ticks). JSP_INPUT_DELAY_AUTO_DEEP_COUNT (2) events within JSP_INPUT_DELAY_AUTO_DEEP_WINDOW_MS (10000) raise the delay
 // by one at once, and no reading lowers it for JSP_INPUT_DELAY_AUTO_HOLD_MS (20000). Rollbacks in the first FIRST_MS after the sync are not counted (the stall).
 // What this peer sees is the other peer's inputs arriving late, which the OTHER peer's delay covers; on a two-PC link both directions see much the same, so
 // both peers raise. JSP_INPUT_DELAY_AUTO_DEEP_COUNT=0 turns the depth trigger off.
+// FIX (delay 4 for 194 s, t8 bundle a: a 20 fps laptop's late inputs gave the host deep rollbacks, and every trigger renewed the 20 s hold): while this PC
+// stretches its ticks for a slower peer (Reading::stretch_us, the time sync's largest stretch in about the last second) by more than
+// JSP_INPUT_DELAY_AUTO_DEEP_STRETCH_US (3000) us, the trigger raises nothing and holds nothing (its events are dropped, counted in deep_skips): the time
+// sync, not this PC's input delay, is what answers a slow peer. 0 = never skip.
 #pragma once
 #include <algorithm>
 #include <cmath>
@@ -62,6 +69,8 @@ struct Params {
     int deep_window_ms = 10000;   // JSP_INPUT_DELAY_AUTO_DEEP_WINDOW_MS
     int deep_merge_ms = 300;
     int hold_ms = 20000;          // JSP_INPUT_DELAY_AUTO_HOLD_MS
+    int deadband_ms = 4;          // JSP_INPUT_DELAY_AUTO_DEADBAND_MS (rule 2's trip; 0 = none)
+    int deep_stretch_us = 3000;   // JSP_INPUT_DELAY_AUTO_DEEP_STRETCH_US: no depth trigger while the time sync stretches more than this (0 = never skip)
 
     void clamp()
     {
@@ -74,17 +83,19 @@ struct Params {
         up_votes = std::max(up_votes, 1); down_votes = std::max(down_votes, 1);
         deep_ticks = std::max(deep_ticks, 1); deep_count = std::min(std::max(deep_count, 0), kMaxDeep);
         deep_window_ms = std::max(deep_window_ms, 1000); hold_ms = std::max(hold_ms, 0);
+        deadband_ms = std::min(std::max(deadband_ms, 0), 16); deep_stretch_us = std::max(deep_stretch_us, 0);
     }
 };
 
 // What step() reads from the session (only when it needs it): GekkoNet's 5 s average round trip and jitter, its last single round trip, how many round
-// trips it measured so far (rtt_seq: last_ping is new only when this moved), and this peer's delay.
-struct Reading { double ping_avg = -1, jitter = 0, last_ping = -1; uint32_t rtt_seq = 0; int cur = 0; };
+// trips it measured so far (rtt_seq: last_ping is new only when this moved), this peer's delay, and the time sync's stretch of this PC's ticks (us, the
+// largest in about the last second; > 0 only while this PC runs ahead of the other).
+struct Reading { double ping_avg = -1, jitter = 0, last_ping = -1; uint32_t rtt_seq = 0; int cur = 0; uint32_t stretch_us = 0; };
 
 struct Decision {
     int want = -1;                // >= 0: set this delay now (differs from Reading::cur)
     int cur = 0;
-    const char* why = "";         // "trip" (a reading) or "rollbacks" (the depth trigger)
+    const char* why = "";         // "trip" (a reading), "rollbacks" (the depth trigger) or "slow peer" (the depth trigger skipped: want stays -1)
     double ping = 0, jitter = 0;  // rule 1: GekkoNet's average and jitter; rule 2: median RTT and spread (percentile - median)
     double need_ms = 0;
     double ping_avg = -1, jitter_avg = 0;   // GekkoNet's average and jitter at this reading (the log line)
@@ -100,6 +111,8 @@ struct State {
     uint64_t deep_t[kMaxDeep] = {}; int deep_n = 0; uint64_t last_deep = 0;
     uint64_t hold_until = 0;
     uint32_t deep_raises = 0;
+    uint32_t deep_skips = 0;      // depth triggers skipped while this PC stretched its ticks for a slower peer
+    uint32_t stretch_us = 0;      // the stretch of the skipped trigger (the log line)
     uint64_t at_ms[9] = {}; uint64_t last_t = 0;   // time spent at each delay (note_time), for settled()
 };
 
@@ -111,13 +124,25 @@ inline void note_time(State& s, uint64_t now, int cur)
 }
 
 // The delay this match spent the most time at (ties: the higher), or -1 before 20 s. A rematch on the same link starts there (JSP_INPUT_DELAY_AUTO_CARRY):
-// the start value of a match otherwise comes from the manifest (2), and the first seconds at a delay the link does not cover are where the testers' first
+// the start value of a match otherwise comes from the manifest (3), and the first seconds at a delay the link does not cover are where the testers' first
 // rollbacks were (support bundle 1: 5 ticks at 2.4 s).
 inline int settled(const State& s)
 {
     uint64_t total = 0; int best = -1;
     for (int d = 0; d <= 8; d++) { total += s.at_ms[d]; if (s.at_ms[d] && (best < 0 || s.at_ms[d] >= s.at_ms[best])) best = d; }
     return total >= 20000 ? best : -1;
+}
+
+// ENHANCEMENT (rematch carry, JSP_INPUT_DELAY_AUTO_CARRY, default on): what a match leaves for the next match on the SAME link. `link` is a key of the link and
+// its peer (jsp_net_game.cpp: the plan's session id, the peer's endpoint and the room), never 0; the game also clears the carry when a link opens or closes, so
+// it never crosses rooms or peers. carry_keep at the end of a match (settled(): -1 when it ran under 20 s, and then the next match uses the default);
+// carry_start at the next session start: settled() of the match before when the key is the same and it is >= 0 (clamped to MIN..MAX), else `def`.
+struct Carry { uint64_t link = 0; int delay = -1; };
+inline void carry_keep(Carry& c, uint64_t link, const State& s) { c.link = link; c.delay = link ? settled(s) : -1; }
+inline int carry_start(const Carry& c, uint64_t link, int def, const Params& p)
+{
+    if (!link || c.link != link || c.delay < 0) return def;
+    return c.delay < p.lo ? p.lo : c.delay > p.hi ? p.hi : c.delay;
 }
 
 // A rollback of `depth` ticks seen at `now` (ms). Main thread, as step().
@@ -171,6 +196,10 @@ Decision step(State& s, const Params& p, uint64_t now, Read&& read)
         if (s.deep_n >= p.deep_count) {
             s.deep_n = 0;
             const Reading r = read(); d.cur = r.cur; d.why = "rollbacks"; d.ping_avg = r.ping_avg; d.jitter_avg = r.jitter;
+            if (p.deep_stretch_us > 0 && r.stretch_us > (uint32_t)p.deep_stretch_us) {   // FIX (delay 4 for 194 s): the slow peer's rollbacks; no raise, no hold
+                d.why = "slow peer"; s.deep_skips++; s.stretch_us = r.stretch_us;
+                return d;
+            }
             s.hold_until = now + (uint64_t)p.hold_ms; s.up = s.down = 0;
             if (s.start_delay < 0) s.start_delay = r.cur;
             const bool capped = now < s.start + (uint64_t)p.guard_ms && r.cur >= s.start_delay + p.guard_raise;
@@ -203,6 +232,10 @@ Decision step(State& s, const Params& p, uint64_t now, Read&& read)
     d.ping = med; d.jitter = hi - med;
     d.need_ms = (med - wait_ms) / 2.0 + (hi - med) + margin;
     int want = ticks_for(d.need_ms, p);
+    // FIX (2 <-> 3 flapping): the deadband. Up only past the current ticks + DEADBAND_MS (a delay below MIN still goes up to MIN), down only when the lower
+    // count covers the need + DEADBAND_MS; inside the band the reading is a "keep".
+    if (want > r.cur && r.cur >= p.lo && d.need_ms <= r.cur * kTickMs + p.deadband_ms) want = r.cur;
+    else if (want < r.cur && ticks_for(d.need_ms + p.deadband_ms, p) >= r.cur) want = r.cur;
     if (guarded && want > s.start_delay + p.guard_raise) want = std::max(r.cur, s.start_delay + p.guard_raise);
     if (want > r.cur) { s.down = 0; if (++s.up < p.up_votes) return d; s.up = 0; }
     else if (want < r.cur) {

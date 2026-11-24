@@ -157,7 +157,7 @@ int main(int argc, char** argv)
     // --- effective-value path ---
     {
         FakeReader rd; EffectiveValues ev(&rd); rd.ev = &ev; int persisted = 0; ev.set_persist([&](Id, uint32_t) { ++persisted; });
-        CHECK(ev.get(Id::InputDelay).src == Src::Default && ev.get(Id::InputDelay).value == 2);
+        CHECK(ev.get(Id::InputDelay).src == Src::Default && ev.get(Id::InputDelay).value == 3);
         CHECK(ev.set_local(Id::InputDelay, 5) && persisted == 1 && ev.get(Id::InputDelay).src == Src::Local && ev.get(Id::InputDelay).value == 5);
         CHECK(!ev.set_local(Id::InputDelay, 99));   // out of range refused
         Digest ad; Values req = rb_values();
