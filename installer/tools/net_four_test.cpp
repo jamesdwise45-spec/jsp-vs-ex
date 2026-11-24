@@ -172,6 +172,12 @@ int main()
     CHECK(jsp4::count_text(3, 2, 4) == "Rollback off for this fight: it has 3 players, the rollback link was set up for 2. It is set up again for 3 after this fight.");
     CHECK(jsp4::count_text(3, 2, 2).rfind("Rollback off: this fight has 3 players and rollback is set to at most 2", 0) == 0);
     CHECK(jsp4::count_text(4, 3, 4).rfind("Rollback off for this fight: it has 4 players", 0) == 0);
+    // review R2: a gap in the records (0, 1, 3 after a leave) is refused with a plain line (and re-planned after the fight, never the 5-bad-matches give-up)
+    { jsp4::RoomView rv; rv.member[0] = 1; rv.member[1] = 2; rv.member[3] = 4; rv.com[0] = rv.com[1] = rv.com[3] = false;
+      const uint8_t hm = jsp4::human_mask(rv);
+      CHECK(hm == 0xB && (hm & ~((1u << 3) - 1u)) != 0);
+      CHECK(jsp4::gap_text(hm) == "Rollback off for this fight: the players are in places 1, 2, 4 of the room, and rollback needs them in places 1 to N without a gap. "
+                                  "The game's own connection is used."); }
 
     // ---- the takeover: battle slot s = GekkoNet slot s for every human record ----
     { uint32_t seen = 0;

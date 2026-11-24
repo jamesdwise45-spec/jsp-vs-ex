@@ -562,7 +562,7 @@ int max_players()
     return m;
 }
 bool multi_peer() { return max_players() > 2 && g.plan.remotes.size() > 1; }
-void g_nat_replan_next();   // ENHANCEMENT (4-player online): after a slot-mismatch refusal (defined with g_nat)
+void g_nat_replan_next(bool count = false);   // ENHANCEMENT (4-player online): after a slot-mismatch (or, count = true, a player-count) refusal (defined with g_nat)
 int test_bots();            // ENHANCEMENT (4-player online): TEST ONLY extra peers (defined with g_nat)
 jpdr::Params g_ad_pm;      // ENHANCEMENT (4-player online): the rule's parameters with 3-4 peers (adapt_settings)
 jpdr::State g_ad;   // per match (reset_match)
@@ -1673,7 +1673,7 @@ void start_session(ppu_context* c)
                 std::fprintf(stderr, "[net] fight has %d human players, the rollback link was planned for %d (JSP_ROLLBACK_MAX_PLAYERS %d): no rollback for this fight, %s\n",
                              nh, np, mp, nh <= mp ? "the link is planned again after it" : "and none in this room while it has more players than that");
                 why = jsp4::count_text(nh, np, mp);
-                g_nat_replan_next();
+                g_nat_replan_next(true);
             }
         }
     }
@@ -1688,7 +1688,15 @@ void start_session(ppu_context* c)
             jsp4::RoomView rv; uint16_t me = 0; uint8_t com[4] = {1, 1, 1, 1};
             if (jsp_native_room_read(rv.member, com, &me)) for (int i = 0; i < 4; i++) rv.com[i] = com[i] != 0;
             humans = jsp4::human_mask(rv);
-            if (!humans || (humans & ~((1u << g.plan.total_players) - 1u))) why = "the room's human records (mask " + std::to_string(humans) + ") do not fit the " + std::to_string((unsigned)g.plan.total_players) + " rollback slots";
+            // FIX (review R2): records with a gap (e.g. 0, 1, 3 after a leave) or outside the plan's slots: GekkoNet slot s must be room record s, so no plan of
+            // these players can serve them. Refused once per fight with a plain line, and (replan_next) no match is re-armed into this fight and no failure is
+            // counted, so it never runs into the 5-bad-matches give-up; after the fight the link is planned again from the room (the game may repack the places).
+            if (!humans || (humans & ~((1u << g.plan.total_players) - 1u))) {
+                std::fprintf(stderr, "[net] the room's human records (mask %u) do not fit the %u rollback slots: no rollback for this fight, the link is planned again after it\n",
+                             humans, (unsigned)g.plan.total_players);
+                why = jsp4::gap_text(humans);
+                g_nat_replan_next();
+            }
         }
         // FIX (swapped controls, testers on 0.7.0-test1): the builder numbers the fighters' net slots in team placement order, not record order, so each
         // net slot is mapped to its owner's rollback slot (room record) for the pad take, and this PC's own fighter must come out on this PC's slot.
@@ -2386,9 +2394,10 @@ struct Native {
     uint64_t claim_said = 0;      // last "waiting for the room records" line
     uint64_t replan_since = 0;    // FIX (review): the count differs from the planned one since then (a re-plan waits kReplanDebounceMs)
     bool replan_next = false;     // FIX (review): the last session refused on a slot mismatch: plan again from the records that fight filled
+    bool replan_count = false;    // FIX (review, optional item): that refusal was the player-count check (only a changed room count needs a new plan)
 } g_nat;
 constexpr uint64_t kReplanDebounceMs = 1500;   // FIX (a 4-copy run: a 3-player rendezvous failed visibly while the 4th joined): the count must hold this long before a re-plan
-void g_nat_replan_next() { g_nat.replan_next = true; }
+void g_nat_replan_next(bool count) { if (!g_nat.replan_next) g_nat.replan_count = count; else if (!count) g_nat.replan_count = false; g_nat.replan_next = true; }
 // ENHANCEMENT (4-player online): TEST ONLY knob kept at 0 in play (JSP_NET_TEST_BOTS needs JSP_ROLLBACK_ALLOW_DEBUG=1): extra rollback peers that are not in
 // the native room. No bot ships with this change (four real copies are the test), so it stays 0 unless set by hand.
 int test_bots()
@@ -2417,7 +2426,7 @@ void native_open(uint64_t room, bool owner, int players, int claim, const std::v
     std::string why; jpno::Refusal code = jpno::Refusal::None;
     if (!conn_open(c, &why, &code)) { conn_close(); log("native room: no rollback link", why); g_nat.given_up = room; return; }
     g_nat.link = true; g_nat.room = room; g_nat.tries++; g_nat.fails = 0; g_nat.rearm_at = 0; g_nat.away_since = 0; g_nat.players = players;
-    g_nat.replan_next = false;   // a new plan: an earlier refusal's re-plan is done
+    g_nat.replan_next = false; g_nat.replan_count = false;   // a new plan: an earlier refusal's re-plan is done
     std::fprintf(stderr, "[net] native room %llu: %d players, rollback link opening as %s (try %d), build %08x%s\n", (unsigned long long)room, players, owner ? "host (room owner)" : "client", g_nat.tries, g.caps.build,
                  players > 2 ? (", slot claim " + std::to_string(claim)).c_str() : "");
 }
@@ -2495,7 +2504,16 @@ void native_poll()
             else if (!g_nat.replan_since) g_nat.replan_since = now;
             // FIX (review): the last session refused on a slot mismatch (the claim guessed the member order wrong): plan again, now from the records that fight filled
             if (g_nat.replan_next && g.phase.load() == Phase::Ended) {
-                g_nat.replan_next = false; native_close("the battle slots did not match the plan: planning again from the room's records");
+                // FIX (review, optional item): a count refusal while the room's member count still makes the planned number of players (the records, not the
+                // room, disagreed): no new plan can differ, so the link stays and native_maintain re-arms the next match as before (counted as a bad match)
+                if (g_nat.replan_count && want == g_nat.players && !differs) {
+                    g_nat.replan_next = false; g_nat.replan_count = false;
+                    log("native room", "the fight's player count did not match the plan, but the room's member count is unchanged: the link stays, the next match is armed as before");
+                    native_maintain(now);
+                    return;
+                }
+                g_nat.replan_next = false; g_nat.replan_count = false;
+                native_close("the battle slots or the player count did not match the plan: planning again from the room's records");
                 g_nat.seen_room = room; g_nat.seen_since = now; g_nat.seen_players = want; g_nat.tries = 0; g_nat.retry_at = 0;
                 return;
             }
@@ -2546,6 +2564,9 @@ void match_poll()
 {
     const uint32_t j = g.match_jump.load();
     if (j <= g.match_k) return;
+    // FIX (review R1): a session this PC refused on the player count or the places (replan_next) waits for the fight to end and the re-plan; following another
+    // PC's next match here would arm it into the same fight (native_maintain holds for the same reason)
+    if (g_nat.replan_next) return;
     const Phase ph = g.phase.load();
     if (ph == Phase::Off || ph == Phase::Running || (ph == Phase::Ended && !g_nat.link)) return;
     if (ph == Phase::Ended && g_nat.away_since) return;   // leaving the native room: native_poll closes the link
