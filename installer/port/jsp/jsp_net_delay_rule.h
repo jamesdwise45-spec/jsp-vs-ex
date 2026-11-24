@@ -215,4 +215,20 @@ Decision step(State& s, const Params& p, uint64_t now, Read&& read)
     return d;
 }
 
+// FIX (time sync can't follow a slow PC, test8 support bundles 2026-11-23): the PC that runs ahead stretches its next tick period by
+// (frames ahead - 0.5) ms, capped at 2 ms. A laptop ran the fight at 20 ticks/s (50 ms a tick): the host would have needed ~17 ms a tick, so it kept running
+// ahead to the prediction window, predicted every tick and rolled back 1292 times in 207 s (snapshot and replay hitches, 18.8 s waiting at the window).
+// Up to 1.5 frames ahead the stretch is as before (1 ms a frame, 1 ms at most: two equal PCs are unchanged); beyond that each further frame ahead adds
+// JSP_TIMESYNC_GAIN_US (5000) us, up to JSP_TIMESYNC_MAX_US (25000) us a tick, so the ahead PC settles about 4-5 frames ahead of a 20 ticks/s PC instead of
+// at the window, and its own input delay covers the trip. Only when this PC flips moves (per PC; the inputs a tick simulates are unchanged).
+// JSP_TIMESYNC_GAIN_US=1000 JSP_TIMESYNC_MAX_US=2000 is the earlier rule.
+inline uint32_t timesync_stretch_us(float ahead, int gain_us, int max_us)
+{
+    if (!(ahead > 0.5f)) return 0;
+    const double base = (std::min(ahead, 1.5f) - 0.5f) * 1000.0;
+    const double more = ahead > 1.5f ? (ahead - 1.5f) * (double)gain_us : 0.0;
+    const double us = std::min(base + more, (double)max_us);
+    return us > 0 ? (uint32_t)us : 0u;
+}
+
 }  // namespace jpdr
