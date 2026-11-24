@@ -10,16 +10,19 @@ Output only (blocks mixed, read index and notify events are exactly as in 3005; 
 - the feedback's gain is absolute: 1 % per 10 ms off the cushion (was the error divided by the cushion, so a deeper cushion corrected less), capped
   as before at AUDIO_LOCK_DRC/256 both ways;
 - the level it reads follows a fall at once (the 0.9 / 0.1 EMA only for a rise), so a stall is answered at the next burst;
-- concealed time is owed (at most 500 ms); while anything is owed the refill cap is AUDIO_LOCK_DRC_BOOST/256 (default 16 = 6.25 %; the feedback and
-  feed-forward total stays capped at 8 %), and the frames the resampler makes over each block's own pay it down;
+- concealed time is owed (at most 500 ms); from the burst that ends a gap, while anything is owed, the refill cap is AUDIO_LOCK_DRC_BOOST/256
+  (default 16 = 6.25 %; the feedback and feed-forward total stays capped at 8 %). The feedback's share of each block pays it down (the slow pace
+  and the feed-forward cover a slower tick and repay nothing), and it is cleared once the level before a burst is back at the cushion;
 - the slow pace (3009) also enters on a short run of slow ticks: two 333 ms buckets in a row under 90 % arrival, neither holding one tick of
   150 ms or more (a single hitch, even 300 ms, never enters). Engaged this way it follows the arrival rate of the last ~1 s and goes down at up to
-  0.5 per second, until 3009's own 1 s buckets take over; the way back is 3009's;
+  0.5 per second, until 3 of 3009's 1 s buckets were made after the entry; the way back is 3009's, and an engagement that never went under 1
+  leaves 3009's buckets as they were;
 - one "[audio-lock] gap N: tick T, X ms after the last burst began, level before that burst L ms, Y ms concealed, owed D ms" line per gap (the first
   40 of a lock, then every 10th);
 - the "[audio-lock]" line keeps every field and their order and appends: "refill: debt max D ms, P ms paid back, quick slow pace N times, boost
   B %, on|off";
 - not done here: a pitch-preserving time stretch (WSOLA) for the refill and the slow pace; the playback still changes pitch with its rate;
+- with AUDIO_LOCK_REFILL=0 the output is 3009's; the game's lock device is then 200 ms as before (main.cpp), unless AUDIO_LOCK_BUF_MS is set;
 - tests: libs/audio/tests/test_audio_lock_race.c part 6, virtual time, 300 ms fake device: steady 30 ticks/s conceals nothing after the start;
   29 fps with a 50-100 ms tick every ~2 s: 21 gaps after 15 s against 76 (3009); runs of 5 / 15 slow ticks: fewer gaps (runs of 80-100 ms ticks
   still mostly conceal: a run loses ~50 ms a tick); single 76 ms and 150-300 ms hitches never engage the slow pace; 20 ticks/s is gap-free once
@@ -27,10 +30,10 @@ Output only (blocks mixed, read index and notify events are exactly as in 3005; 
   3009's. audio_lock_measure.c adds a "bundle hitches ~2 s" scenario (50-100 ms every 1-3 s) with the owed time per hitch.
 
 diff --git a/libs/audio/cellAudio.c b/libs/audio/cellAudio.c
-index 3eebc27..74263d8 100644
+index 3eebc27..f8489f5 100644
 --- a/libs/audio/cellAudio.c
 +++ b/libs/audio/cellAudio.c
-@@ -922,6 +922,40 @@ static double s_lk_sb_r[LK_SLOW_WIN];                      /* the last complete
+@@ -922,6 +922,45 @@ static double s_lk_sb_r[LK_SLOW_WIN];                      /* the last complete
  static lk_slow_mark s_lk_sb[LK_SLOW_WIN];                  /* the start of the bucket being filled [0] and of the ones before it */
  static lk_slow_mark s_lk_sr[LK_SLOW_RING];                 /* the last bursts */
  static double s_lk_sr_ffb, s_lk_sr_last_ff; static unsigned long long s_lk_sr_last_b;   /* the running sum, and the last burst's feed-forward and start */
@@ -42,11 +45,13 @@ index 3eebc27..74263d8 100644
 + *    per 10 ms under (or over) the cushion, capped as before at AUDIO_LOCK_DRC/256 on both sides;
 + *  - the level it reads fell slowly (an EMA of 0.9 / 0.1 per burst), so after a stall it saw a modest dip. It now follows a fall at once and a rise
 + *    as before;
-+ *  - concealed time is a debt: the frames a gap concealed are owed, and while anything is owed the cap to refill is AUDIO_LOCK_DRC_BOOST/256
-+ *    (default 16 = 6.25 %, the feedback and feed-forward total still capped at LK_SKEW_MAX); the extra frames the resampler makes pay it down;
++ *  - concealed time is a debt: the frames a gap concealed are owed, and from the burst that ends the gap, while anything is owed, the cap to refill
++ *    is AUDIO_LOCK_DRC_BOOST/256 (default 16 = 6.25 %, the feedback and feed-forward total still capped at LK_SKEW_MAX); the feedback's share of
++ *    each block pays it down (not the slow pace's or the feed-forward's), and it is cleared once the level before a burst is back at the cushion;
 + *  - the slow pace (3009) also enters on a short run of slow ticks: two LK_Q_BUCKET_MS buckets in a row under LK_Q_ENTER, neither holding a
 + *    single tick longer than LK_Q_HITCH_MS (one hitch, even a long one, stays the cushion's and the concealment's). Engaged this way, it follows the
-+ *    arrival rate of the last LK_Q_WIN buckets (about 1 s) until the 1 s buckets of 3009 take over, and goes down at LK_SLOW_DOWN_Q per second.
++ *    arrival rate of the last LK_Q_WIN buckets (about 1 s) until LK_SLOW_NB of 3009's 1 s buckets were made after the entry, and goes down at
++ *    LK_SLOW_DOWN_Q per second. An engagement that never went under 1 leaves 3009's buckets as they were when it ends.
 + *    The runs of 5-19 slow ticks (0.3-3 s) that made most of room 71's gaps fall between the cushion and 3009's 3 s entry.
 + * One "[audio-lock] gap" line per concealed gap (at most LK_GAP_LOG per lock, then every LK_GAP_LOG_EVERY-th): the tick (blocks / 6.25 since the lock
 + * began), the ms since the last burst began, the level before that burst and the gap's length.
@@ -62,7 +67,10 @@ index 3eebc27..74263d8 100644
 +#define LK_GAP_LOG_EVERY   10
 +static int    s_lk_refill = 1, s_lk_drc_boost = 16;
 +static double s_lk_debt = 0.0, s_lk_debt_max = 0.0;          /* frames owed (concealed, not yet paid back by the resampler) */
-+static unsigned long long s_lk_paid;                          /* frames paid back */
++static double s_lk_paid = 0.0;                               /* frames paid back (review: a double, nothing rounded away) */
++static double s_lk_fb_pay = 0.0;                             /* this burst's feedback while it refills (> 0): what pays the debt, per block */
++static unsigned long long s_lk_sb_total, s_lk_q_from;        /* 3009's 1 s buckets ever completed; the count at the quick entry */
++static double s_lk_eng_lo = 1.0;                             /* the lowest rate of this engagement (an exit with none under 1 keeps 3009's buckets) */
 +static int    s_lk_q_n = 0, s_lk_q_eng = 0; static unsigned long long s_lk_q_entries;
 +static double s_lk_q_r[LK_Q_WIN], s_lk_q_long[LK_Q_WIN];      /* the last complete quick buckets' rates and longest ticks (ms), newest first */
 +static double s_lk_q_longest = 0.0, s_lk_burst_t = -1.0, s_lk_burst_lvl = 0.0;
@@ -71,10 +79,12 @@ index 3eebc27..74263d8 100644
  static double lk_now_ms(void)
  {
      static LARGE_INTEGER f; LARGE_INTEGER t;
-@@ -956,14 +990,30 @@ static void lk_slow_burst(double ff, int level, int cushion)
+@@ -955,15 +994,34 @@ static void lk_slow_burst(double ff, int level, int cushion)
+         for (int i = LK_SLOW_WIN - 1; i > 0; i--) { s_lk_sb_r[i] = s_lk_sb_r[i - 1]; s_lk_sb[i] = s_lk_sb[i - 1]; }
          s_lk_sb_r[0] = lk_rate_between(&s_lk_sb[0], &cur); s_lk_sb[0] = cur;
          if (s_lk_sb_n < LK_SLOW_WIN) s_lk_sb_n++;
-     }
++        s_lk_sb_total++;   /* patch 3010 */
++    }
 +    if (s_lk_refill) {   /* patch 3010: the quick buckets, and the longest tick in each (the time since the last burst) */
 +        if (s_lk_sr_w == 2) { s_lk_q[0] = s_lk_sr[0]; s_lk_q_longest = 0.0; }
 +        const double tick_ms = now - s_lk_sr[(s_lk_sr_w - 2) % LK_SLOW_RING].t;
@@ -85,17 +95,20 @@ index 3eebc27..74263d8 100644
 +            s_lk_q_r[0] = lk_rate_between(&s_lk_q[1], &cur); s_lk_q_long[0] = s_lk_q_longest; s_lk_q[0] = cur; s_lk_q_longest = 0.0;
 +            if (s_lk_q_n < LK_Q_WIN) s_lk_q_n++;
 +        }
-+    }
+     }
      if (!s_lk_slow_min) return;
 +    if (s_lk_refill && !s_lk_slow_eng && s_lk_q_n >= 2 && s_lk_q_r[0] < LK_Q_ENTER && s_lk_q_r[1] < LK_Q_ENTER
 +        && s_lk_q_long[0] < LK_Q_HITCH_MS && s_lk_q_long[1] < LK_Q_HITCH_MS) {   /* patch 3010: a short run of slow ticks */
-+        s_lk_slow_eng = 1; s_lk_q_eng = 1; s_lk_slow_entries++; s_lk_q_entries++;
++        s_lk_slow_eng = 1; s_lk_q_eng = 1; s_lk_slow_entries++; s_lk_q_entries++; s_lk_q_from = s_lk_sb_total; s_lk_eng_lo = s_lk_slow;
 +    }
      if (!s_lk_slow_eng && s_lk_sb_n >= LK_SLOW_NB) {
          double hi = 0.0; for (int i = 0; i < LK_SLOW_NB; i++) if (s_lk_sb_r[i] > hi) hi = s_lk_sb_r[i];
-         if (hi < LK_SLOW_ENTER) { s_lk_slow_eng = 1; s_lk_slow_entries++; }
+-        if (hi < LK_SLOW_ENTER) { s_lk_slow_eng = 1; s_lk_slow_entries++; }
++        if (hi < LK_SLOW_ENTER) { s_lk_slow_eng = 1; s_lk_slow_entries++; s_lk_eng_lo = s_lk_slow; }
      }
-+    if (s_lk_q_eng && s_lk_sb_n >= LK_SLOW_NB) s_lk_q_eng = 0;   /* patch 3010: 3009's own window from here */
++    /* patch 3010: 3009's own window once LK_SLOW_NB of its buckets were made after the quick entry (review: s_lk_sb_n is not reset at that entry,
++     * and the buckets before it are not this pace) */
++    if (s_lk_q_eng && s_lk_sb_total - s_lk_q_from >= LK_SLOW_NB && s_lk_sb_n >= LK_SLOW_NB) s_lk_q_eng = 0;
      double target = 1.0;
      if (s_lk_slow_eng) {
 -        target = lk_rate_between(&s_lk_sb[s_lk_sb_n - 1], &cur);
@@ -103,7 +116,7 @@ index 3eebc27..74263d8 100644
          if (s_lk_sr_w > LK_SLOW_QUICK) {
              const double quick = lk_rate_between(&s_lk_sr[(s_lk_sr_w - 1 - LK_SLOW_QUICK) % LK_SLOW_RING], &cur);
              if (quick >= LK_SLOW_EXIT) target = 1.0;   /* the pace is back */
-@@ -971,9 +1021,12 @@ static void lk_slow_burst(double ff, int level, int cushion)
+@@ -971,9 +1029,15 @@ static void lk_slow_burst(double ff, int level, int cushion)
          if (target >= LK_SLOW_EXIT) target = 1.0;
          const double lo = s_lk_slow_min / 100.0; if (target < lo) target = lo;
      }
@@ -112,13 +125,16 @@ index 3eebc27..74263d8 100644
 +    if (target < s_lk_slow && level <= cushion) { s_lk_slow -= down * dt; if (s_lk_slow < target) s_lk_slow = target; }
      else if (target > s_lk_slow) { s_lk_slow += LK_SLOW_UP * dt; if (s_lk_slow > target) s_lk_slow = target; }
 -    if (s_lk_slow_eng && target >= 1.0 && s_lk_slow >= 1.0 && level <= cushion + cushion / 4) { s_lk_slow_eng = 0; s_lk_sb_n = 0; s_lk_sb[0] = cur; }
++    if (s_lk_slow < s_lk_eng_lo) s_lk_eng_lo = s_lk_slow;
 +    if (s_lk_slow_eng && target >= 1.0 && s_lk_slow >= 1.0 && level <= cushion + cushion / 4) {
-+        s_lk_slow_eng = 0; s_lk_sb_n = 0; s_lk_sb[0] = cur; s_lk_q_eng = 0; s_lk_q_n = 0; s_lk_q[0] = cur; s_lk_q_longest = 0.0;
++        /* patch 3010: an engagement that never went under 1 (a quick entry the pace did not confirm) keeps 3009's buckets */
++        if (!s_lk_refill || s_lk_eng_lo < 1.0) { s_lk_sb_n = 0; s_lk_sb[0] = cur; }
++        s_lk_slow_eng = 0; s_lk_q_eng = 0; s_lk_q_n = 0; s_lk_q[0] = cur; s_lk_q_longest = 0.0; s_lk_eng_lo = 1.0;
 +    }
      double out = s_lk_slow;
      /* the level trim, while engaged only. It aims at LK_SLOW_AIM x the cushion while the 3007 feedback (fb, capped at AUDIO_LOCK_DRC/256) still aims
       * at the cushion itself: in slow mode the trough settles between the two (about 75 ms of a 90 ms cushion), the trim being much the stronger.
-@@ -985,7 +1038,7 @@ static void lk_slow_burst(double ff, int level, int cushion)
+@@ -985,7 +1049,7 @@ static void lk_slow_burst(double ff, int level, int cushion)
          if (out > 1.0 + LK_SLOW_LVL) out = 1.0 + LK_SLOW_LVL;
      }
      /* what the resampler plays: no faster a change than the ramps (the trim does not jump in at engaging) */
@@ -127,7 +143,7 @@ index 3eebc27..74263d8 100644
      if (out > s_lk_slow_out + LK_SLOW_UP * dt) out = s_lk_slow_out + LK_SLOW_UP * dt;
      s_lk_slow_out = out; s_lk_slow_from = s_lk_slow_play; s_lk_slow_i = 0;
      if (s_lk_slow_out < s_lk_slow_lo) s_lk_slow_lo = s_lk_slow_out;
-@@ -1024,6 +1077,8 @@ static void lk_begin(void)
+@@ -1024,6 +1088,8 @@ static void lk_begin(void)
          s_lk_ff = lk_env(getenv("AUDIO_LOCK_FF"), 1) != 0;   /* patch 3008 */
          s_lk_slow_min = lk_env(getenv("AUDIO_LOCK_SLOW_MIN"), 60);   /* patch 3009: 0 or 100 = off; never under LK_SLOW_FLOOR_PCT */
          if (s_lk_slow_min <= 0 || s_lk_slow_min >= 100) s_lk_slow_min = 0; else if (s_lk_slow_min < LK_SLOW_FLOOR_PCT) s_lk_slow_min = LK_SLOW_FLOOR_PCT;
@@ -136,16 +152,16 @@ index 3eebc27..74263d8 100644
      }
      s_lk_active = 1; s_lk_burst = 1; s_lk_have_last = 0; s_lk_pos = 0.0; s_lk_ema = -1.0; s_lk_skew = 0.0; s_lk_ring_w = 0; s_lk_conc = 0;
      s_lk_blocks = s_lk_dry = s_lk_conceals = s_lk_conc_frames = s_lk_long_gaps = s_lk_drops = s_lk_squeezed = s_lk_bursts = 0;
-@@ -1031,6 +1086,8 @@ static void lk_begin(void)
+@@ -1031,6 +1097,8 @@ static void lk_begin(void)
      s_lk_ff_bursts = 0; s_lk_ff_sum = 0; s_lk_ff_max = 0; s_lk_tot_min = s_lk_tot_max = 0;   /* patch 3008 */
      s_lk_slow = s_lk_slow_out = s_lk_slow_lo = s_lk_slow_play = s_lk_slow_from = 1.0; s_lk_slow_i = 0; s_lk_slow_eng = 0; s_lk_slow_ms = 0.0; s_lk_slow_t = -1.0; s_lk_slow_entries = 0;   /* patch 3009 */
      s_lk_sb_n = 0; s_lk_sr_w = 0; s_lk_sr_ffb = s_lk_sr_last_ff = 0.0; s_lk_sr_last_b = 0;
-+    s_lk_debt = s_lk_debt_max = 0.0; s_lk_paid = 0; s_lk_q_n = 0; s_lk_q_eng = 0; s_lk_q_entries = 0; s_lk_q_longest = 0.0;   /* patch 3010 */
++    s_lk_debt = s_lk_debt_max = s_lk_paid = s_lk_fb_pay = 0.0; s_lk_sb_total = s_lk_q_from = 0; s_lk_eng_lo = 1.0; s_lk_q_n = 0; s_lk_q_eng = 0; s_lk_q_entries = 0; s_lk_q_longest = 0.0;   /* patch 3010 */
 +    s_lk_burst_t = s_lk_gap_t = -1.0; s_lk_burst_lvl = s_lk_gap_since = s_lk_gap_lvl = 0.0;
  }
  static int lk_cushion_frames(void)
  {
-@@ -1045,7 +1102,8 @@ static void lk_report(const char* why)
+@@ -1045,7 +1113,8 @@ static void lk_report(const char* why)
      fprintf(stderr, "[audio-lock] %s: %llu blocks, %llu device underruns, %llu concealed gaps (%.0f ms, %llu longer than %d ms), %llu blocks squeezed, %llu dropped, "
                      "rate %+.2f..%+.2f %%, level before a burst min %.1f ms mean %.1f ms, cushion %.1f ms, device buffer %.1f ms, smoothing %s, "
                      "stretch fed forward: %llu bursts, mean %.0f us, max %d us, total rate %+.2f..%+.2f %%, feed-forward %s, "
@@ -155,7 +171,7 @@ index 3eebc27..74263d8 100644
              why, s_lk_blocks, s_lk_dry, s_lk_conceals, s_lk_conc_frames / fpms, s_lk_long_gaps, s_lk_conceal_ms, s_lk_squeezed, s_lk_drops,
              s_lk_skew_min * 100.0, s_lk_skew_max * 100.0, s_lk_trough_min < 0 ? 0.0 : s_lk_trough_min / fpms, s_lk_bursts ? s_lk_trough_sum / s_lk_bursts / fpms : 0.0,
              lk_cushion_frames() / fpms, lk_cap_frames() / fpms, s_lk_smooth ? "on" : "off (AUDIO_LOCK_SMOOTH=0)",
-@@ -1055,7 +1113,10 @@ static void lk_report(const char* why)
+@@ -1055,7 +1124,10 @@ static void lk_report(const char* why)
              !s_lk_smooth ? "off (smoothing off)" : s_lk_ff ? "on" : "off (AUDIO_LOCK_FF=0)",
              /* patch 3009, appended: how often and how long the playback followed a slow pace down, and how low it went (1.000 = never) */
              s_lk_slow_entries, s_lk_slow_ms / 1000.0, s_lk_slow_lo, s_lk_slow_min,
@@ -167,7 +183,7 @@ index 3eebc27..74263d8 100644
  }
  static void lk_end(void) { if (!s_lk_active) return; s_lk_active = 0; lk_report("lock ended"); }
  static void lk_send(const float* f, u32 n)   /* to the device, and into the history */
-@@ -1085,6 +1146,9 @@ static void lk_conc_frame(float* o)
+@@ -1085,6 +1157,9 @@ static void lk_conc_frame(float* o)
  }
  static void lk_conc_start(void)
  {
@@ -177,7 +193,7 @@ index 3eebc27..74263d8 100644
      for (int i = 0; i < LK_H; i++) { const u32 r = (u32)((s_lk_ring_w - LK_H + i) % LK_H); s_lk_seg[i * 2] = s_lk_ring[r * 2]; s_lk_seg[i * 2 + 1] = s_lk_ring[r * 2 + 1]; }
      s_lk_conc = 1; s_lk_conc_first = 1; s_lk_conc_p = 0; s_lk_conc_t = 0; s_lk_conceals++;
  }
-@@ -1093,6 +1157,14 @@ static void lk_conc_stop(void)
+@@ -1093,6 +1168,14 @@ static void lk_conc_stop(void)
      s_lk_conc_frames += (unsigned long long)s_lk_conc_t;
      if (s_lk_conc_t > (long)s_lk_conceal_ms * (CELL_AUDIO_SAMPLE_RATE / 1000)) s_lk_long_gaps++;
      s_lk_conc = 0;
@@ -192,7 +208,7 @@ index 3eebc27..74263d8 100644
  }
  /* Idle between ticks (every ~2 ms): keep the device over the low-water mark with concealment while no real block comes. */
  static void lk_idle_tail(void)
-@@ -1124,9 +1196,15 @@ static void lk_submit_block(void)
+@@ -1124,9 +1207,18 @@ static void lk_submit_block(void)
      if (s_lk_burst) {   /* the first block after an idle wait: the level now is the low point before this tick's burst */
          s_lk_burst = 0; s_lk_bursts++; s_lk_trough_sum += level; if (s_lk_trough_min < 0 || level < s_lk_trough_min) s_lk_trough_min = level;
          if (level == 0 && s_lk_have_last && !s_lk_conc) s_lk_dry++;
@@ -202,20 +218,24 @@ index 3eebc27..74263d8 100644
          double fb = 0.0;
 -        if (s_lk_smooth && s_lk_drc > 0 && cushion > 0) {
 +        if (s_lk_smooth && s_lk_drc > 0 && cushion > 0 && s_lk_refill) {   /* patch 3010: absolute gain; while owing, the boosted cap to refill */
-+            const double hi = (s_lk_debt > 0.0 && s_lk_drc_boost > s_lk_drc ? s_lk_drc_boost : s_lk_drc) / (double)LK_N, lo = -s_lk_drc / (double)LK_N;
++            if (level >= cushion) s_lk_debt = 0.0;   /* back at the cushion: nothing is owed any more (review: the debt stayed owed all fight) */
++            const int owing = s_lk_debt > 0.0 || s_lk_conc;   /* the burst that ends a gap refills at the boost already (review) */
++            const double hi = (owing && s_lk_drc_boost > s_lk_drc ? s_lk_drc_boost : s_lk_drc) / (double)LK_N, lo = -s_lk_drc / (double)LK_N;
 +            fb = (cushion - s_lk_ema) / (CELL_AUDIO_SAMPLE_RATE / 100.0) * (LK_FB_PCT_PER_10MS / 100.0);
 +            if (fb > hi) fb = hi; if (fb < lo) fb = lo;
++            s_lk_fb_pay = fb > 0.0 ? fb : 0.0;
 +            if (fb < s_lk_skew_min) s_lk_skew_min = fb; if (fb > s_lk_skew_max) s_lk_skew_max = fb;
 +        } else if (s_lk_smooth && s_lk_drc > 0 && cushion > 0) {
              double e = (cushion - s_lk_ema) / cushion; if (e > 1) e = 1; if (e < -1) e = -1;
              fb = e * s_lk_drc / (double)LK_N;
              if (fb < s_lk_skew_min) s_lk_skew_min = fb; if (fb > s_lk_skew_max) s_lk_skew_max = fb;
-@@ -1161,6 +1239,9 @@ static void lk_submit_block(void)
+@@ -1161,6 +1253,10 @@ static void lk_submit_block(void)
          m++; s_lk_pos += step;
      }
      s_lk_pos -= LK_N; s_lk_prev[0] = s_mix_buffer[(LK_N - 1) * 2]; s_lk_prev[1] = s_mix_buffer[(LK_N - 1) * 2 + 1];
-+    if (s_lk_refill && s_lk_debt > 0.0 && m > LK_N) {   /* patch 3010: the frames over the block's own pay the debt */
-+        const double x = (double)(m - LK_N) < s_lk_debt ? (double)(m - LK_N) : s_lk_debt; s_lk_debt -= x; s_lk_paid += (unsigned long long)x;
++    if (s_lk_refill && s_lk_debt > 0.0 && s_lk_fb_pay > 0.0) {   /* patch 3010: the feedback's share of the block pays the debt (not the slow pace's, not the
++                                                                 * feed-forward's: those cover a slower tick, they repay nothing) */
++        const double x = LK_N * s_lk_fb_pay < s_lk_debt ? LK_N * s_lk_fb_pay : s_lk_debt; s_lk_debt -= x; s_lk_paid += x;
 +    }
      if (s_lk_conc) {   /* back from concealment: crossfade the loop out and the real block in */
          for (u32 i = 0; i < LK_F && i < m; i++) { float f[2]; lk_conc_frame(f); const float w = (float)(i + 1) / LK_F;
