@@ -256,6 +256,9 @@ static const KV kDefaults[] = {
     {"JSP_ROLLBACK_PICK", "1"},
     // FORK TEST BUILD ONLY (not for upstream): Re-select character(s) opens the game's own character-select page on both PCs; JSP_PICK_NATIVE_SELECT=0 = the port's picker.
     {"JSP_PICK_NATIVE_SELECT", "1"},
+    // FORK TEST BUILD ONLY (not for upstream): a Friendly Match room of 3-4 humans gets the rollback mesh (test11, 4-player); JSP_ROLLBACK_MAX_PLAYERS=2 = two
+    // players only, as upstream. Every PC in the room needs it (a test11 fork build has it).
+    {"JSP_ROLLBACK_MAX_PLAYERS", "4"},
     // A restore waits (at most JSP_SNAPSHOT_SITE_MS, 50 ms) until every helper thread is parked where it was at the target's save (jsp_snapshot_sync.h, SiteMoved). Soak
     // 2026-11-21 (replay-driven depth 2, ~3,200 restores): a CRI loader worker was caught inside its file read at a restore; 0 desyncs, restore 10.7 ms avg (no cost).
     {"JSP_SNAPSHOT_SITE", "1"},
