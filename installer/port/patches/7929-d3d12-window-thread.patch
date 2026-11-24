@@ -1,0 +1,184 @@
+Patch 7929 (rollback netcode, online stalls): the game window and its message pump run on their own thread; HITCH also times the pipe wait and Present.
+
+Why. The window belonged to the port's frame clock thread, the thread that drains the FIFO and gives the guest its vblanks. Its pump
+called DispatchMessage, and DefWindowProc runs its modal loops in place: holding the title bar or a frame edge (move / size), the window
+menu (Alt, Alt+Space, a click on the window icon), and any slow message another process sends to the window (an overlay, a global hook).
+For as long as such a loop runs the frame clock gives no vblank and takes no flip, so the guest stops; in a rollback match the lockstep
+clock then stops both PCs. One online match (test10 friends' bundle b, room 69) had a 897 ms tick whose frame clock time was 865 ms of
+window pump.
+
+What. create_window now runs on a new thread (win_thread_main) that does nothing else than GetMessage / DispatchMessage for that window.
+The modal loops wait there, not on the frame clock. The frame clock's pump (rsx_d3d12_backend_pump_messages) still empties its own
+queue and reports the closed flag, which the window thread also sets when its loop ends. The thread runs one step above normal unless
+HOST_PRIO=0: the submit thread's SetWindowText (the title bar stats) and Present can send it a message and wait for the answer. It
+never waits on a drawing thread, so a sent message cannot deadlock. Shutdown posts WM_CLOSE instead of calling DestroyWindow, which
+only works on the owner thread.
+
+Unchanged: the guest sees nothing new (presentation and input only). Keys are read with GetAsyncKeyState and the focus is checked by
+process (GetForegroundWindow + process id), both independent of the thread that owns the window. The in-game text panel's calls from
+the window procedure take its own lock (cellOskDialog.c s_ov_lock). The swap chain is created for the window from the frame clock
+thread, as DXGI allows. WINDOW_THREAD=0 keeps the old way (the window on the frame clock thread). One line at start says which.
+
+Diagnostic. With HITCH=<ms> (2905), the per-present line also shows "pipe wait" (the frame clock waiting for the submit thread to finish
+the previous batch, which includes its Present and its next-back-buffer wait) and "Present" (the Present call itself, on the submit
+thread). Off by default, as before.
+
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+index 2f5ed2b..9d50914 100644
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -595,10 +595,12 @@ static int pipe_on(void)
+ /* FIFO thread: wait until the submit half has finished the batch in flight. The window belongs to this thread, and
+  * Present on the submit thread can SendMessage to it, so sent messages keep being delivered while waiting (a plain
+  * wait deadlocked at the first frames in another title's port). Posted messages stay queued for the normal pump. */
++static int hz_ms(void); static double hz_now(void); static double s_hz_t[8]; static u32 s_hz_n[8];   /* 7929: HITCH probe (2905), defined below */
+ static void pipe_wait(void)
+ {
+     if (!s_pipe.busy) return;
+     LARGE_INTEGER q0, q1, fq; QueryPerformanceCounter(&q0);
++    const double hz_pw0 = hz_ms() ? hz_now() : 0;   /* 7929 (HITCH): the frame clock waiting for the submit thread */
+     for (;;) {
+         const DWORD r = MsgWaitForMultipleObjects(1, &s_pipe.done, FALSE, INFINITE, QS_SENDMESSAGE);
+         if (r == WAIT_OBJECT_0) break;
+@@ -607,6 +609,7 @@ static void pipe_wait(void)
+     QueryPerformanceCounter(&q1); QueryPerformanceFrequency(&fq);
+     s_pipe.wait_ms += (double)(q1.QuadPart - q0.QuadPart) * 1000.0 / (double)fq.QuadPart;
+     s_pipe.n_wait++;
++    if (hz_pw0) { s_hz_t[6] += hz_now() - hz_pw0; s_hz_n[6]++; }
+     s_pipe.busy = 0;
+ }
+ /* RES_SCALE=n (1-4): render n times the guest resolution (2 = 1440p, 3 = 4K
+@@ -1089,6 +1092,63 @@ static HWND create_window(u32 width, u32 height, const char* title)
+     return h;
+ }
+ 
++/* 7929: the window lives on its own thread, which does nothing but pump its messages (WINDOW_THREAD=0: on the calling thread, the
++ * old way). Before, the window belonged to the thread that also drains the FIFO and gives the guest its vblanks (the port's frame
++ * clock), and DispatchMessage runs DefWindowProc's modal loops in place: holding the title bar or a frame edge (move / size), the
++ * window menu (Alt, Alt+Space, a click on the icon) and any slow message sent by another process (overlays, hooks) stopped the
++ * whole game for as long as they lasted (an 865 ms pump in one online match). Now only this thread waits in them; the drawing
++ * thread's pump finds no window messages. Nothing the guest sees changes (presentation and input only): the keys are read with
++ * GetAsyncKeyState and the focus by process, both thread-independent, and the in-game text panel's calls take their own lock.
++ * The thread runs one step above normal unless HOST_PRIO=0, because Present / SetWindowText on the submit thread can send it a
++ * message and wait for the answer. It never waits on the drawing threads, so a sent message cannot deadlock. */
++static int s_win_thread = 0;   /* 1: the window belongs to win_thread_main */
++static struct { u32 w, h; const char* title; HWND hwnd; HANDLE ready; } s_wt;
++static DWORD WINAPI win_thread_main(LPVOID arg)
++{
++    (void)arg;
++    { const char* e = getenv("HOST_PRIO");
++      if (!(e && *e == '0')) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL); }
++    s_wt.hwnd = create_window(s_wt.w, s_wt.h, s_wt.title);
++    const HWND h = s_wt.hwnd;
++    SetEvent(s_wt.ready);   /* s_wt is the creator's from here on */
++    if (!h) return 0;
++    MSG m;
++    for (;;) {
++        const BOOL r = GetMessageA(&m, NULL, 0, 0);
++        if (r == 0 || r == -1) break;   /* WM_QUIT (the window was destroyed) or an error */
++        TranslateMessage(&m);
++        DispatchMessageA(&m);
++    }
++    InterlockedExchange((volatile LONG*)&s_d3d.window_closed, 1);   /* the frame clock's pump reports it and the game quits */
++    return 0;
++}
++static HWND create_window_threaded(u32 width, u32 height, const char* title)
++{
++    const char* e = getenv("WINDOW_THREAD");
++    if (e && *e == '0') {
++        fprintf(stderr, "[D3D12] window thread: off (WINDOW_THREAD=0), the window's messages are pumped by the drawing thread%c", 10);
++        return create_window(width, height, title);
++    }
++    s_wt.w = width; s_wt.h = height; s_wt.title = title; s_wt.hwnd = NULL;
++    s_wt.ready = CreateEventA(NULL, TRUE, FALSE, NULL);
++    HANDLE th = s_wt.ready ? CreateThread(NULL, 0, win_thread_main, NULL, 0, NULL) : NULL;
++    if (!th) {
++        if (s_wt.ready) { CloseHandle(s_wt.ready); s_wt.ready = NULL; }
++        fprintf(stderr, "[D3D12] window thread: not created (error %lu), the window stays on the drawing thread%c", (unsigned long)GetLastError(), 10);
++        return create_window(width, height, title);
++    }
++    WaitForSingleObject(s_wt.ready, INFINITE);
++    CloseHandle(s_wt.ready); s_wt.ready = NULL;
++    const HWND h = s_wt.hwnd;
++    const DWORD tid = GetThreadId(th);
++    CloseHandle(th);
++    if (!h) return NULL;   /* the thread has returned; init fails as before */
++    s_win_thread = 1;
++    fprintf(stderr, "[D3D12] window thread: on (tid %lu), the window's messages no longer run on the drawing thread (WINDOW_THREAD=0 = the old way)%c",
++            (unsigned long)tid, 10);
++    return h;
++}
++
+ /* ---------------------------------------------------------------------------
+  * D3D12 initialization
+  * -----------------------------------------------------------------------*/
+@@ -9974,11 +10034,13 @@ skip_dump_consider: ;
+      * offscreen-only batch. */
+     if (f->present) {
+         const int pm = d3d12_present_mode();   /* 2915: 0 no wait (default), 1 on the vblank, 2 no wait with tearing */
++        const double hz_p0 = hz_ms() ? hz_now() : 0;   /* 7929 (HITCH): the Present call itself (on the submit thread with PIPE=1) */
+         if (pm == 1)
+             s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, 1, 0);
+         else
+             s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, 0,
+                                               (pm == 2 && s_d3d.tearing) ? DXGI_PRESENT_ALLOW_TEARING : 0);
++        if (hz_p0) { s_hz_t[7] += hz_now() - hz_p0; s_hz_n[7]++; }
+     }
+     rdoc_frame_end();
+ 
+@@ -10134,9 +10196,10 @@ static void d3d12_present(void* ud, u32 buffer_id)
+         const double t1 = hz_now(), dt = t1 - hz_t0, gap = last_end ? hz_t0 - last_end : 0;
+         if (dt > hz_ms() || gap > 3 * hz_ms())
+             fprintf(stderr, "[HITCH] #%u frame %llu: present %.1f ms (gap before %.1f): vs compile %.1f/%u  shader %.1f/%u  "
+-                    "pso %.1f/%u  gpu wait %.1f/%u  next-frame wait %.1f/%u  render_frame %.1f  draws %u%c",
++                    "pso %.1f/%u  gpu wait %.1f/%u  next-frame wait %.1f/%u  render_frame %.1f  draws %u  pipe wait %.1f/%u  Present %.1f/%u%c",
+                     ++n_hitch, (unsigned long long)s_d3d.frame_count, dt, gap, s_hz_t[0], s_hz_n[0], s_hz_t[1], s_hz_n[1],
+-                    s_hz_t[2], s_hz_n[2], s_hz_t[3], s_hz_n[3], s_hz_t[4], s_hz_n[4], s_hz_t[5], s_dbg_last_draws, 10);
++                    s_hz_t[2], s_hz_n[2], s_hz_t[3], s_hz_n[3], s_hz_t[4], s_hz_n[4], s_hz_t[5], s_dbg_last_draws,
++                    s_hz_t[6], s_hz_n[6], s_hz_t[7], s_hz_n[7], 10);   /* 7929: pipe wait = the frame clock waiting for the submit thread */
+         for (int k = 0; k < 8; k++) { s_hz_t[k] = 0; s_hz_n[k] = 0; }
+         last_end = t1;
+     }
+@@ -12911,7 +12974,7 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
+         snprintf(g_rsx_title_base, sizeof(g_rsx_title_base), "%s",
+                  title ? title : "ps3recomp");
+     }
+-    s_d3d.hwnd = create_window(width, height, title);
++    s_d3d.hwnd = create_window_threaded(width, height, title);   /* 7929 */
+     if (!s_d3d.hwnd) {
+         pipe_effective_close();
+         printf("[D3D12] ERROR: Window creation failed\n");
+@@ -12985,7 +13048,10 @@ void rsx_d3d12_backend_shutdown(void)
+     if (s_d3d.cmd_queue) s_d3d.cmd_queue->lpVtbl->Release(s_d3d.cmd_queue);
+     if (s_d3d.device) s_d3d.device->lpVtbl->Release(s_d3d.device);
+ 
+-    if (s_d3d.hwnd) DestroyWindow(s_d3d.hwnd);
++    if (s_d3d.hwnd) {   /* 7929: only the owner thread can destroy it */
++        if (s_win_thread) PostMessageA(s_d3d.hwnd, WM_CLOSE, 0, 0);
++        else DestroyWindow(s_d3d.hwnd);
++    }
+ 
+     rsx_set_backend(NULL);
+     s_d3d.initialized = 0;
+@@ -13008,7 +13074,7 @@ int rsx_d3d12_backend_pump_messages(void)
+         TranslateMessage(&msg);
+         DispatchMessageA(&msg);
+     }
+-    return s_d3d.window_closed ? -1 : 0;
++    return *(volatile int*)&s_d3d.window_closed ? -1 : 0;   /* 7929: set by the window thread */
+ }
+ 
+ static void rsx_d3d12_backend_present_hz_impl(void)
+@@ -13112,9 +13178,10 @@ void rsx_d3d12_backend_present(void)
+         const double t1 = hz_now(), dt = t1 - hz_t0, gap = last_end ? hz_t0 - last_end : 0;
+         if (dt > hz_ms() || gap > 3 * hz_ms())
+             fprintf(stderr, "[HITCH] #%u frame %llu: present %.1f ms (gap before %.1f): vs compile %.1f/%u  shader %.1f/%u  "
+-                    "pso %.1f/%u  gpu wait %.1f/%u  next-frame wait %.1f/%u  render_frame %.1f  draws %u%c",
++                    "pso %.1f/%u  gpu wait %.1f/%u  next-frame wait %.1f/%u  render_frame %.1f  draws %u  pipe wait %.1f/%u  Present %.1f/%u%c",
+                     ++n_hitch, (unsigned long long)s_d3d.frame_count, dt, gap, s_hz_t[0], s_hz_n[0], s_hz_t[1], s_hz_n[1],
+-                    s_hz_t[2], s_hz_n[2], s_hz_t[3], s_hz_n[3], s_hz_t[4], s_hz_n[4], s_hz_t[5], s_dbg_last_draws, 10);
++                    s_hz_t[2], s_hz_n[2], s_hz_t[3], s_hz_n[3], s_hz_t[4], s_hz_n[4], s_hz_t[5], s_dbg_last_draws,
++                    s_hz_t[6], s_hz_n[6], s_hz_t[7], s_hz_n[7], 10);   /* 7929: pipe wait = the frame clock waiting for the submit thread */
+         for (int k = 0; k < 8; k++) { s_hz_t[k] = 0; s_hz_n[k] = 0; }
+         last_end = t1;
+     }
