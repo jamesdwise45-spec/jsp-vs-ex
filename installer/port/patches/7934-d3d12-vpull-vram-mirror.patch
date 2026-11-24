@@ -6,12 +6,13 @@ fights (60-80 MB per batch at 3200-4000 draws), the first suspect for its 50-70 
 What. With the switch, two DEFAULT-heap mirrors are made at init (ring size + slack, and the index half: about 144 MB of video memory
 with the default 128 MB ring). The start of each batch's draw loop copies the used span of the batch's ring half (+ the Load2 slack)
 and of its index half into them (barriers COMMON -> COPY_DEST -> NON_PIXEL_SHADER_RESOURCE / INDEX_BUFFER; buffers decay to COMMON
-between ExecuteCommandLists, and batches run in queue order, so one mirror serves every batch, also with GPU_OVERLAP=1). The draws
+between ExecuteCommandLists, and batches run in queue order, so one mirror serves every batch, also with GPU_OVERLAP=1). The copy
+span is the batch's high-water mark of the ring offset (a guard; the offset only grows today). The draws
 bind the mirrors at the same offsets. The CPU writes exactly as before. [VPULL_VRAM] every 600 batches: MB copied per batch;
 GPU_TIME=1 shows the copy as "vram-copy". Mirror allocation fails: the old binding. Off by default.
 
 diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
-index 1f2e9c1..45d7c77 100644
+index ed3b644..75be406 100644
 --- a/libs/video/rsx_d3d12_backend.c
 +++ b/libs/video/rsx_d3d12_backend.c
 @@ -487,6 +487,7 @@ typedef struct RfFrame {
@@ -22,7 +23,7 @@ index 1f2e9c1..45d7c77 100644
  } RfFrame;
  static void render_frame_submit(const RfFrame* f);
  static void pipe_thread_tune(void);   /* 2921 */
-@@ -707,6 +708,21 @@ static int vpull_on(void)
+@@ -707,6 +708,23 @@ static int vpull_on(void)
      return s_vpull.on;
  }
  static void vpull_report(void);
@@ -35,7 +36,9 @@ index 1f2e9c1..45d7c77 100644
 + * changes. One mirror serves every batch: batches run in queue order, and each copy is fenced by its own barriers (buffers
 + * decay to COMMON between ExecuteCommandLists). Costs ring+16 MB of video memory and one copy per batch (GPU_TIME=1 shows it
 + * as "vram-copy"). No mirror (allocation failed, VPULL off): the old binding. */
-+static struct { int on; ID3D12Resource* ring; ID3D12Resource* ib; u64 n, bytes; } s_vv = { -1, NULL, NULL, 0, 0 };
++static struct { int on; ID3D12Resource* ring; ID3D12Resource* ib; u64 n, bytes; u32 hwm; } s_vv = { -1, NULL, NULL, 0, 0, 0 };
++/* The batch's highest ring offset so far (a guard: s_vpull.off only grows within a batch today). */
++static u32 vv_ring_hwm(void) { if (s_vpull.off > s_vv.hwm) s_vv.hwm = s_vpull.off; return s_vv.hwm; }
 +static int vpull_vram_on(void)
 +{
 +    if (s_vv.on < 0) { const char* e = getenv("VPULL_VRAM"); s_vv.on = (e && *e == '1') ? 1 : 0; }
@@ -44,7 +47,7 @@ index 1f2e9c1..45d7c77 100644
  /* Raw bind offset of the duck's texture, identified by CONTENT (duck.tga is
   * overwhelmingly yellow, avg 243,191,23). VRAM offsets move between runs, so a
   * hard-coded offset in a filter silently matches nothing and the run looks like
-@@ -1946,6 +1962,22 @@ static int init_d3d12(u32 width, u32 height)
+@@ -1954,6 +1972,22 @@ static int init_d3d12(u32 width, u32 height)
                  rsx_vpull_fill_lut((float*)lp_);
                  s_vpull.ring_mapped = (u8*)rp_; s_vpull.tab_mapped = (u8*)tp_;
                  fprintf(stderr, "[VPULL] vertex pulling on: %u MB byte ring x2 parity%c", mb, 10);
@@ -67,15 +70,15 @@ index 1f2e9c1..45d7c77 100644
              } else {
                  fprintf(stderr, "[VPULL] buffer allocation failed -- VPULL off%c", 10);
                  s_vpull.ring_mapped = NULL; s_vpull.tab_mapped = NULL; s_vpull.on = 0;
-@@ -9259,6 +9291,7 @@ static void rf_detach(RfFrame* f, int piped)
+@@ -9267,6 +9301,7 @@ static void rf_detach(RfFrame* f, int piped)
  {
      f->draws = s_d3d.draws; f->n = s_d3d.draw_count; f->parity = s_d3d.vp_parity;
      f->present = s_present_this_frame; f->piped = piped;
-+    f->vpull_bytes = s_vpull.off; f->ib_count = s_d3d.vp_ib_offset;   /* 7934 */
++    f->vpull_bytes = vv_ring_hwm(); s_vv.hwm = 0; f->ib_count = s_d3d.vp_ib_offset;   /* 7934: the batch's high-water mark */
      const rsx_state* st = s_d3d.current_rsx_state;
      f->have_st = st != NULL;
      if (st) for (u32 r = 0; r < 4; r++) for (u32 c = 0; c < 4; c++) f->vc[r * 4 + c] = st->vertex_constants[r][c];
-@@ -9474,9 +9507,43 @@ static void render_frame_submit(const RfFrame* f)
+@@ -9484,9 +9519,43 @@ static void render_frame_submit(const RfFrame* f)
              double _rec0 = perf_on() ? perf_now() : 0.0;
              int seen_small_vp = 0, captured = 0;
              /* VPULL: this batch's halves of the byte ring and the tables. */
@@ -120,7 +123,7 @@ index 1f2e9c1..45d7c77 100644
              const u64 vpull_tab_va = s_vpull.tab_mapped
                  ? s_vpull.tab->lpVtbl->GetGPUVirtualAddress(s_vpull.tab)
                    + (u64)f->parity * MAX_DRAWS * RSX_VPULL_TAB_BYTES : 0;
-@@ -9813,8 +9880,7 @@ static void render_frame_submit(const RfFrame* f)
+@@ -9823,8 +9892,7 @@ static void render_frame_submit(const RfFrame* f)
                  if (dr->indexed) {
                      if (!ib_bound) {
                          D3D12_INDEX_BUFFER_VIEW ibv;
@@ -130,9 +133,33 @@ index 1f2e9c1..45d7c77 100644
                          ibv.SizeInBytes = VP_MAX_INDICES * 4;
                          ibv.Format = DXGI_FORMAT_R32_UINT;
                          s_d3d.cmd_list->lpVtbl->IASetIndexBuffer(s_d3d.cmd_list, &ibv);
-@@ -13315,6 +13381,8 @@ void rsx_d3d12_backend_shutdown(void)
-     if (s_d3d.fence) s_d3d.fence->lpVtbl->Release(s_d3d.fence);
-     if (s_ovl.fence) { s_ovl.fence->lpVtbl->Release(s_ovl.fence); s_ovl.fence = NULL; }   /* 7931 */
+@@ -10621,6 +10689,7 @@ static void d3d12_clear(void* ud, u32 flags, u32 color, float depth, u8 stencil)
+     for (u32 _i = 0; _i < s_d3d.draw_count && _i < MAX_DRAWS; _i++) { s_d3d.draws[_i].indexed = 0; s_d3d.draws[_i].vpull = 0; }
+     s_ix_run_valid = 0;
+     s_vpull.off = 0; s_vpull.open = 0; s_vpull_gen++;   /* VPULL records end with the batch too */
++    s_vv.hwm = 0;   /* 7934: these records are gone */
+     s_d3d.draw_count   = 0;
+     s_d3d.vb_offset    = 0;
+     s_d3d.vp_vb_offset = 0;
+@@ -12063,6 +12132,7 @@ static u32 upload_vpull(const rsx_state* st, u32 first, u32 count, u32 prim)
+                 s_vpull.rec_base = gbase; s_vpull.seg_k = 0; s_vpull.seg_lo = 0; s_vpull.seg_hi = nv; s_vpull.seg_valid = 0;
+                 s_vpull.rec_k = nv + s_vpull.pad;
+                 { const u64 e = (u64)gbase + (u64)s_vpull.rec_k * S; s_vpull.off = e > s_vpull.ring_bytes ? s_vpull.ring_bytes : (u32)e; }
++                vv_ring_hwm();   /* 7934 */
+                 s_vpull.rec_noext = 1;
+                 s_vpull.vs_idx = gvs;
+                 s_vpull.rec_S = S; s_vpull.rec_lbase = s_vpull.lbase; s_vpull.rec_loc = s_vpull.loc;
+@@ -12165,6 +12235,7 @@ static u32 upload_vpull(const rsx_state* st, u32 first, u32 count, u32 prim)
+     else if (!reused) {
+       const u64 o = s_vpull.nstr > 1 ? (u64)rec_base + len : (u64)rec_base + (u64)s_vpull.rec_k * S;
+       s_vpull.off = o > s_vpull.ring_bytes ? s_vpull.ring_bytes : (u32)o; }
++    vv_ring_hwm();   /* 7934 */
+     if (!cont) s_vpull.rec_noext = (s_vpull.nstr > 1 || reused) ? 1 : 0;
+     if (s_vpull.nstr > 1 || reused) s_vpull.seg_valid = 0;   /* such a record is not extended */
+     if (!cont) {
+@@ -13326,6 +13397,8 @@ void rsx_d3d12_backend_shutdown(void)
+     if (s_ovl.fence) s_ovl.fence->lpVtbl->Release(s_ovl.fence);   /* 7931 */
+     memset(&s_ovl, 0, sizeof s_ovl);   /* 7931: a later init starts a new fence at 0, so no old value may be waited for */
      if (s_d3d.latency_wait) { CloseHandle(s_d3d.latency_wait); s_d3d.latency_wait = NULL; }   /* 7932 */
 +    if (s_vv.ring) { s_vv.ring->lpVtbl->Release(s_vv.ring); s_vv.ring = NULL; }   /* 7934 */
 +    if (s_vv.ib) { s_vv.ib->lpVtbl->Release(s_vv.ib); s_vv.ib = NULL; }
