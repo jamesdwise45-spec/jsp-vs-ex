@@ -1034,6 +1034,7 @@ void end_with(const std::string& text, bool quiet = false)
     guest_clock_end();
     save_replay();   // before the stepper is torn down; the session object still holds the recording after a failure
     if (g.glue) std::fprintf(stderr, "[net] saves %llu, of which without a snapshot (final frame) %llu\n", (unsigned long long)g.glue->commits(), (unsigned long long)g.glue->skipped());
+    if (g.glue) std::fputs(g.glue->arrival_summary().c_str(), stderr);   // DIAGNOSTIC (test10, snap-poll): how fast predicted frames became final
     if (g.bench && g.started_ms) bench_line("total", g.bs_total, (double)(GetTickCount64() - g.started_ms) / 1000.0);
     jsp_snapshot_ext_set_idle_hook(nullptr);   // the gate must not call into a finished session
     jsp_snapshot_ext_guard_summary();
