@@ -210,6 +210,14 @@ int main()
         Sim m; m.p.hi = 3; m.p.clamp(); m.rtt = [](uint64_t) { return 400.0; };
         CHECK(m.run(30000) == 3);
     }
+    // the stretch peak goes stale after about 1 s (a stall: no GekkoNet update, so no new peak)
+    {
+        CHECK(jpdr::stretch_recent(8000, 10000, 10000) == 8000);
+        CHECK(jpdr::stretch_recent(8000, 10000, 11000) == 8000);
+        CHECK(jpdr::stretch_recent(8000, 10000, 11001) == 0);
+        CHECK(jpdr::stretch_recent(8000, 0, 500) == 0);       // never taken
+        CHECK(jpdr::stretch_recent(8000, 10000, 9000) == 0);  // clock before the peak
+    }
     // time sync stretch: unchanged up to 1.5 frames ahead; steeper beyond; capped; the earlier rule with gain 1000 / max 2000
     {
         CHECK(jpdr::timesync_stretch_us(0.0f, 5000, 25000) == 0);
@@ -290,22 +298,24 @@ int main()
         m1.rtt = [](uint64_t t) { return t < 6000 ? 200.0 : 240.0; };   // 200: (200 - 33.3) / 2 + 16 = 99.3 ms -> 3; 240: 119.3 ms -> 4
         for (int i = 0; i < 1200; i++) { m1.run(33); jpdr::note_time(m1.s, m1.t, m1.cur); }
         CHECK(m1.cur == 4); CHECK(jpdr::settled(m1.s) == 4);
-        jpdr::carry_keep(c, 0x1234, m1.s);
-        CHECK(c.link == 0x1234 && c.delay == 4);
+        jpdr::carry_keep(c, 0x1234, m1.s, 3);   // that match's manifest said 3
+        CHECK(c.link == 0x1234 && c.delay == 4 && c.man == 3);
         CHECK(jpdr::carry_start(c, 0x1234, 3, p) == 4);   // same link and peer
         CHECK(jpdr::carry_start(c, 0x9999, 3, p) == 3);   // another link, room or peer
         CHECK(jpdr::carry_start(c, 0, 3, p) == 3);        // no key (no plan)
         jpdr::Params p3; p3.hi = 3; p3.clamp();
-        CHECK(jpdr::carry_start(c, 0x1234, 2, p3) == 3);  // clamped to MAX
+        CHECK(jpdr::carry_start(c, 0x1234, 3, p3) == 3);  // clamped to MAX
+        CHECK(jpdr::carry_start(c, 0x1234, 2, p) == 2);   // the host set JSP_INPUT_DELAY=2 since: the manifest wins
+        CHECK(jpdr::carry_start(c, 0x1234, 5, p) == 5);
         // the carried start is the guard's base: a start of 4 may not go above 5 before 10 s (MAX 4 here anyway), and the next match begins there
         Sim m2; m2.p.clamp(); m2.cur = jpdr::carry_start(c, 0x1234, 3, m2.p); m2.rtt = [](uint64_t) { return 240.0; };
         CHECK(m2.cur == 4); CHECK(m2.run(30000) == 4); CHECK(m2.changes == 0); CHECK(m2.s.start_delay == 4);
         // a match under 20 s leaves -1: the next match uses the default
         jpdr::State short_m; uint64_t t = 1000;
         for (int i = 0; i < 300; i++, t += 33) jpdr::note_time(short_m, t, 4);
-        jpdr::carry_keep(c, 0x1234, short_m);
+        jpdr::carry_keep(c, 0x1234, short_m, 3);
         CHECK(c.delay == -1); CHECK(jpdr::carry_start(c, 0x1234, 3, p) == 3);
-        jpdr::carry_keep(c, 0, m1.s);   // no key: nothing to carry
+        jpdr::carry_keep(c, 0, m1.s, 3);   // no key: nothing to carry
         CHECK(c.delay == -1 && jpdr::carry_start(c, 0, 3, p) == 3);
     }
     std::printf("net delay rule: %d checks, %d failed\n", g_checks, g_fail);

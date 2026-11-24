@@ -299,7 +299,7 @@ the top-left corner, above the fight HUD's top bar:
 | Part | What it is | Where the value comes from |
 |---|---|---|
 | path | `direct`, or `relay` when the match goes through the re-psn server; `-` before it is known | direct IP is always direct; over re-psn, the path the rendezvous chose |
-| delay | the input delay of this match in game ticks (30 per second) | the host's `JSP_INPUT_DELAY`, sent to the client in the settings handshake, so both PCs show the same |
+| delay | this PC's input delay in game ticks (30 per second) | it starts at the host's `JSP_INPUT_DELAY` (sent to the client in the settings handshake) or, on a rematch on the same link, where the last match settled; the adaptive input delay then sets each PC's own, so the two PCs can show different values |
 | last | how many ticks the last rollback went back and ran again; `-` before the first | counted by the port each time the session rolls back |
 
 The text is rebuilt at most four times a second and redrawn only when it changes. It uses the game font of the port's overlay

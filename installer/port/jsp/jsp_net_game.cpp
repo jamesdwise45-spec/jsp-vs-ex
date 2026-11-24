@@ -545,6 +545,7 @@ jpdr::Carry g_ad_carry;      // ENHANCEMENT (rematch carry): per link (conn_open
 int g_ad_carry_on = 1;       // JSP_INPUT_DELAY_AUTO_CARRY (0 = off)
 // FIX (depth trigger vs a slow peer): the time sync's largest stretch of this PC's ticks in about the last second (us; boundary), for jpdr::Reading. Per match.
 uint32_t g_ts_peak_us = 0; uint64_t g_ts_peak_ms = 0;
+int g_ad_man_delay = -1;     // ENHANCEMENT (rematch carry): the manifest's InputDelay of the running match (start_session), kept with the carry
 // The link and its peer, for the carry: the plan's session id (the host's random id of this link), every remote endpoint and the re-psn room. 0 = no plan.
 uint64_t link_key()
 {
@@ -606,7 +607,7 @@ void adapt_delay(uint64_t now)
     const jpdr::Decision d = jpdr::step(g_ad, g_ad_p, now, [] {
         const SessionStats st = g.sess.stats();
         jpdr::Reading r; r.ping_avg = st.ping_ms; r.jitter = st.jitter_ms; r.last_ping = st.last_ping_ms; r.rtt_seq = st.rtt_seq; r.cur = st.local_delay;
-        r.stretch_us = g_ts_peak_us;   // FIX (depth trigger vs a slow peer)
+        r.stretch_us = jpdr::stretch_recent(g_ts_peak_us, g_ts_peak_ms, GetTickCount64());   // FIX (depth trigger vs a slow peer): 0 when over ~1 s old
         return r;
     });
     if (d.why[0] == 's' && (g_ad.deep_skips == 1 || g_ad.deep_skips % 20 == 0))   // FIX (depth trigger vs a slow peer): the first skip of a match, then every 20th
@@ -1066,7 +1067,7 @@ void end_with(const std::string& text, bool quiet = false)
     g.last_end_ok = er.last_end_ok;
     if (g.started_ms) g.fresh_gate = true;
     // ENHANCEMENT (rematch carry): what this match settled on, for the next session on this link (a match that did not run keeps what was there)
-    if (g.started_ms && !g.bench && g_ad_on > 0 && g_ad_carry_on) jpdr::carry_keep(g_ad_carry, link_key(), g_ad);
+    if (g.started_ms && !g.bench && g_ad_on > 0 && g_ad_carry_on) jpdr::carry_keep(g_ad_carry, link_key(), g_ad, g_ad_man_delay);
     reset_match();
 }
 // After a local failure the peer is told WHY by a handshake Cancel (Gekko's disconnect alone would show it only 'Opponent disconnected'). The peer waits a moment for it.
@@ -1570,6 +1571,7 @@ void start_session(ppu_context* c)
     // The start delay: the manifest's (both peers agree on it), or with the rematch carry what the last match on this link settled on (per peer: GekkoNet
     // stamps every input with its frame, so the peers need not start alike; see adapt_delay).
     const int man_delay = (int)vals.v[static_cast<size_t>(jpsm::Id::InputDelay)];
+    g_ad_man_delay = man_delay;
     adapt_settings();
     int start_delay = man_delay;
     if (!g.bench && g_ad_on > 0 && g_ad_carry_on) {
@@ -1577,7 +1579,9 @@ void start_session(ppu_context* c)
         start_delay = jpdr::carry_start(g_ad_carry, lk, man_delay, g_ad_p);
         if (lk && g_ad_carry.link == lk)   // one line per session on a link that already ran a match
             std::fprintf(stderr, "[net] input delay starts at %d ticks (%s; manifest %d; JSP_INPUT_DELAY_AUTO_CARRY=0 turns it off)\n", start_delay,
-                         g_ad_carry.delay >= 0 ? "carried: the last match on this link settled there" : "the manifest's: the last match on this link ran under 20 s", man_delay);
+                         g_ad_carry.delay < 0 ? "the manifest's: the last match on this link ran under 20 s"
+                         : g_ad_carry.man != man_delay ? "the manifest's: the host's InputDelay changed since the last match"
+                         : "carried: the last match on this link settled there", man_delay);
     }
     cfg.local_delay.assign(g.plan.local_count, (uint8_t)start_delay);
     g.bv.delay = start_delay;   // status badge: this PC's input delay (adapt_delay keeps it current)

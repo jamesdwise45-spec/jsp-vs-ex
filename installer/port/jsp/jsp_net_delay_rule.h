@@ -137,11 +137,13 @@ inline int settled(const State& s)
 // its peer (jsp_net_game.cpp: the plan's session id, the peer's endpoint and the room), never 0; the game also clears the carry when a link opens or closes, so
 // it never crosses rooms or peers. carry_keep at the end of a match (settled(): -1 when it ran under 20 s, and then the next match uses the default);
 // carry_start at the next session start: settled() of the match before when the key is the same and it is >= 0 (clamped to MIN..MAX), else `def`.
-struct Carry { uint64_t link = 0; int delay = -1; };
-inline void carry_keep(Carry& c, uint64_t link, const State& s) { c.link = link; c.delay = link ? settled(s) : -1; }
+// `man` / `def` is the manifest's InputDelay of that match / of the new one: when the host changed JSP_INPUT_DELAY in between, the manifest's value wins
+// (review of 9c628fe: an explicit host setting must still decide the start of a rematch).
+struct Carry { uint64_t link = 0; int delay = -1; int man = -1; };
+inline void carry_keep(Carry& c, uint64_t link, const State& s, int man) { c.link = link; c.delay = link ? settled(s) : -1; c.man = man; }
 inline int carry_start(const Carry& c, uint64_t link, int def, const Params& p)
 {
-    if (!link || c.link != link || c.delay < 0) return def;
+    if (!link || c.link != link || c.delay < 0 || c.man != def) return def;
     return c.delay < p.lo ? p.lo : c.delay > p.hi ? p.hi : c.delay;
 }
 
@@ -255,6 +257,13 @@ Decision step(State& s, const Params& p, uint64_t now, Read&& read)
 // JSP_TIMESYNC_GAIN_US (5000) us, up to JSP_TIMESYNC_MAX_US (25000) us a tick, so the ahead PC settles about 4-5 frames ahead of a 20 ticks/s PC instead of
 // at the window, and its own input delay covers the trip. Only when this PC flips moves (per PC; the inputs a tick simulates are unchanged).
 // JSP_TIMESYNC_GAIN_US=1000 JSP_TIMESYNC_MAX_US=2000 is the earlier rule.
+// The stretch peak for Reading::stretch_us at `now`: 0 when the peak was taken more than `max_age_ms` ago (review of 9c628fe: the peak is updated only on
+// iterations where GekkoNet updated, so a stall over a second would otherwise keep an old peak).
+inline uint32_t stretch_recent(uint32_t peak_us, uint64_t peak_ms, uint64_t now, uint64_t max_age_ms = 1000)
+{
+    return peak_ms && now >= peak_ms && now - peak_ms <= max_age_ms ? peak_us : 0u;
+}
+
 inline uint32_t timesync_stretch_us(float ahead, int gain_us, int max_us)
 {
     if (!(ahead > 0.5f)) return 0;

@@ -57,6 +57,7 @@ struct Match {
     bool waiting = false; double press_t = 0; uint16_t press_bits = 0; int press_frame = -1; bool applied = false, acked = false;
     int last_live = -1;    // the newest live (not rolling back) Advance frame seen
     int press_min = -1;    // the frame the waiting press lands on: earlier frames are not its own
+    int max_stamp = -1;    // the highest frame a local input was stamped for so far (on_local): GekkoNet adds local inputs in sequence only
     struct Ack { int frame; double t; } ack[32] = {}; int ack_n = 0; int ack_last = -2;
     uint32_t presses = 0, timeouts = 0; Dist apply, confirm;
 };
@@ -93,15 +94,19 @@ inline void on_rollback(Match& m, double now, int64_t depth)
 }
 
 // The local pad's buttons sampled for an update (local player 0), with this PC's input delay now (ticks). A newly pressed button starts a sample when none
-// waits; it lands on the frame after the last live one + the delay (before any live frame was seen: on frame `delay`, as GekkoNet's first one).
+// waits; it lands on the frame after the last live one + the delay (before any live frame was seen: on frame `delay`, as GekkoNet's first one), or, when
+// that frame is already filled, the frame after the highest one stamped so far (review of 9c628fe: after a delay decrease GekkoNet drops new local inputs
+// until the clock catches up, because InputBuffer::AddInput accepts only the next frame in sequence).
 inline void on_local(Match& m, double now, uint16_t buttons, int delay = 0)
 {
+    const int stamp = m.last_live + 1 + (delay > 0 ? delay : 0), prev_max = m.max_stamp;
+    if (stamp > m.max_stamp) m.max_stamp = stamp;
     const uint16_t fresh = (uint16_t)(buttons & ~m.prev_buttons);
     m.prev_buttons = buttons;
     press_check(m, now);
     if (!fresh || m.waiting) return;
     m.waiting = true; m.press_t = now; m.press_bits = fresh; m.press_frame = -1; m.applied = m.acked = false; m.ack_n = 0; m.ack_last = -2; m.presses++;
-    m.press_min = m.last_live + 1 + (delay > 0 ? delay : 0);
+    m.press_min = stamp > prev_max + 1 ? stamp : prev_max + 1;
 }
 
 inline void ack_resolve(Match& m)
