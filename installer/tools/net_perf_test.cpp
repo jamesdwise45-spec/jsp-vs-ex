@@ -3,6 +3,7 @@
 #include "jsp_net_perf.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <string>
 
@@ -92,6 +93,57 @@ int main()
         CHECK(!m.waiting && m.timeouts == 1);
         jpperf::on_local(m, t + 2633, 0x0000); jpperf::on_local(m, t + 2666, 0x0200);
         CHECK(m.presses == 4 && m.waiting);
+    }
+    // FIX (press->shown under-measured): press, release, press inside the delay window. At delay 4 the first press (frame 21 + 4) is not sampled (the
+    // sampler waits for an earlier one); the second, at the update after live frame 22, lands on frame 27. Frame 25 still holds the first press's button: not
+    // the second press's frame. The old code took frame 25 and showed it ~66 ms early.
+    {
+        jpperf::Match m; double t = 1000;
+        for (int f = 0; f <= 20; f++) { jpperf::on_advance(m, f, false, 0x0000); jpperf::on_frame(m, t, true, 4); t += 33.3; }
+        CHECK(m.last_live == 20);
+        jpperf::on_local(m, t, 0x0100, 4);                 // an earlier press that is still waiting (its own frame 25 later)
+        CHECK(m.waiting && m.press_min == 25);
+        m.waiting = false;                                 // say it was dropped: the sampler is free while its frame is still in the pipeline
+        jpperf::on_advance(m, 21, false, 0x0000); jpperf::on_frame(m, t, true, 4); t += 33.3;
+        jpperf::on_local(m, t, 0x0000, 4);                 // released
+        jpperf::on_advance(m, 22, false, 0x0000); jpperf::on_frame(m, t, true, 4); t += 33.3;
+        const double press_t = t;
+        jpperf::on_local(m, t, 0x0100, 4);                 // pressed again: lands on 22 + 1 + 4 = 27
+        CHECK(m.waiting && m.presses == 2 && m.press_min == 27);
+        for (int f = 23; f <= 26; f++) {                   // 25 and 26 hold the first press's button (and a rollback of 27 does not count either)
+            jpperf::on_advance(m, f, false, f == 25 || f == 26 ? 0x0100 : 0x0000);
+            if (f == 26) jpperf::on_advance(m, 27, true, 0x0100);
+            jpperf::on_frame(m, t, true, 4); t += 33.3;
+            CHECK(m.press_frame == -1 && !m.applied);
+        }
+        jpperf::on_advance(m, 27, false, 0x0100);          // the second press's own frame
+        CHECK(m.press_frame == 27);
+        jpperf::on_frame(m, t, true, 4);
+        CHECK(m.applied && m.apply.n == 1);
+        CHECK(std::abs(m.apply.max - 4 * 33.3) < 0.01);   // the 4-tick delay: shown 4 frames after the press (the old code: 2)
+        CHECK(std::abs(m.apply.max - (t - press_t)) < 0.01);
+        // after a delay decrease (4 -> 1) GekkoNet drops new local inputs until the clock catches up: frames up to 27 are already filled at delay 4, so a
+        // press at the update after live frame 23 with delay 1 (23 + 1 + 1 = 25) lands on 28, the next frame in sequence, not on 25
+        jpperf::Match d;
+        for (int f = 0; f <= 22; f++) { jpperf::on_advance(d, f, false, 0x0000); jpperf::on_local(d, 0, 0x0000, 4); }
+        CHECK(d.max_stamp == 27);   // the last on_local came after live frame 22: 22 + 1 + 4
+        jpperf::on_advance(d, 23, false, 0x0000);
+        jpperf::on_local(d, 0, 0x0400, 1);                  // pressed right after the decrease
+        CHECK(d.waiting && d.press_min == 28);
+        jpperf::on_advance(d, 25, false, 0x0400);           // (25 holds the button from an earlier press: not this one)
+        CHECK(d.press_frame == -1);
+        jpperf::on_advance(d, 28, false, 0x0400);
+        CHECK(d.press_frame == 28);
+        // the same frame sampled twice (an update with no advance): the second stamp is dropped by GekkoNet, so a press there lands one later
+        jpperf::Match e;
+        jpperf::on_advance(e, 10, false, 0x0000);
+        jpperf::on_local(e, 0, 0x0000, 2);                  // stamped 13
+        jpperf::on_local(e, 1, 0x0008, 2);                  // same frame: 13 is taken, the press lands on 14
+        CHECK(e.press_min == 14);
+        // delay 0 (and no live frame seen yet): the floor is the next frame, as before
+        jpperf::Match z;
+        jpperf::on_local(z, 0, 0x0001); CHECK(z.press_min == 0);
+        jpperf::on_advance(z, 5, false, 0x0001); CHECK(z.press_frame == 5);
     }
     // the summary: five [perf] lines, the connection named, no line when nothing was measured missing its fields
     {

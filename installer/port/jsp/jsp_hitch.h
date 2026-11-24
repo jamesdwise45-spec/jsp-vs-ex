@@ -95,10 +95,23 @@ inline int cause(const Gap& g, const Clock& c)
     return CGuest;
 }
 
+// DIAGNOSTIC (per-match pipeline counts, toolkit 2922): the running totals of the game's pipeline requests that missed the in-memory cache,
+// warm (built ahead by the warm-up) and cold (built on request), and the cold build time. main.cpp points this at
+// rsx_d3d12_pipeline_counts; it stays null in the host test, and then the summary has no pipelines part.
+inline void (*g_pipeline_counts)(long* warm, long* cold, double* cold_ms) = nullptr;
+struct Pipes { long warm = 0, cold = 0; double cold_ms = 0; bool ok = false; };
+inline Pipes pipes_now()
+{
+    Pipes p;
+    if (g_pipeline_counts) { g_pipeline_counts(&p.warm, &p.cold, &p.cold_ms); p.ok = true; }
+    return p;
+}
+
 struct Match {
     Gap gap;
     uint32_t hitches = 0, lines = 0;
     uint32_t by_cause[kCauses] = {};
+    Pipes pipes0;   // the pipeline totals at the match's first measured frame (close_gap), so the summary counts the fight only
 };
 
 // Main thread, per boundary that the gap covers. Every part is clamped at 0 (timer granularity, a caller's subtraction).
@@ -127,6 +140,7 @@ inline void add_rollback(Gap& g, uint32_t depth) { g.rollbacks++; if (depth > g.
 inline std::string close_gap(Match& m, double gap_ms, uint32_t tick, const Clock& c)
 {
     std::string s;
+    if (!m.pipes0.ok) m.pipes0 = pipes_now();
     if (gap_ms > kHitchMs) {
         m.hitches++;
         const int k = cause(m.gap, c);
@@ -169,8 +183,16 @@ inline std::string summary(const Match& m)
     char b[64];
     for (int k = 0; k < kCauses; k++) if (m.by_cause[k]) { std::snprintf(b, sizeof b, " %s %u", cause_name(k), m.by_cause[k]); s += b; }
     if (!m.hitches) s += " none";
-    std::snprintf(b, sizeof b, " | %u lines written, %u not (cap %u)\n", m.lines, m.hitches - m.lines, kMaxLines);
+    std::snprintf(b, sizeof b, " | %u lines written, %u not (cap %u)", m.lines, m.hitches - m.lines, kMaxLines);
     s += b;
+    if (m.pipes0.ok) {   // DIAGNOSTIC (toolkit 2922): pipelines the fight asked for, warm (built ahead) vs cold (built during the fight)
+        const Pipes p = pipes_now();
+        char pb[128];
+        std::snprintf(pb, sizeof pb, " | pipelines: %ld warm, %ld cold (%.0f thread-ms building)", p.warm - m.pipes0.warm, p.cold - m.pipes0.cold,
+                      p.cold_ms - m.pipes0.cold_ms);
+        s += pb;
+    }
+    s += '\n';
     return s;
 }
 

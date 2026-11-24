@@ -7,7 +7,8 @@
 // rollback hooks are installed. Any non-zero value is on (not empty, first character not '0'), as for JSP_ROLLBACK.
 // Values, all already known to the session:
 //   path   "direct" for a direct-IP session; over re-psn the rendezvous' path (jsp_net_repsn.h path_name: "direct" or "relay")
-//   delay  the input delay of the match in ticks (the manifest's InputDelay: the host's value, the same on both PCs)
+//   delay  this PC's input delay in ticks (it starts at the manifest's InputDelay, the host's value, or the rematch carry; the adaptive delay changes it
+//          per PC, so the two PCs may show different values)
 //   last   the length of the last rollback in ticks (the ticks the game went back and ran again: current tick minus the rollback target)
 //   max    the largest rollback of the session, count the number of rollbacks (log line only)
 // "f" is a game tick (30 per second); the game font has printable ASCII only, so the separator is '|', not a middle dot.

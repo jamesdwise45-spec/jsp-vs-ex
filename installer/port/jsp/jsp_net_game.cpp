@@ -136,6 +136,8 @@ unsigned long long jsp_native_room_seen_ms(void);   // jsp_net_native.cpp (ENHAN
 unsigned long long jsp_native_loading_seen_ms(void);   // jsp_net_native.cpp (FIX, mapping run U4): when the online loading scene last ran (0 = never)
 unsigned long long jsp_native_page_seen_ms(void);   // jsp_net_native.cpp (ENHANCEMENT, JSP_PICK_NATIVE_SELECT=1): when the Battle settings page last ran (0 = never)
 uint32_t cellGcm_flip_request_count(void);   // toolkit (FIX pick7, the freeze owner while the after-match menu is up): flips the game requested
+void jsp_sound_preload_install(void);        // jsp_sound_preload.cpp (FIX, test8 sound-barrier hitches): the sound archive held in RAM (JSP_SOUND_PRELOAD_MB)
+void jsp_sound_preload_fight_start(void);    // jsp_sound_preload.cpp: each session start, how much is still in RAM; the rest read again
 }
 
 namespace {
@@ -512,7 +514,7 @@ void badge(const std::string& b) { if (b == g.badge_shown) return; g.badge_shown
 void ping_hide() { if (g.ping_shown.empty()) return; g.ping_shown.clear(); redraw(); }
 std::string path_word() { const int k = g.path_kind.load(); return k == 1 ? "direct" : k == 2 ? "relay" : ""; }
 // ENHANCEMENT (input lag, smoothness audit cause 2): ON by default since 2026-11-21 (JSP_INPUT_DELAY_AUTO=0 turns it off). On a good link (ping <= ~40 ms with little jitter) it settles on 1 tick (the start value is the
-// manifest's InputDelay, default 2), and it only goes higher when the trip needs it. The peers need not agree on it: GekkoNet stamps each input with its
+// manifest's InputDelay, default 3 since test10: every real link in the bundles went 2 -> 3 at its first reading), and it only goes higher when the trip needs it. The peers need not agree on it: GekkoNet stamps each input with its
 // frame, both PCs simulate the same stamped inputs, and a delay change only moves which frame a local input lands on (sync.cpp SetDelay: a longer delay
 // repeats the last input to fill the gap; a shorter one drops local inputs until the clock catches up). So the determinism rule is not touched.
 // ENHANCEMENT (adaptive input delay). Every 2 s this peer sets its OWN input delay from the measured round trip: the delay that covers the one-way trip plus
@@ -527,6 +529,10 @@ std::string path_word() { const int k = g.path_kind.load(); return k == 1 ? "dir
 // (all JSP_INPUT_DELAY_AUTO_*; see the header for each). Read once per process.
 // Each peer changes only its own delay: inputs are stamped with their tick, so the two peers need not agree (the manifest's InputDelay is the start value).
 // FIX (rematch inherited delay state): the rule's state is per match (reset_match).
+// ENHANCEMENT (rematch carry, JSP_INPUT_DELAY_AUTO_CARRY=0 turns it off): what the rule's state of a match says it settled on (jpdr::settled, >= 20 s) is kept
+// at end_with with a key of the link and its peer (link_key), and the next session on the SAME link starts there instead of the manifest's value
+// (start_session); conn_open and conn_close clear it, so it never crosses a link, a room or a peer. Per peer like every delay change: only which frame this
+// PC's own inputs land on moves.
 // FIX (fight-start stall, runs native-rb1/rb2: the first reading of a match said ping 243-416 ms on a 60 ms link and jumped the delay to 4): see the guard above.
 // FIX (ping includes the answer wait): GekkoNet answers a ping at its next poll, once a tick, so the measured round trip carries up to one tick (33 ms) of
 // waiting that is no network time (rb1: 30 ms each way measured 94-100 ms); the rule takes up to half the round trip, capped at one tick, off before halving.
@@ -537,6 +543,22 @@ std::atomic<int> g_pick_active{0};   // jsp_pick_active(): a pair is applied at 
 jpdr::State g_ad;   // per match (reset_match)
 int g_ad_on = -1;   // the switches are read once per process
 jpdr::Params g_ad_p;
+jpdr::Carry g_ad_carry;      // ENHANCEMENT (rematch carry): per link (conn_open / conn_close clear it)
+int g_ad_carry_on = 1;       // JSP_INPUT_DELAY_AUTO_CARRY (0 = off)
+// FIX (depth trigger vs a slow peer): the time sync's largest stretch of this PC's ticks in about the last second (us; boundary), for jpdr::Reading. Per match.
+uint32_t g_ts_peak_us = 0; uint64_t g_ts_peak_ms = 0;
+int g_ad_man_delay = -1;     // ENHANCEMENT (rematch carry): the manifest's InputDelay of the running match (start_session), kept with the carry
+// The link and its peer, for the carry: the plan's session id (the host's random id of this link), every remote endpoint and the re-psn room. 0 = no plan.
+uint64_t link_key()
+{
+    if (!g.plan_ready || !g.plan.session_id || g.plan.remotes.empty()) return 0;
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&h](const void* p, size_t n) { const uint8_t* b = (const uint8_t*)p; for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 1099511628211ull; } };
+    const uint64_t sid = g.plan.session_id, room = g.presence_room.load();
+    mix(&sid, sizeof sid); mix(&room, sizeof room); mix(&g.plan.total_players, 1); mix(&g.plan.local_first, 1);
+    for (const PeerSlots& r : g.plan.remotes) { const std::string e = to_string(r.ep); mix(e.data(), e.size()); mix(&r.first_slot, 1); }
+    return h ? h : 1;
+}
 // ENHANCEMENT (rollback hitches, JSP_ROLLBACK_PREDICTION=N, 1..8, default 6; 8 = as before): how many ticks this PC may run ahead on predicted inputs before
 // it waits (GekkoNet's input prediction window, set at the first synced boundary of each match; the session is created with 8). It caps the deepest
 // rollback, and so the longest hitch, at N ticks (testers: 8-tick rollbacks). Each PC alone: it only changes when this PC waits, never which inputs a tick
@@ -558,6 +580,8 @@ void adapt_settings()
     num("JSP_INPUT_DELAY_AUTO_UP_VOTES", p.up_votes); num("JSP_INPUT_DELAY_AUTO_DOWN_VOTES", p.down_votes);
     num("JSP_INPUT_DELAY_AUTO_DEEP_TICKS", p.deep_ticks); num("JSP_INPUT_DELAY_AUTO_DEEP_COUNT", p.deep_count);
     num("JSP_INPUT_DELAY_AUTO_DEEP_WINDOW_MS", p.deep_window_ms); num("JSP_INPUT_DELAY_AUTO_HOLD_MS", p.hold_ms);
+    num("JSP_INPUT_DELAY_AUTO_DEADBAND_MS", p.deadband_ms); num("JSP_INPUT_DELAY_AUTO_DEEP_STRETCH_US", p.deep_stretch_us);
+    num("JSP_INPUT_DELAY_AUTO_CARRY", g_ad_carry_on);
     num("JSP_ROLLBACK_PREDICTION", g_ad_pred);
     num("JSP_TIMESYNC_GAIN_US", g_ts_gain_us); num("JSP_TIMESYNC_MAX_US", g_ts_max_us); num("JSP_TEST_SLOW_MS", g_test_slow_ms);
     g_ts_gain_us = std::min(std::max(g_ts_gain_us, 0), 20000); g_ts_max_us = std::min(std::max(g_ts_max_us, 0), 50000); g_test_slow_ms = std::min(std::max(g_test_slow_ms, 0), 100);
@@ -569,8 +593,9 @@ void adapt_settings()
     if (!g_ad_on) std::fprintf(stderr, "[net] adaptive input delay off (JSP_INPUT_DELAY_AUTO=0: the manifest's InputDelay holds)\n");
     else if (p.rule == 1) std::fprintf(stderr, "[net] adaptive input delay on (%d..%d ticks, margin %d ms; JSP_INPUT_DELAY_AUTO=0 turns it off)\n", p.lo, p.hi, p.margin_ms);
     else std::fprintf(stderr, "[net] adaptive input delay on (%d..%d ticks, margin %d ms; rule 2: p%d of %d round trips, margin %d ms from %d ms, first reading %d ms, "
-                      "depth trigger %d rollbacks > %d ticks in %d ms; JSP_INPUT_DELAY_AUTO=0 turns it off)\n", p.lo, p.hi, p.margin_ms, p.pct, p.samples, p.high_margin_ms,
-                      p.high_ping_ms, p.first_ms, p.deep_count, p.deep_ticks, p.deep_window_ms);
+                      "depth trigger %d rollbacks > %d ticks in %d ms, not while stretching > %d us; deadband %d ms; rematch carry %s; JSP_INPUT_DELAY_AUTO=0 turns it off)\n",
+                      p.lo, p.hi, p.margin_ms, p.pct, p.samples, p.high_margin_ms, p.high_ping_ms, p.first_ms, p.deep_count, p.deep_ticks, p.deep_window_ms,
+                      p.deep_stretch_us, p.deadband_ms, g_ad_carry_on ? "on" : "off");
 }
 // A rollback of `depth` ticks (the glue's rollback, main thread): rule 2's depth trigger.
 void adapt_note_rollback(int64_t depth) { if (g_ad_on > 0 && !g.bench) jpdr::note_rollback(g_ad, g_ad_p, GetTickCount64(), depth); }
@@ -580,11 +605,16 @@ void adapt_delay(uint64_t now)
     if (!g.sess.synced()) return;
     if (!g_ad.start && g_ad_pred != 8) g.sess.set_prediction_window((uint8_t)g_ad_pred);   // once per match (g_ad is reset per match)
     if (!g_ad_on) { if (!g_ad.start) g_ad.start = now; return; }
+    jpdr::note_time(g_ad, now, g.bv.delay);   // ENHANCEMENT (rematch carry): the time at each delay, for jpdr::settled at the match end
     const jpdr::Decision d = jpdr::step(g_ad, g_ad_p, now, [] {
         const SessionStats st = g.sess.stats();
         jpdr::Reading r; r.ping_avg = st.ping_ms; r.jitter = st.jitter_ms; r.last_ping = st.last_ping_ms; r.rtt_seq = st.rtt_seq; r.cur = st.local_delay;
+        r.stretch_us = jpdr::stretch_recent(g_ts_peak_us, g_ts_peak_ms, GetTickCount64());   // FIX (depth trigger vs a slow peer): 0 when over ~1 s old
         return r;
     });
+    if (d.why[0] == 's' && (g_ad.deep_skips == 1 || g_ad.deep_skips % 20 == 0))   // FIX (depth trigger vs a slow peer): the first skip of a match, then every 20th
+        std::fprintf(stderr, "[net] input delay %d kept: %d rollbacks deeper than %d ticks, but this PC stretches its ticks %u us for a slower peer (%u skipped this match)\n",
+                     d.cur, g_ad_p.deep_count, g_ad_p.deep_ticks, g_ad.stretch_us, g_ad.deep_skips);
     if (d.want < 0 || d.want == d.cur) return;
     g.sess.set_local_delay((uint8_t)d.want); g.bv.delay = d.want;
     // The line starts as before ("input delay A -> B ticks (ping P ms, jitter J ms"): GekkoNet's averages, whatever the rule.
@@ -973,7 +1003,8 @@ void reset_match()
     g.last_run_ms = g.started_ms = 0; g.settings_shown_ms = 0;   // started_ms = 0: the presence no longer counts a match
     g.bv = jpnb::Values(); g.badge_every = jpnb::Every(); g.status_every = jpnb::Every(); g.ping_every = jpnb::Every();
     g.record = false; g.match_winner = 0; ko_clear();
-    g_ad = jpdr::State();   // ENHANCEMENT (adaptive input delay): per match
+    g_ad = jpdr::State();   // ENHANCEMENT (adaptive input delay): per match (the rematch carry was kept by end_with before this)
+    g_ts_peak_us = 0; g_ts_peak_ms = 0;   // FIX (depth trigger vs a slow peer): per match
     g_perf = jpperf::Match();   // ENHANCEMENT (match perf summary): per match
     g_hz = jph::Match(); g_hz_exit = 0; g_hz_after_rerun = false;   // DIAGNOSTIC (per-hitch line): per match
     g_audio_waits = g_audio_timeouts = 0; g_audio_wait_ms = 0;
@@ -1037,6 +1068,8 @@ void end_with(const std::string& text, bool quiet = false)
     // ENHANCEMENT (same-link rematch): a match that ran ended inside its fight; a re-armed match waits until that fight is gone (boundary, fresh_gate)
     g.last_end_ok = er.last_end_ok;
     if (g.started_ms) g.fresh_gate = true;
+    // ENHANCEMENT (rematch carry): what this match settled on, for the next session on this link (a match that did not run keeps what was there)
+    if (g.started_ms && !g.bench && g_ad_on > 0 && g_ad_carry_on) jpdr::carry_keep(g_ad_carry, link_key(), g_ad, g_ad_man_delay);
     reset_match();
 }
 // After a local failure the peer is told WHY by a handshake Cancel (Gekko's disconnect alone would show it only 'Opponent disconnected'). The peer waits a moment for it.
@@ -1340,7 +1373,7 @@ public:
         { static const bool ln = [] { char b[8] = {}; return jsp_setting_get("JSP_NET_LOAD_NEUTRAL", b, sizeof b) && b[0] == '1'; }();
           if (ln && !g.fight_seen && !g.bench) { jsi::Pad n; n.connected = true; const auto b = n.pack(); for (int i = 0; i < 8; i++) canon[i] = b[i]; } }
         pad_pack_to_wire(canon, wire);   // the device is physical port 0 on every machine; the table slot it feeds is the plan's local slot
-        if (perf_on()) jpperf::on_local(g_perf, perf_now(), (uint16_t)(canon[0] | (canon[1] << 8)));   // ENHANCEMENT (match perf summary): the press sample
+        if (perf_on()) jpperf::on_local(g_perf, perf_now(), (uint16_t)(canon[0] | (canon[1] << 8)), g.bv.delay);   // ENHANCEMENT (match perf summary): the press sample; FIX: + the delay = its frame
     }
     void advanced(int32_t frame, bool rolling_back, const jsi::Pad* in, unsigned players) override   // ENHANCEMENT (match perf summary): the press's frame
     {
@@ -1537,8 +1570,23 @@ void start_session(ppu_context* c)
     jsp_snapshot_ext_set_idle_hook([] { g.sess.poll(); });
     SessionConfig cfg;
     cfg.max_prediction = (uint8_t)kMaxPrediction; cfg.ring_depth = kRingDepth;
-    cfg.local_delay.assign(g.plan.local_count, (uint8_t)vals.v[static_cast<size_t>(jpsm::Id::InputDelay)]);          // from the manifest: both peers agree
-    g.bv.delay = (int)vals.v[static_cast<size_t>(jpsm::Id::InputDelay)];   // status badge: the match's input delay (the same on both PCs)
+    // The start delay: the manifest's (both peers agree on it), or with the rematch carry what the last match on this link settled on (per peer: GekkoNet
+    // stamps every input with its frame, so the peers need not start alike; see adapt_delay).
+    const int man_delay = (int)vals.v[static_cast<size_t>(jpsm::Id::InputDelay)];
+    g_ad_man_delay = man_delay;
+    adapt_settings();
+    int start_delay = man_delay;
+    if (!g.bench && g_ad_on > 0 && g_ad_carry_on) {
+        const uint64_t lk = link_key();
+        start_delay = jpdr::carry_start(g_ad_carry, lk, man_delay, g_ad_p);
+        if (lk && g_ad_carry.link == lk)   // one line per session on a link that already ran a match
+            std::fprintf(stderr, "[net] input delay starts at %d ticks (%s; manifest %d; JSP_INPUT_DELAY_AUTO_CARRY=0 turns it off)\n", start_delay,
+                         g_ad_carry.delay < 0 ? "the manifest's: the last match on this link ran under 20 s"
+                         : g_ad_carry.man != man_delay ? "the manifest's: the host's InputDelay changed since the last match"
+                         : "carried: the last match on this link settled there", man_delay);
+    }
+    cfg.local_delay.assign(g.plan.local_count, (uint8_t)start_delay);
+    g.bv.delay = start_delay;   // status badge: this PC's input delay (adapt_delay keeps it current)
     cfg.disconnect_timeout_ms = vals.v[static_cast<size_t>(jpsm::Id::GraceSeconds)] * 1000u;                          // the grace window = the disconnect timeout
     { char ls[8] = {}; cfg.limited_saving = jsp_setting_get("JSP_ROLLBACK_LIMITED_SAVING", ls, sizeof ls) && ls[0] == '1';   // TEST (A/B, both PCs alike): GekkoNet sparse saving (SessionConfig::limited_saving)
       if (cfg.limited_saving) std::fprintf(stderr, "[net] TEST: sparse saving on (JSP_ROLLBACK_LIMITED_SAVING=1)\n"); }
@@ -1615,6 +1663,7 @@ void start_session(ppu_context* c)
     jsp_stepper_lockstep(1);   // FIX (rollback determinism): 2 vblanks per flip in the live ticks too (jsp_stepper.cpp)
     guest_clock_start();
     cri_lock_start();
+    jsp_sound_preload_fight_start();   // FIX (test8 sound-barrier hitches): logs how much of the sound archive is still in RAM, reads the rest again
     show("Connecting to opponent...");
 }
 
@@ -1839,6 +1888,7 @@ void boundary(ppu_context* c)
         adapt_settings();   // the time-sync switches (read once)
         const float ahead = g.bench ? 0.f : g.sess.frames_ahead();
         const uint32_t us = jpdr::timesync_stretch_us(ahead, g_ts_gain_us, g_ts_max_us);   // FIX (time sync can't follow a slow PC): jsp_net_delay_rule.h
+        { const uint64_t tn = GetTickCount64(); if (us >= g_ts_peak_us || tn - g_ts_peak_ms > 1000) { g_ts_peak_us = us; g_ts_peak_ms = tn; } }   // FIX (depth trigger vs a slow peer)
         if (g_test_slow_ms > 0) Sleep((DWORD)g_test_slow_ms);   // TEST (JSP_TEST_SLOW_MS): this copy plays a slow PC (two-copy runs only; default 0)
         if (g.bench || !jsp_stepper_lockstep_stretch_us(us)) { if (const uint32_t ms = g.sess.pace_sleep_ms(33)) Sleep(ms); }
         else audio_stretch_us = us;
@@ -2085,6 +2135,7 @@ bool conn_open(const Conn& c, std::string* why, jpno::Refusal* code)
 {
     RepsnIdentity rid;
     g.host = c.host; g.listen_port = c.port; g.join = c.join;
+    g_ad_carry = jpdr::Carry();   // ENHANCEMENT (rematch carry): a new link starts from the manifest
     if (c.repsn) {   // ENHANCEMENT (rollback over re-psn): a room on the player's re-psn server arranges the session; our UdpMux socket is the P2P socket
         char srv[160] = {}, nm[64] = {}, cid[24] = {}; int rep_rtt = 0;
         if (!jsp_online_repsn_identity(srv, sizeof srv, nm, sizeof nm, cid, sizeof cid, &rep_rtt) || !parse_server(srv, rid.host, rid.port) || !nm[0]) {
@@ -2190,6 +2241,7 @@ void conn_close()
     g.ev_first = g.ev_next = g.wait_next = 0; g.hs_last = -2;
     g.listen_port = 0; g.join = Endpoint{};
     g.match_k = 0; g.match_jump = 0; g.beacon_next = 0; g.fresh_gate = false;   // ENHANCEMENT (same-link rematch): the counter belongs to the link
+    g_ad_carry = jpdr::Carry();   // ENHANCEMENT (rematch carry): so does the carried input delay
     g.flow.close(); g.pick_link = false; g_pick_active = 0;   // ENHANCEMENT (post-game / pick): a new link never reuses a pair (the pump thread is stopped)
     g.phase = Phase::Off;
     show(""); badge(""); ping_hide();
@@ -2732,6 +2784,7 @@ extern "C" void jsp_net_game_install(void)
     uint32_t net_build = 0;
     if (!jsp_mods_net_build(build_id(), &net_build)) { std::fprintf(stderr, "[net] rollback refused: %s: off\n", jmods::kModsNotAsListed); return; }
     g_net_build = net_build;
+    jsp_sound_preload_install();   // FIX (test8 sound-barrier hitches): before the guest opens the sound archive; the barrier (fs_wait) is unchanged
     {   // ENHANCEMENT (rollback bench): no socket, no handshake; armed at once, the first fight tick starts the local stress session (start_bench)
         char bb[8] = {};
         if (jsp_setting_get(jpno::kKeyBench, bb, sizeof bb) && jpno::flag_on(bb)) {

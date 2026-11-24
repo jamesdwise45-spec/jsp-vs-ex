@@ -241,6 +241,7 @@ add_executable(${PROJECT_NAME}
     feat_3v3.cpp  # ENHANCEMENT: 3v3 Free Battle, on by default with the two-page menu (SIX=0 or MENU_PAGES=0 off); the team size window, 3v3 Character Select, six fighters in the fight
     # ENHANCEMENT, EXPERIMENTAL rollback netcode: every file below does nothing unless JSP_ROLLBACK=1 (docs/ROLLBACK.md)
     jsp_rollback.cpp   # the entry points main.cpp and stubs.cpp call; each returns at once without JSP_ROLLBACK=1
+    jsp_sound_preload.cpp # FIX: the sound archive held in RAM in a rollback session (jsp_net_game_install; JSP_SOUND_PRELOAD_MB, 0 off)
     jsp_net_game.cpp   # the game glue: settings handshake, session start, frame hooks, overlays
     jsp_net_session.cpp # UDP transport, rendezvous, GekkoNet session (no game dependency)
     jsp_stepper.cpp    # replay clock and canonical pad record (toolkit patch 7915)

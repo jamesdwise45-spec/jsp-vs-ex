@@ -257,7 +257,7 @@ Over re-psn instead of a typed address (with an optional relay): see "Rollback o
 
 1. Both games start as usual. Once each has finished starting up, the client connects to the host. The client shows
    *Waiting for host...* and the host *Waiting for client...*; holding F9 for 1.5 s cancels (a tap does nothing).
-2. The host's match rules (input delay `JSP_INPUT_DELAY`, 0 to 8 ticks, default 2; the reconnect grace time
+2. The host's match rules (input delay `JSP_INPUT_DELAY`, 0 to 8 ticks, default 3; the reconnect grace time
    `JSP_NET_GRACE_S`, 1 to 30 s, default 5; the match timer) are sent to the client for this match only. The client shows
    *Settings received: controlled by host*. Your own settings come back when the match ends; nothing is saved. Settings that
    only apply at start-up must already be the same on both PCs (for example the KO count, the 60 fps drawing mode, and the
@@ -299,7 +299,7 @@ the top-left corner, above the fight HUD's top bar:
 | Part | What it is | Where the value comes from |
 |---|---|---|
 | path | `direct`, or `relay` when the match goes through the re-psn server; `-` before it is known | direct IP is always direct; over re-psn, the path the rendezvous chose |
-| delay | the input delay of this match in game ticks (30 per second) | the host's `JSP_INPUT_DELAY`, sent to the client in the settings handshake, so both PCs show the same |
+| delay | this PC's input delay in game ticks (30 per second) | it starts at the host's `JSP_INPUT_DELAY` (sent to the client in the settings handshake) or, on a rematch on the same link, where the last match settled; the adaptive input delay then sets each PC's own, so the two PCs can show different values |
 | last | how many ticks the last rollback went back and ran again; `-` before the first | counted by the port each time the session rolls back |
 
 The text is rebuilt at most four times a second and redrawn only when it changes. It uses the game font of the port's overlay

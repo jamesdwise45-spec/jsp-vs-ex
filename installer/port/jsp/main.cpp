@@ -72,6 +72,8 @@
  * there is nothing to shim: the 15.6 ms default timer granularity this works
  * around is a Windows problem. */
 #include <timeapi.h>
+#include "jsp_hitch.h"   /* jph::g_pipeline_counts (DIAGNOSTIC, the per-match pipeline counts) */
+extern "C" void rsx_d3d12_pipeline_counts(long* warm, long* cold, double* cold_ms);   /* rsx_d3d12_backend.c, toolkit 2922 */
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -211,6 +213,91 @@ static void present_guest_frame(void)
     InterlockedIncrement(&g_frames_presented);
 }
 
+#ifdef _WIN32
+/* ENHANCEMENT (hybrid CPUs, test10): a laptop with 4 performance and 4 efficiency cores under Windows 10 (no Thread Director) ran every
+ * CPU part of a frame about 3x slower than a desktop of the same single-thread speed (guest 48.6 vs 13.2 ms, FIFO drain 42 vs 14,
+ * present 19 vs 10). The busy host threads opt out of EcoQoS (execution-speed power throttling) and the drawing threads run one step
+ * above normal, like the title's high-priority PPU threads, so the scheduler does not leave them on an efficiency core or behind those.
+ * HOST_PRIO=0 leaves priorities and execution-speed throttling at the Windows default (the timer opt-out stays). Host scheduling only:
+ * no guest-visible value (clock, tick, input, game state) depends on it. */
+static bool host_prio_on(void) { const char* e = getenv("HOST_PRIO"); return !(e && *e == '0'); }
+/* SetThreadInformation(ThreadPowerThrottling) is a Windows 8+ declaration, looked up at run time like SetProcessInformation in main.
+ * Values from processthreadsapi.h: ThreadPowerThrottling = 3, THREAD_POWER_THROTTLING_CURRENT_VERSION = 1, ..._EXECUTION_SPEED = 0x1. */
+static bool thread_no_ecoqos(HANDLE t)
+{
+    struct { ULONG Version, ControlMask, StateMask; } ts = { 1u, 0x1u, 0u };   /* StateMask 0 = never throttle this thread */
+    using SetThreadInfo = BOOL (WINAPI*)(HANDLE, int, LPVOID, DWORD);
+    const auto set = (SetThreadInfo)(void*)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadInformation");
+    return set && set(t, 3, &ts, (DWORD)sizeof ts);
+}
+/* One line: the cores per efficiency class (GetLogicalProcessorInformationEx, RelationProcessorCore = 0; Windows 7+, looked up at run
+ * time; EfficiencyClass is the second byte of PROCESSOR_RELATIONSHIP, higher = faster, all equal on a non-hybrid CPU) and the power
+ * source, so a support bundle shows a hybrid CPU or a laptop on battery. Parsed by offset: the struct's field names differ between SDKs. */
+static void log_cpu_topology(void)
+{
+    using GetLpiEx = BOOL (WINAPI*)(int, void*, DWORD*);
+    const auto get = (GetLpiEx)(void*)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetLogicalProcessorInformationEx");
+    DWORD len = 0;
+    unsigned char* buf = nullptr;
+    if (get) { get(0, nullptr, &len); if (len) buf = (unsigned char*)malloc(len); }
+    if (!buf || !get(0, buf, &len)) {
+        fprintf(stderr, "[cpu] topology unavailable (error %lu)\n", (unsigned long)GetLastError());
+        free(buf);
+        return;
+    }
+    unsigned cores[256] = {}, threads[256] = {}, n_cores = 0, n_threads = 0;
+    const DWORD ga = (DWORD)sizeof(ULONG_PTR) + 8;   /* GROUP_AFFINITY: KAFFINITY Mask, WORD Group, WORD Reserved[3] */
+    for (DWORD off = 0; off + 8 <= len;) {
+        DWORD rel, size;
+        memcpy(&rel, buf + off, 4); memcpy(&size, buf + off + 4, 4);
+        if (size < 8 || size > len - off) break;
+        if (rel == 0 && size >= 8 + 24) {   /* PROCESSOR_RELATIONSHIP at +8: Flags, EfficiencyClass, Reserved[20], WORD GroupCount, GroupMask[] at +24 */
+            const unsigned cls = buf[off + 9];
+            WORD groups; memcpy(&groups, buf + off + 8 + 22, 2);
+            unsigned lp = 0;
+            for (DWORD g = 0; g < groups && 8 + 24 + (g + 1) * ga <= size; g++) {
+                ULONG_PTR m; memcpy(&m, buf + off + 8 + 24 + g * ga, sizeof m);
+                for (; m; m &= m - 1) lp++;
+            }
+            cores[cls]++; threads[cls] += lp; n_cores++; n_threads += lp;
+        }
+        off += size;
+    }
+    free(buf);
+    char line[512]; size_t n = 0; int classes = 0;
+    /* append, clamped: n never passes the buffer, a full line is cut, never overrun */
+    auto add = [&](const char* fmt, auto... a) {
+        if (n >= sizeof line - 1) return;
+        const int k = snprintf(line + n, sizeof line - n, fmt, a...);
+        if (k > 0) n += (size_t)k < sizeof line - n ? (size_t)k : sizeof line - 1 - n;
+    };
+    for (int c = 255; c >= 0; c--) if (cores[c]) classes++;
+    add("[cpu] %u cores, %u logical processors: ", n_cores, n_threads);
+    if (classes <= 1) add("%s", "one efficiency class reported (not hybrid, or Windows does not say)");
+    else {
+        add("%s", "HYBRID,");
+        int rank = 0;   /* the fastest class is P; with 2 classes the other is E; with 3+ the rest are E1, E2, ... (E1 the faster) */
+        for (int c = 255; c >= 0; c--) if (cores[c]) {
+            char lab[16];
+            if (rank == 0) snprintf(lab, sizeof lab, "P-cores");
+            else if (classes == 2) snprintf(lab, sizeof lab, "E-cores");
+            else snprintf(lab, sizeof lab, "E%d-cores", rank);
+            add("%s %u %s (%u threads, class %d)", rank ? " +" : "", cores[c], lab, threads[c], c);
+            rank++;
+        }
+    }
+    SYSTEM_POWER_STATUS ps;
+    if (GetSystemPowerStatus(&ps)) {   /* ACLineStatus 0 battery, 1 AC, 255 unknown; byte 3 (SystemStatusFlag, Windows 10+): 1 = battery saver on */
+        const unsigned char saver = ((const unsigned char*)&ps)[3];
+        if (ps.ACLineStatus == 1) add("%s", "; power: AC");
+        else if (ps.ACLineStatus == 0) add("; power: BATTERY (%u %%)", (unsigned)ps.BatteryLifePercent);
+        else add("%s", "; power: unknown");
+        if (saver == 1) add("%s", ", battery saver ON");
+    }
+    fprintf(stderr, "%s\n", line);
+}
+#endif
+
 extern "C" void jsp_stepper_hitch_outer(double present_ms, double drain_ms, double pump_ms);   /* jsp_stepper.cpp: DIAGNOSTIC (per-hitch line) */
 extern "C" int jsp_hitch_diag_on(void);                                                         /* jsp_stepper.cpp: JSP_HITCH_DIAG, default 1 */
 static double hz_qms(void) { LARGE_INTEGER f, c; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&c); return (double)c.QuadPart * 1000.0 / (double)f.QuadPart; }
@@ -220,6 +307,15 @@ static DWORD WINAPI frame_clock(LPVOID)
     const char* title = getenv("PS3_TITLE");
     if (!title || !*title) title = "J-Stars Victory VS+";   /* the launcher sets PS3_TITLE; scripted runs may not */
 
+#ifdef _WIN32
+    /* ENHANCEMENT (hybrid CPUs): this thread runs the FIFO drain and the frame prepare (and the whole present with PIPE=0). Set before
+     * rsx_backend_init, so it holds from the first frame. */
+    if (host_prio_on()) {
+        const bool prio = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) != 0;
+        const bool eco = thread_no_ecoqos(GetCurrentThread());
+        fprintf(stderr, "[host] frame clock thread (FIFO drain, prepare): priority above normal %s, EcoQoS off %s\n", prio ? "ok" : "failed", eco ? "ok" : "failed");
+    }
+#endif
     int rsx_ok = (rsx_backend_init(WINDOW_WIDTH, WINDOW_HEIGHT, title) == 0);
     fprintf(stderr, "[rsx] %s backend init %s\n", RSX_BACKEND_NAME,
             rsx_ok ? "OK -- window open" : "FAILED");
@@ -636,17 +732,34 @@ int main(int argc, char** argv)
     /* 1 ms timer resolution. The default granularity is about 15.6 ms, which
      * inflates every shorter wait the title makes and throttles the whole
      * thing. POSIX timers are already fine-grained. */
-    timeBeginPeriod(1);
+    const bool timer_ok = timeBeginPeriod(1) == 0;   /* TIMERR_NOERROR */
+    const bool hprio = host_prio_on();
+    int eco_ok = -1, tr_ok = -1;   /* -1 not tried, 0 failed, 1 ok */
     {   /* Windows 11 drops a process's timer resolution back to ~15.6 ms while its window is covered or minimized (power throttling), so every
          * Sleep(1) of the game and of the rollback gate would take a whole timer tick. Opt out of that (the call fails harmlessly on older Windows). */
         /* Looked up at run time: SetProcessInformation and its power-throttling types are Windows 8+/10+ declarations, missing
          * from the headers at the toolkit's default _WIN32_WINNT (the CI syntax check). Values from processthreadsapi.h:
          * ProcessPowerThrottling = 4, PROCESS_POWER_THROTTLING_CURRENT_VERSION = 1, ..._IGNORE_TIMER_RESOLUTION = 0x4. */
-        struct { ULONG Version, ControlMask, StateMask; } pt = { 1u, 0x4u, 0u };   /* StateMask 0 = never throttle the timer resolution */
+        /* ENHANCEMENT (hybrid CPUs): first ..._EXECUTION_SPEED = 0x1, the EcoQoS opt-out, unless HOST_PRIO=0 (see host_prio_on). Two calls:
+         * IGNORE_TIMER_RESOLUTION is Windows 11 only, and Windows 10 refuses a mask that names it, which would lose the EcoQoS opt-out on the
+         * Windows 10 hybrid laptops this is for. StateMask 0 = never throttle. */
+        struct PT { ULONG Version, ControlMask, StateMask; };
         using SetProcInfo = BOOL (WINAPI*)(HANDLE, int, LPVOID, DWORD);
-        if (const auto set = (SetProcInfo)(void*)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetProcessInformation"))
-            set(GetCurrentProcess(), 4, &pt, (DWORD)sizeof pt);
+        if (const auto set = (SetProcInfo)(void*)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetProcessInformation")) {
+            if (hprio) { PT pt = { 1u, 0x1u, 0u }; eco_ok = set(GetCurrentProcess(), 4, &pt, (DWORD)sizeof pt) != 0; }
+            PT pt = { 1u, 0x4u, 0u };
+            tr_ok = set(GetCurrentProcess(), 4, &pt, (DWORD)sizeof pt) != 0;
+        }
     }
+    /* ENHANCEMENT (hybrid CPUs): what was applied, in one line, and the CPU topology. The audio mix thread is unchanged: it raises itself
+     * to time-critical with MMCSS "Pro Audio" (toolkit cellAudio.c) and waits on the device event, and the 1 ms timer above covers its
+     * Sleep(1) and short timeouts. */
+    auto res = [](int r) { return r < 0 ? "not tried" : r ? "ok" : "failed"; };
+    fprintf(stderr, "[host] timer 1 ms %s; process EcoQoS (execution speed) off: %s; timer-resolution throttling off: %s%s; HOST_PRIO %s\n",
+            timer_ok ? "ok" : "FAILED", hprio ? res(eco_ok) : "no (HOST_PRIO=0)", res(tr_ok), tr_ok == 0 ? " (Windows 10: expected)" : "",
+            hprio ? "on: frame clock and PIPE threads above normal, EcoQoS off (own lines follow)" : "=0: Windows default thread priorities and EcoQoS");
+    log_cpu_topology();
+    jph::g_pipeline_counts = rsx_d3d12_pipeline_counts;   /* DIAGNOSTIC (toolkit 2922): pipelines warm / cold on the per-match [perf] hitch causes line */
     setvbuf(stdout, NULL, _IONBF, 0);   /* unbuffered: do not lose prints on a kill */
     /* from jsp-vs-ex jstars/port/main.cpp: sound with a 16-block cellAudio ring (the game asks for 8) and CRI
      * keeping 12 blocks (64 ms) ahead instead of 5, which rides out the late ticks of its sound server (v0.15:
