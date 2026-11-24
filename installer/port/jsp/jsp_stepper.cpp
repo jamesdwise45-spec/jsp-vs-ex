@@ -306,7 +306,7 @@ long long g_ls_next = 0;            // QPC deadline of the next flip (0 = no sch
 long long g_ls_last = 0;            // QPC of the last flip (the liveness timer)
 uint64_t g_ls_flips = 0, g_ls_idle = 0, g_ls_restarts = 0, g_ls_stretch_total_us = 0;
 std::atomic<uint32_t> g_ls_stretch_us{0};   // the main thread adds, the frame clock takes it at the next flip
-constexpr uint32_t kStretchMaxUs = 2000;    // at most 2 ms (6%) longer per tick
+constexpr uint32_t kStretchMaxUs = 50000;   // a hard bound per period; the boundary caps each tick's stretch (JSP_TIMESYNC_MAX_US, jsp_net_delay_rule.h)
 }
 static ULONGLONG g_ls_last_ms = 0;                                 // frame clock thread only: GetTickCount64 of the last lockstep flip
 // FIX (review of PR 248, the freeze timeout): on = a match starts: the no-flip deadline runs from now (jsr::start), not from a first flip that may never come.
