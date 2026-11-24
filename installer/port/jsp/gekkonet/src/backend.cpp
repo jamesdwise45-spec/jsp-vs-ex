@@ -918,6 +918,11 @@ void Gekko::MessageSystem::OnSyncRequest(NetAddress& addr, NetPacket& pkt)
 
         for (auto& player : *current) {
             if (player->address.Equals(addr)) {
+                // jsp-vs-ex local addition (no re-sync of a disconnected actor): a Disconnected actor never syncs again in this session, so a peer
+                // that is still sending after it was marked gone gets no SyncResponse (see OnSyncResponse).
+                if (player->GetStatus() == Disconnected) {
+                    continue;
+                }
                 player->session_magic = body->rng_data;
                 if (player->sync_num == 0) {
                     player->stats.last_sent_sync_message = now;
@@ -959,6 +964,13 @@ void Gekko::MessageSystem::OnSyncResponse(NetAddress& addr, NetPacket& pkt)
             }
 
             if (player->address.Equals(addr)) {
+                // jsp-vs-ex local addition (no re-sync of a disconnected actor): MarkActorDisconnected sets sync_num to 0, and without this skip a peer
+                // that keeps answering (the mid-match "still asking" ping-pong above) counted it up again and set the actor back to Connected. With 3-4
+                // peers that revived actor then carried disconnect claims about the others (net_session_test mesh3_leave: the two that remained
+                // dropped each other). A Disconnected actor stays Disconnected for the rest of the session.
+                if (player->GetStatus() == Disconnected) {
+                    continue;
+                }
                 player->session_magic = body->rng_data;
                 if (player->sync_num < NUM_TO_SYNC) {
                     player->sync_num++;

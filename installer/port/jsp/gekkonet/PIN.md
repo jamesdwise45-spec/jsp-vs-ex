@@ -6,13 +6,13 @@ The rollback session library used by the experimental rollback netcode (`jsp_net
 - Commit: `45dac7e5` ("Fix the default adapter dropping large packets and spinning on errors (#61)")
 - Licence: BSD 2-Clause (`LICENSE`, copyright Jamie Meyer); `thirdparty/zpp/zpp_bits.h` is MIT (`thirdparty/zpp/LICENSE`).
 - What is here: `GekkoLib/include` as `include/`, `GekkoLib/src` as `src/`, `zpp_bits.h` and its `LICENSE` from `GekkoLib/thirdparty/zpp` as `thirdparty/zpp/`, and the
-  top-level `LICENSE`. The files are unchanged except two local additions, each marked "jsp-vs-ex local addition" in the code. The first:
+  top-level `LICENSE`. The files are unchanged except three local additions, each marked "jsp-vs-ex local addition" in the code. The first:
   `gekko_final_frame` (gekkonet.h/.cpp, `FinalFrame` in session.h, game_session.h/.cpp), a read-only accessor for the latest frame no later
   rollback can go back past (from GekkoNet's own confirmed frame and pending incorrect frame). The rollback glue uses it to skip the snapshots
   of states that can never be loaded (`jsp_net_glue.h`). It should go upstream; re-apply it when updating.
   The second: `GekkoNetworkStats` gained `rtt_count` (`NetStats::rtt_count`, +1 in `AddRTT`) and `last_acked_frame` (that player's
   `NetStats::last_acked_frame`), filled in `NetworkStats` of game_session.cpp and spectator_session.cpp. The adaptive input delay keeps only round trips
-  whose count is new (`jsp_net_delay_rule.h`), and the match's input-latency summary reads the ack (`jsp_net_perf.h`). Re-apply it when updating. Left out: the asio copy (the port has its own UDP transport and builds with
+  whose count is new (`jsp_net_delay_rule.h`), and the match's input-latency summary reads the ack (`jsp_net_perf.h`). Re-apply it when updating. The third (test11, 4-player): in `backend.cpp`, `OnSyncRequest` and `OnSyncResponse` skip an actor that is already Disconnected, so a peer that keeps sending after it was marked gone is never set back to Connected (MarkActorDisconnected sets `sync_num` to 0, and the mid-match sync ping-pong counted it up again). (Ignoring disconnect claims from a sender that is Disconnected locally was tried and dropped: in net_session_test `mesh4_cut` it let the PCs on either side of a cut link disagree about who left, and the match ran on split.) With 3-4 peers the revived actor's claims made the peers that remained drop each other (net_session_test `mesh3_leave`); with 2 peers any disconnect ends the match first. Re-apply it when updating. Left out: the asio copy (the port has its own UDP transport and builds with
   `GEKKONET_NO_ASIO`), the examples, the documentation (also zpp_bits' README) and the upstream build files.
 - Built by `installer/port/jsp/CMakeLists.txt` as part of the game exe (`GEKKONET_STATIC`, `GEKKONET_NO_ASIO`, `ws2_32`).
 

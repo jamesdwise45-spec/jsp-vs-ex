@@ -156,5 +156,14 @@ inline std::string count_text(int humans, int planned, int max)
     return "Rollback off for this fight: it has " + std::to_string(humans) + " players, the rollback link was set up for " + std::to_string(planned) +
            ". It is set up again for " + std::to_string(humans) + " after this fight.";
 }
+// FIX (review R2): the fight's human records have a gap (e.g. records 0, 1 and 3 after a leave) or lie outside the plan's slots. GekkoNet slot s is room record s,
+// so no rollback plan of these players can serve them until the game packs them into places 1..N again (it may, at the next fight setup).
+inline std::string gap_text(uint8_t humans)
+{
+    std::string places;
+    for (int i = 0; i < 4; i++) if (humans >> i & 1) places += (places.empty() ? "" : ", ") + std::to_string(i + 1);
+    return "Rollback off for this fight: the players are in places " + (places.empty() ? std::string("-") : places) +
+           " of the room, and rollback needs them in places 1 to N without a gap. The game's own connection is used.";
+}
 
 }  // namespace jsp4
