@@ -1,0 +1,141 @@
+Patch 7934 (experiment, GPU time): VPULL_VRAM=1 lets the GPU read the batch's pulled vertex bytes and indices from video memory.
+
+Why. VPULL's byte ring and the index buffer are UPLOAD heaps (system memory): every vertex-shader load of a pulled vertex and every
+index fetch crosses PCIe. The test10 desktop log pulls 100 % of its indexed draws and uploads 7.1-7.9 GB of vertex bytes per 5 s in
+fights (60-80 MB per batch at 3200-4000 draws), the first suspect for its 50-70 ms GPU frames.
+What. With the switch, two DEFAULT-heap mirrors are made at init (ring size + slack, and the index half: about 144 MB of video memory
+with the default 128 MB ring). The start of each batch's draw loop copies the used span of the batch's ring half (+ the Load2 slack)
+and of its index half into them (barriers COMMON -> COPY_DEST -> NON_PIXEL_SHADER_RESOURCE / INDEX_BUFFER; buffers decay to COMMON
+between ExecuteCommandLists, and batches run in queue order, so one mirror serves every batch, also with GPU_OVERLAP=1). The draws
+bind the mirrors at the same offsets. The CPU writes exactly as before. [VPULL_VRAM] every 600 batches: MB copied per batch;
+GPU_TIME=1 shows the copy as "vram-copy". Mirror allocation fails: the old binding. Off by default.
+
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+index 1f2e9c1..45d7c77 100644
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -487,6 +487,7 @@ typedef struct RfFrame {
+     double rf0; u32 fi;
+     D3D12DrawRecord* draws; u32 n; int parity; int present; int piped;
+     int have_st; float vc[16];
++    u32 vpull_bytes, ib_count;   /* 7934: this batch's used VPULL ring bytes and indices (for VPULL_VRAM) */
+ } RfFrame;
+ static void render_frame_submit(const RfFrame* f);
+ static void pipe_thread_tune(void);   /* 2921 */
+@@ -707,6 +708,21 @@ static int vpull_on(void)
+     return s_vpull.on;
+ }
+ static void vpull_report(void);
++/* 7934 VPULL_VRAM=1 (experiment, off by default): the GPU reads this batch's vertex bytes and indices from video memory.
++ * VPULL's byte ring and the index buffer live in UPLOAD heaps, i.e. system memory: every vertex-shader Load of a pulled
++ * vertex and every index fetch crosses PCIe. J-Stars fights pull nearly all draws (test10 desktop: 1.4-1.7 GB/s of vertex
++ * bytes, 60-80 MB per batch at 3200-4000 draws). With the switch, the start of each batch's draw loop copies the used span of
++ * its ring half (+ the Load2 slack) and of its index half into one DEFAULT-heap mirror each (CopyBufferRegion: a bulk
++ * transfer), and the draws bind the mirrors at the same offsets. The CPU writes exactly as before; nothing the guest reads
++ * changes. One mirror serves every batch: batches run in queue order, and each copy is fenced by its own barriers (buffers
++ * decay to COMMON between ExecuteCommandLists). Costs ring+16 MB of video memory and one copy per batch (GPU_TIME=1 shows it
++ * as "vram-copy"). No mirror (allocation failed, VPULL off): the old binding. */
++static struct { int on; ID3D12Resource* ring; ID3D12Resource* ib; u64 n, bytes; } s_vv = { -1, NULL, NULL, 0, 0 };
++static int vpull_vram_on(void)
++{
++    if (s_vv.on < 0) { const char* e = getenv("VPULL_VRAM"); s_vv.on = (e && *e == '1') ? 1 : 0; }
++    return s_vv.on;
++}
+ /* Raw bind offset of the duck's texture, identified by CONTENT (duck.tga is
+  * overwhelmingly yellow, avg 243,191,23). VRAM offsets move between runs, so a
+  * hard-coded offset in a filter silently matches nothing and the run looks like
+@@ -1946,6 +1962,22 @@ static int init_d3d12(u32 width, u32 height)
+                 rsx_vpull_fill_lut((float*)lp_);
+                 s_vpull.ring_mapped = (u8*)rp_; s_vpull.tab_mapped = (u8*)tp_;
+                 fprintf(stderr, "[VPULL] vertex pulling on: %u MB byte ring x2 parity%c", mb, 10);
++                if (vpull_vram_on()) {   /* 7934: the video-memory mirrors */
++                    D3D12_HEAP_PROPERTIES dh = {0}; dh.Type = D3D12_HEAP_TYPE_DEFAULT;
++                    D3D12_RESOURCE_DESC md = bd;
++                    md.Width = (u64)s_vpull.ring_bytes + VPULL_RING_SLACK;
++                    int vok = SUCCEEDED(s_d3d.device->lpVtbl->CreateCommittedResource(s_d3d.device, &dh, D3D12_HEAP_FLAG_NONE, &md,
++                                  D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void**)&s_vv.ring));
++                    md.Width = (u64)VP_MAX_INDICES * 4;
++                    vok = vok && SUCCEEDED(s_d3d.device->lpVtbl->CreateCommittedResource(s_d3d.device, &dh, D3D12_HEAP_FLAG_NONE, &md,
++                                  D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource, (void**)&s_vv.ib));
++                    if (!vok) {
++                        if (s_vv.ring) { s_vv.ring->lpVtbl->Release(s_vv.ring); s_vv.ring = NULL; }
++                        if (s_vv.ib) { s_vv.ib->lpVtbl->Release(s_vv.ib); s_vv.ib = NULL; }
++                    }
++                    fprintf(stderr, "[VPULL_VRAM] %s%c", vok ? "on: vertex bytes and indices copied to video memory per batch" :
++                            "mirror allocation failed: the GPU reads the upload heaps as before", 10);
++                }
+             } else {
+                 fprintf(stderr, "[VPULL] buffer allocation failed -- VPULL off%c", 10);
+                 s_vpull.ring_mapped = NULL; s_vpull.tab_mapped = NULL; s_vpull.on = 0;
+@@ -9259,6 +9291,7 @@ static void rf_detach(RfFrame* f, int piped)
+ {
+     f->draws = s_d3d.draws; f->n = s_d3d.draw_count; f->parity = s_d3d.vp_parity;
+     f->present = s_present_this_frame; f->piped = piped;
++    f->vpull_bytes = s_vpull.off; f->ib_count = s_d3d.vp_ib_offset;   /* 7934 */
+     const rsx_state* st = s_d3d.current_rsx_state;
+     f->have_st = st != NULL;
+     if (st) for (u32 r = 0; r < 4; r++) for (u32 c = 0; c < 4; c++) f->vc[r * 4 + c] = st->vertex_constants[r][c];
+@@ -9474,9 +9507,43 @@ static void render_frame_submit(const RfFrame* f)
+             double _rec0 = perf_on() ? perf_now() : 0.0;
+             int seen_small_vp = 0, captured = 0;
+             /* VPULL: this batch's halves of the byte ring and the tables. */
+-            const u64 vpull_ring_va = s_vpull.ring_mapped
++            u64 vpull_ring_va = s_vpull.ring_mapped
+                 ? s_vpull.ring->lpVtbl->GetGPUVirtualAddress(s_vpull.ring)
+                   + (u64)f->parity * ((u64)s_vpull.ring_bytes + VPULL_RING_SLACK) : 0;
++            u64 ib_va = s_d3d.vp_ib ? s_d3d.vp_ib->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_ib) + (u64)f->parity * VP_MAX_INDICES * 4 : 0;
++            if (s_vv.ring && s_vv.ib && s_vpull.ring_mapped && (f->vpull_bytes || f->ib_count)) {   /* 7934 VPULL_VRAM */
++                gput_mark(0xCu);
++                const u64 rbytes = (u64)f->vpull_bytes + VPULL_RING_SLACK <= (u64)s_vpull.ring_bytes + VPULL_RING_SLACK
++                                 ? (u64)f->vpull_bytes + VPULL_RING_SLACK : (u64)s_vpull.ring_bytes + VPULL_RING_SLACK;
++                const u64 ibytes = (u64)(f->ib_count <= VP_MAX_INDICES ? f->ib_count : VP_MAX_INDICES) * 4;
++                D3D12_RESOURCE_BARRIER vb2[2]; memset(vb2, 0, sizeof vb2);
++                for (int _k = 0; _k < 2; _k++) {
++                    vb2[_k].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++                    vb2[_k].Transition.pResource = _k ? s_vv.ib : s_vv.ring;
++                    vb2[_k].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++                    vb2[_k].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;   /* buffers decay to COMMON between batches */
++                    vb2[_k].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
++                }
++                s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 2, vb2);
++                s_d3d.cmd_list->lpVtbl->CopyBufferRegion(s_d3d.cmd_list, s_vv.ring, 0, s_vpull.ring,
++                    (u64)f->parity * ((u64)s_vpull.ring_bytes + VPULL_RING_SLACK), rbytes);
++                if (ibytes)
++                    s_d3d.cmd_list->lpVtbl->CopyBufferRegion(s_d3d.cmd_list, s_vv.ib, 0, s_d3d.vp_ib,
++                        (u64)f->parity * VP_MAX_INDICES * 4, ibytes);
++                vb2[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
++                vb2[0].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
++                vb2[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
++                vb2[1].Transition.StateAfter = D3D12_RESOURCE_STATE_INDEX_BUFFER;
++                s_d3d.cmd_list->lpVtbl->ResourceBarrier(s_d3d.cmd_list, 2, vb2);
++                vpull_ring_va = s_vv.ring->lpVtbl->GetGPUVirtualAddress(s_vv.ring);
++                ib_va = s_vv.ib->lpVtbl->GetGPUVirtualAddress(s_vv.ib);
++                s_vv.n++; s_vv.bytes += rbytes + ibytes;
++                if ((s_vv.n % 600) == 0) {
++                    fprintf(stderr, "[VPULL_VRAM] %llu batches, %.1f MB copied per batch on average%c",
++                            (unsigned long long)s_vv.n, (double)s_vv.bytes / (double)s_vv.n / 1048576.0, 10);
++                    s_vv.n = 0; s_vv.bytes = 0;
++                }
++            }
+             const u64 vpull_tab_va = s_vpull.tab_mapped
+                 ? s_vpull.tab->lpVtbl->GetGPUVirtualAddress(s_vpull.tab)
+                   + (u64)f->parity * MAX_DRAWS * RSX_VPULL_TAB_BYTES : 0;
+@@ -9813,8 +9880,7 @@ static void render_frame_submit(const RfFrame* f)
+                 if (dr->indexed) {
+                     if (!ib_bound) {
+                         D3D12_INDEX_BUFFER_VIEW ibv;
+-                        ibv.BufferLocation = s_d3d.vp_ib->lpVtbl->GetGPUVirtualAddress(s_d3d.vp_ib)
+-                                           + (u64)f->parity * VP_MAX_INDICES * 4;
++                        ibv.BufferLocation = ib_va;   /* 7934: this batch's half, or its video-memory mirror */
+                         ibv.SizeInBytes = VP_MAX_INDICES * 4;
+                         ibv.Format = DXGI_FORMAT_R32_UINT;
+                         s_d3d.cmd_list->lpVtbl->IASetIndexBuffer(s_d3d.cmd_list, &ibv);
+@@ -13315,6 +13381,8 @@ void rsx_d3d12_backend_shutdown(void)
+     if (s_d3d.fence) s_d3d.fence->lpVtbl->Release(s_d3d.fence);
+     if (s_ovl.fence) { s_ovl.fence->lpVtbl->Release(s_ovl.fence); s_ovl.fence = NULL; }   /* 7931 */
+     if (s_d3d.latency_wait) { CloseHandle(s_d3d.latency_wait); s_d3d.latency_wait = NULL; }   /* 7932 */
++    if (s_vv.ring) { s_vv.ring->lpVtbl->Release(s_vv.ring); s_vv.ring = NULL; }   /* 7934 */
++    if (s_vv.ib) { s_vv.ib->lpVtbl->Release(s_vv.ib); s_vv.ib = NULL; }
+     if (s_d3d.fence_event) CloseHandle(s_d3d.fence_event);
+     if (s_d3d.cmd_list) s_d3d.cmd_list->lpVtbl->Release(s_d3d.cmd_list);
+     if (s_d3d.tex_ring) s_d3d.tex_ring->lpVtbl->Release(s_d3d.tex_ring);

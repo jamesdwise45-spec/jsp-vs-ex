@@ -1,0 +1,167 @@
+Patch 7933 (diagnostic): GPU_TIME=1 names where the GPU time goes.
+
+The [GPUT] line (patch 2906, every 120 batches) now gives ms per batch, draws per batch and how busy the GPU was over the wall time of
+those batches (near 100 %: GPU-bound; low: the GPU waits for the CPU), then the ten costliest passes by name: rt:<offset> WxH,
+depth:<offset> WxH (depth-only), display WxH, start(uploads,copies) (texture uploads and copies before the first target switch),
+post(composite,AA,HUD,present), vram-copy (VPULL_VRAM, patch 7934), each with ms per batch, how many times it ran and its draws.
+The last query slot is kept for the end mark, so a batch with more than 1023 target switches still measures its whole span
+("marks dropped" says so). Off (GPU_TIME unset): nothing is recorded, as before.
+
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+index 05376f2..1f2e9c1 100644
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -8411,6 +8411,8 @@ float (*g_rsx_ui_scale)(u32 rt_off, const float box[4], float* ax, float* ay) =
+ int (*g_rsx_aa_mode)(u32 rt_off) = 0;
+ int (*g_rsx_cutout)(float* out) = 0;
+ 
++/* 7933: [GPUT] names each key (rt:/depth:/display with the pass size, start, post), adds each pass's draw count, the draws
++ * per batch and how busy the GPU was over the wall time; the last query slot is kept for the end mark. */
+ /* Patch 2906 (diagnostic, experiment line): GPU_TIME=1 puts a timestamp query at the start of each frame's command
+  * list, at every render-target switch of the replay (key: the colour target's guest offset, or the depth surface's
+  * offset | 1 for a depth-only pass, 2 for the display), before the after-replay work (key 0xE: composite, edge
+@@ -8427,26 +8429,61 @@ static int gput_on(void)
+ static ID3D12QueryHeap* s_gput_heap = NULL;
+ static ID3D12Resource* s_gput_rb[FRAME_COUNT];
+ static u32 s_gput_n[FRAME_COUNT], s_gput_key[FRAME_COUNT][GPUT_MAX];
++/* 7933: per mark, the draws issued until the next mark and the pass's viewport size (0 = not a target switch). */
++static u32 s_gput_draws[FRAME_COUNT][GPUT_MAX], s_gput_wh[FRAME_COUNT][GPUT_MAX];
++static u32 s_gput_dctr = 0, s_gput_dctr_at = 0, s_gput_drop = 0;
+ static u32 s_gput_cur_fi = 0;
+ static u64 s_gput_freq = 0;
+-typedef struct { u32 key; double ms; u32 n; } GputAcc;
++typedef struct { u32 key; double ms; u32 n; u32 draws; u32 wh; } GputAcc;
+ static GputAcc s_gput_acc[128];
+ static int s_gput_nacc = 0, s_gput_frames = 0;
+-static double s_gput_total = 0;
++static double s_gput_total = 0, s_gput_wall0 = 0;
++static u32 s_gput_tdraws = 0, s_gput_lost = 0;
+ 
+-static void gput_mark(u32 key)
++/* 7933: one draw issued in the replay (counted into the pass of the last mark). */
++static void gput_draw(void) { s_gput_dctr++; }
++static void gput_mark_wh(u32 key, u32 w, u32 h)
+ {
+     if (!gput_on() || !s_gput_heap) return;
+     const u32 fi = s_gput_cur_fi, i = s_gput_n[fi];
++    if (i > 0) s_gput_draws[fi][i - 1] = s_gput_dctr - s_gput_dctr_at;
++    s_gput_dctr_at = s_gput_dctr;
++    /* 7933: the last slot is kept for the end mark, so a batch with very many switches still measures its whole span
++     * (the extra switches' time then goes to the last recorded pass; counted as "marks dropped"). */
++    if (i >= GPUT_MAX - 1 && key != 0xFFFFFFFFu) { s_gput_drop++; return; }
+     if (i >= GPUT_MAX) return;
+     s_d3d.cmd_list->lpVtbl->EndQuery(s_d3d.cmd_list, s_gput_heap, D3D12_QUERY_TYPE_TIMESTAMP, fi * GPUT_MAX + i);
+-    s_gput_key[fi][i] = key; s_gput_n[fi] = i + 1;
++    s_gput_key[fi][i] = key; s_gput_wh[fi][i] = (w > 0xFFFFu ? 0xFFFFu : w) << 16 | (h > 0xFFFFu ? 0xFFFFu : h);
++    s_gput_draws[fi][i] = 0; s_gput_n[fi] = i + 1;
+ }
++static void gput_mark(u32 key) { gput_mark_wh(key, 0, 0); }
+ 
+-static void gput_acc(u32 key, double ms)
++static void gput_acc(u32 key, double ms, u32 draws, u32 wh)
+ {
+-    for (int k = 0; k < s_gput_nacc; k++) if (s_gput_acc[k].key == key) { s_gput_acc[k].ms += ms; s_gput_acc[k].n++; return; }
+-    if (s_gput_nacc < 128) { s_gput_acc[s_gput_nacc].key = key; s_gput_acc[s_gput_nacc].ms = ms; s_gput_acc[s_gput_nacc].n = 1; s_gput_nacc++; }
++    for (int k = 0; k < s_gput_nacc; k++)
++        if (s_gput_acc[k].key == key) {
++            s_gput_acc[k].ms += ms; s_gput_acc[k].n++; s_gput_acc[k].draws += draws;
++            if (wh) s_gput_acc[k].wh = wh;
++            return;
++        }
++    if (s_gput_nacc < 128) {
++        GputAcc* a = &s_gput_acc[s_gput_nacc++];
++        a->key = key; a->ms = ms; a->n = 1; a->draws = draws; a->wh = wh;
++    } else s_gput_lost++;
++}
++/* 7933: a readable name for a key. */
++static const char* gput_name(u32 key, u32 wh, char* b, size_t n)
++{
++    const u32 w = wh >> 16, h = wh & 0xFFFFu;
++    char sz[24] = "";
++    if (w && h) snprintf(sz, sizeof sz, " %ux%u", w, h);
++    if (key == 0xF0000000u) snprintf(b, n, "start(uploads,copies)");
++    else if (key == 0xEu) snprintf(b, n, "post(composite,AA,HUD,present)");
++    else if (key == 0xCu) snprintf(b, n, "vram-copy");
++    else if (key == 2u) snprintf(b, n, "display%s", sz);
++    else if (key & 1u) snprintf(b, n, "depth:%08X%s", key & ~1u, sz);
++    else snprintf(b, n, "rt:%08X%s", key, sz);
++    return b;
+ }
+ 
+ /* After the frame index's allocator reset: read its last frame, then start this one. */
+@@ -8475,26 +8512,40 @@ static void gput_begin(u32 fi)
+         void* p = NULL; D3D12_RANGE r = {0, (SIZE_T)n * 8};
+         if (SUCCEEDED(s_gput_rb[fi]->lpVtbl->Map(s_gput_rb[fi], 0, &r, &p)) && p) {
+             const u64* t = (const u64*)p;
+-            for (u32 i = 0; i + 1 < n; i++)
+-                if (t[i + 1] >= t[i]) gput_acc(s_gput_key[fi][i], (double)(t[i + 1] - t[i]) * 1000.0 / (double)s_gput_freq);
++            for (u32 i = 0; i + 1 < n; i++) {
++                s_gput_tdraws += s_gput_draws[fi][i];
++                if (t[i + 1] >= t[i]) gput_acc(s_gput_key[fi][i], (double)(t[i + 1] - t[i]) * 1000.0 / (double)s_gput_freq,
++                                               s_gput_draws[fi][i], s_gput_wh[fi][i]);
++            }
+             if (t[n - 1] >= t[0]) s_gput_total += (double)(t[n - 1] - t[0]) * 1000.0 / (double)s_gput_freq;
+             D3D12_RANGE w = {0, 0}; s_gput_rb[fi]->lpVtbl->Unmap(s_gput_rb[fi], 0, &w);
++            const double now = hz_now();
++            if (s_gput_wall0 <= 0) s_gput_wall0 = now;
+             if (++s_gput_frames == 120) {
+-                fprintf(stderr, "[GPUT] %.2f ms/frame GPU (120 frames):", s_gput_total / 120.0);
++                /* 7933: per batch (a frame, or a mid-frame flush), the GPU span from the first to the last mark; "busy" is the
++                 * sum of the spans over the wall time of the 120 batches (near 100 %: GPU-bound; low: the GPU waits for the
++                 * CPU). Then the costliest passes by name: ms per batch, how many times the pass ran, its draws. */
++                const double wall = now - s_gput_wall0;
++                fprintf(stderr, "[GPUT] %.2f ms/batch GPU (120 batches, %.0f draws/batch, busy %.0f%% of %.0f ms wall):",
++                        s_gput_total / 120.0, (double)s_gput_tdraws / 120.0, wall > 0 ? 100.0 * s_gput_total / wall : 0.0, wall);
+                 for (int k = 0; k < 10; k++) {
+                     int best = -1;
+                     for (int j = 0; j < s_gput_nacc; j++)
+                         if (s_gput_acc[j].n && (best < 0 || s_gput_acc[j].ms > s_gput_acc[best].ms)) best = j;
+                     if (best < 0) break;
+-                    fprintf(stderr, " %08X %.2f (%u)", s_gput_acc[best].key, s_gput_acc[best].ms / 120.0, s_gput_acc[best].n);
++                    char nb[64];
++                    fprintf(stderr, " %s %.2f ms (%ux, %u draws)", gput_name(s_gput_acc[best].key, s_gput_acc[best].wh, nb, sizeof nb),
++                            s_gput_acc[best].ms / 120.0, s_gput_acc[best].n, s_gput_acc[best].draws);
+                     s_gput_acc[best].n = 0;
+                 }
++                if (s_gput_drop || s_gput_lost) fprintf(stderr, " [marks dropped %u, keys not tallied %u]", s_gput_drop, s_gput_lost);
+                 fprintf(stderr, "%c", 10);
+-                s_gput_nacc = 0; s_gput_frames = 0; s_gput_total = 0;
++                s_gput_nacc = 0; s_gput_frames = 0; s_gput_total = 0; s_gput_wall0 = now;
++                s_gput_tdraws = 0; s_gput_drop = 0; s_gput_lost = 0;
+             }
+         }
+     }
+-    s_gput_cur_fi = fi; s_gput_n[fi] = 0;
++    s_gput_cur_fi = fi; s_gput_n[fi] = 0; s_gput_dctr_at = s_gput_dctr;
+     gput_mark(0xF0000000u);   /* frame start: uploads and work before the first switch */
+ }
+ 
+@@ -9516,7 +9567,8 @@ static void render_frame_submit(const RfFrame* f)
+                     cur_sc = bsc;
+                     D3D12_RECT sc = {0, 0, (LONG)vp.Width, (LONG)vp.Height};
+                     vp_last_w = vp.Width; vp_last_h = vp.Height;
+-                    gput_mark(dr->no_color ? (dr->zeta_off | 1u) : (dr->rt_off ? dr->rt_off : 2u));   /* patch 2906 */
++                    gput_mark_wh(dr->no_color ? (dr->zeta_off | 1u) : (dr->rt_off ? dr->rt_off : 2u),   /* patch 2906 */
++                                 (u32)vp.Width, (u32)vp.Height);   /* 7933: with the pass size */
+                     s_d3d.cmd_list->lpVtbl->OMSetRenderTargets(s_d3d.cmd_list, dr->no_color ? 0 : nrt,
+                                                                dr->no_color ? NULL : rh, FALSE, &cur_dsv);
+                     s_d3d.cmd_list->lpVtbl->RSSetViewports(s_d3d.cmd_list, 1, &vp);
+@@ -9783,13 +9835,16 @@ static void render_frame_submit(const RfFrame* f)
+                                 VPULL_RP_TAB, vpull_tab_va + (u64)dr->cb_slot * RSX_VPULL_TAB_BYTES);
+                             s_d3d.cmd_list->lpVtbl->DrawIndexedInstanced(s_d3d.cmd_list,
+                                 dr->index_count, 1, dr->ib_first, 0, 0);
++                            gput_draw();   /* 7933 */
+                         } else s_vpull.n_skip++;
+-                    } else
++                    } else {
+                     s_d3d.cmd_list->lpVtbl->DrawIndexedInstanced(s_d3d.cmd_list,
+                         dr->index_count, 1, dr->ib_first, (INT)(dr->vb_byte_offset / 256), 0);
+-                } else
++                    gput_draw(); }   /* 7933 */
++                } else {
+                 s_d3d.cmd_list->lpVtbl->DrawInstanced(s_d3d.cmd_list,
+                     dr->vertex_count, 1, dr->vb_byte_offset / 256, 0);
++                gput_draw(); }   /* 7933 */
+                 { static u64 s_aa_frame = (u64)-1;   /* 2511: edge smoothing after the scene copy, once a frame */
+                   if (dr->aa_after && cur_rt >= 0 && s_aa_frame != s_d3d.frame_count) {
+                       s_aa_frame = s_d3d.frame_count;
