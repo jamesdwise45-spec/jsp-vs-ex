@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Host test of toolkit patches 3005, 3007, 3008, 3009 and 3010 (the tick-locked audio of rollback matches; no game, no GPU, no audio device): runs the patch's own
+# Host test of toolkit patches 3005, 3007, 3008, 3009, 3010 and 3011 (the tick-locked audio of rollback matches; no game, no GPU, no audio device): runs the patch's own
 # Windows test, libs/audio/tests/test_audio_lock_race.c, which drives the real cellAudio.c code (that path is the WASAPI mix thread's):
 #   - a mix thread (audio_lock_step) against a guest audio thread that receives each notify event and works on it, and a game thread that raises the
 #     target and waits for ps3_audio_lock_idle, with rewinds: at every idle the guest took and finished every block, and the read index matches;
@@ -10,6 +10,8 @@
 #     with nothing dropped; the 60% floor).
 #   - patch 3010: the refill in virtual time (steady 30 ticks/s conceals nothing; a 29 fps fight with 50-100 ms hitches and runs of slow ticks
 #     conceal fewer gaps than 3009; single hitches never engage the quick slow pace).
+#   - patch 3011: the pitch-preserving stretch (a sine keeps its pitch at 0.6 / 1.0625 / 1.032, no click at the joins, a chirp too, rate 1 is the
+#     input; CPU per burst). AUDIO_LOCK_WAV_DIR=dir also writes before/after WAVs.
 # Needs a Windows C compiler and a way to run the .exe: MINGW_CC (e.g. llvm-mingw's x86_64-w64-mingw32-clang, also a Windows .exe called from WSL),
 # else x86_64-w64-mingw32-gcc or x86_64-w64-mingw32-clang on PATH. With none it says SKIP and passes, unless CI=1.
 #   bash installer/tools/audio_lock_test.sh TOOLKIT_DIR [SCRATCH_DIR] [SECONDS]      (TOOLKIT_DIR: installer/tools/export_toolkit.py --out DIR)
