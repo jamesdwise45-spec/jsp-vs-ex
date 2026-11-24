@@ -6,7 +6,7 @@
 // nvwgf2umx.dll+0xecd8f0) or a "D3D Background Thread", both at priority -15 (idle). GetThreadContext returns only once the target is really suspended,
 // and an idle-priority thread on a busy CPU waits a long time for the core it needs to take the suspension.
 // Why it is safe to leave them running: guest memory (the vm_base reservation) is written only by the guest's PPU / SPU threads, the toolkit's and the
-// port's own host threads (all started by code in the exe), and the RSX side (the FIFO walker on the frame clock thread, reported to the RSX write
+// port's own host threads (all created by code in the exe, though many start in the CRT's or winpthreads' trampoline), and the RSX side (the FIFO walker on the frame clock thread, reported to the RSX write
 // guard by patch 7917). The D3D12 backend never gives guest memory to D3D (no OpenExistingHeapFromAddress, no placed resource over it): uploads copy
 // guest memory into D3D's own buffers on the backend's threads, readbacks copy out of them on the backend's threads, and it registers no D3D callback
 // (it polls the info queue). So a driver thread only ever touches the driver's own memory. The frozen-interval write check (JSP_SNAPSHOT_FROZEN_WRITES,
@@ -19,9 +19,9 @@ namespace jsh {
 
 enum Cls : uint8_t {
     Unknown = 0,
-    Other = 1,    // frozen: started in the exe, or nothing names it a driver thread
+    Other = 1,    // frozen: start address in the exe, or nothing named it a driver thread after kNameChecks reads
     Driver = 2,   // left running
-    Maybe = 3,    // started elsewhere (the CRT's thread trampoline, ntdll's pool): its description may still name it (checked again a few times)
+    Maybe = 3,    // started elsewhere (the CRT's or winpthreads' trampoline, ntdll's pool): frozen; its description may still name it (read again a few times)
 };
 
 inline char lower(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c; }
@@ -48,7 +48,9 @@ inline bool driver_module(const char* base)
 // "D3D Background Thread N" (laptop, RTX 4060: priority -15, 51 ms to stop). The toolkit and the port never give a thread such a name.
 inline bool driver_name(const char* name) { return iprefix(name, "D3D Background Thread"); }
 
-// The class from the start address: the exe's own threads are frozen for good, a driver module's are left running for good, the rest is Maybe.
+// The class from the start address: a start in the exe is frozen for good, a start in a driver module is left running for good, the rest is Maybe.
+// Most of the exe's own threads are Maybe (_beginthreadex / std::thread start in ucrtbase or libwinpthread): they stay frozen because no such
+// thread is named "D3D Background Thread", and after kNameChecks reads they are Other.
 inline Cls from_start(const char* module_base, bool in_exe)
 {
     if (in_exe) return Other;
