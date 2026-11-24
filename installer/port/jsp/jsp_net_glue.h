@@ -12,6 +12,8 @@
 // A Run ends the iteration at once (one tick per iteration, live or replayed). The Run op is returned AGAIN, with regrant = true, while the granted tick has not
 // completed; the game then must not poll the pad again (see Stepper::boundary: skip_pad).
 #pragma once
+#include <cstdio>
+#include <map>
 #include "jsp_net_session.h"
 #include "jsp_stepper.h"
 
@@ -39,7 +41,7 @@ public:
     // allow_update=false: pacing (frames_ahead >= 1) or the caller is not ready; the stepper is still serviced (commits, replays).
     jsx::Op iteration(bool allow_update = true)
     {
-        bool updated = false;
+        bool updated = false, polled = false;
         for (;;) {
             if (s_.failed()) return none();
             const jsx::Op op = st_.boundary(g_.done());
@@ -49,9 +51,27 @@ public:
                 if (save_ids_.empty()) { s_.abort("commit failed"); return none(); }
                 // ENHANCEMENT (rollback latency): a save of a frame below GekkoNet's final frame can never be loaded (every later Load names the final frame or a
                 // later one), so it gets its checksum (desync detection) but no snapshot: no freeze, no copy. The tick is then no rollback target (Stepper::forget).
-                const bool skip = skip_final_ && save_frames_.front() < s_.final_frame() && g_.hash_only(op.tick, &h);
+                // ENHANCEMENT (test10, snap-poll): nothing polls the socket during the ~30 ms tick (the keepalive thread only after 250 ms of silence), so
+                // without a poll here the final frame is the one of the last update: a remote input that arrived during the tick does not count yet and the
+                // save of a frame that is in fact confirmed takes a full snapshot. One non-blocking poll per iteration, before its first skip test. It cannot
+                // change what any frame simulates: GekkoNet's Poll (game_session.cpp Poll -> HandleReceivedInputs) only files received remote inputs into
+                // its input buffer (AddRemoteInput, which marks a misprediction as an incorrect frame) and re-sends unacked local inputs; Advance, Load and
+                // Save events are made only by UpdateSession, which begins with the very same Poll, so the next update sees exactly the inputs it would have
+                // seen anyway (the keepalive thread already polls at arbitrary moments, and so does the snapshot gate's idle_service, the hook jsp_net_game.cpp
+                // sets, at most every 20 ms in its retry waits and precheck spins with the threads running). FinalFrame stops before a pending incorrect frame, so a poll that finds
+                // a misprediction only lowers it: a frame a later Load can target is never skipped.
+                int ff = -1;
+                if (skip_final_) {
+                    const int ff_before = s_.final_frame();
+                    if (!polled) { s_.poll(); polled = true; }
+                    ff = s_.final_frame();
+                    if (save_frames_.front() < ff && !(save_frames_.front() < ff_before)) poll_skips_++;
+                }
+                const int sf = save_frames_.front();
+                const bool skip = skip_final_ && sf < ff && g_.hash_only(op.tick, &h);
                 if (skip) { st_.forget(op.tick); skipped_++; }
                 else if (!g_.commit(op.tick, &h, &tok)) { s_.abort("commit failed"); return none(); }
+                if (skip_final_) note_arrival(sf, ff, !skip);
                 if (!s_.complete_save(save_ids_.front(), h, tok)) { s_.abort("commit failed"); return none(); }
                 save_ids_.erase(save_ids_.begin()); save_frames_.erase(save_frames_.begin()); commits_++;
                 break;
@@ -73,9 +93,42 @@ public:
     uint64_t runs() const { return runs_; }
     uint64_t commits() const { return commits_; }
     uint64_t skipped() const { return skipped_; }   // commits that took no snapshot (final frame)
+    uint64_t poll_skips() const { return poll_skips_; }   // of them: skipped only because of the poll before the test (the final frame of the last update was too low)
     void set_skip_final(bool on) { skip_final_ = on; }
+    // DIAGNOSTIC (test10, snap-poll): of the saves that took a snapshot (the frame was still predicted), how many ticks passed until GekkoNet's final frame
+    // passed that frame (its remote input confirmed it). Ticks = GekkoNet frames, counted on the newest saved frame, so a rollback's re-run saves do not
+    // count as time. Checked at each commit (after its poll), so 1 = confirmed by the next tick's save. One line, for the match end.
+    std::string arrival_summary() const
+    {
+        uint64_t n = 0; for (uint64_t c : arr_hist_) n += c;
+        char b[256];
+        if (!n) { std::snprintf(b, sizeof b, "[net] predicted saves confirmed after: none measured (%llu still open), %llu saves skipped thanks to the poll\n",
+                                (unsigned long long)arr_open_.size(), (unsigned long long)poll_skips_); return b; }
+        auto pct = [&](double q) { const uint64_t want = (uint64_t)(q * (double)n + 0.999999); uint64_t acc = 0;
+                                   for (int i = 0; i < kArrBins; i++) { acc += arr_hist_[i]; if (acc >= want) return i; } return kArrBins - 1; };
+        const int p50 = pct(0.5), p90 = pct(0.9);
+        std::snprintf(b, sizeof b, "[net] predicted saves confirmed after: p50 %d%s p90 %d%s ticks, max %d ticks (%llu measured, %llu still open, %llu dropped); "
+                      "%llu saves skipped thanks to the poll\n", p50, p50 == kArrBins - 1 ? "+" : "", p90, p90 == kArrBins - 1 ? "+" : "", arr_max_,
+                      (unsigned long long)n, (unsigned long long)arr_open_.size(), (unsigned long long)arr_dropped_, (unsigned long long)poll_skips_);
+        return b;
+    }
 private:
     static jsx::Op none() { return jsx::Op(); }
+    // Arrival bookkeeping (diagnostic only, never feeds a decision): `frame` was just saved with a snapshot (snapshotted) or as a checksum; `ff` = final frame.
+    void note_arrival(int frame, int ff, bool snapshotted)
+    {
+        if (frame > arr_newest_) arr_newest_ = frame;
+        if (snapshotted && !arr_open_.count(frame)) {   // a re-save after a rollback keeps the first time the frame was predicted
+            if (arr_open_.size() >= kArrOpenMax) { arr_open_.erase(arr_open_.begin()); arr_dropped_++; }
+            arr_open_.emplace(frame, arr_newest_);
+        }
+        while (!arr_open_.empty() && arr_open_.begin()->first < ff) {
+            const int d = arr_newest_ - arr_open_.begin()->second;
+            const int bin = d < 0 ? 0 : d >= kArrBins ? kArrBins - 1 : d;
+            arr_hist_[bin]++; if (d > arr_max_) arr_max_ = d;
+            arr_open_.erase(arr_open_.begin());
+        }
+    }
     // Pad of local player n -> events -> stepper queue. True when events were pushed (the caller calls boundary() again).
     bool update_once()
     {
@@ -114,7 +167,13 @@ private:
     std::vector<uint32_t> save_ids_;
     std::vector<int> save_frames_;   // GekkoNet frame of each pending save, parallel to save_ids_
     bool skip_final_ = false;
-    uint64_t updates_ = 0, runs_ = 0, commits_ = 0, skipped_ = 0;
+    uint64_t updates_ = 0, runs_ = 0, commits_ = 0, skipped_ = 0, poll_skips_ = 0;
+    static constexpr int kArrBins = 64;                 // 0..62 ticks, 63 = 63 or more
+    static constexpr size_t kArrOpenMax = 1024;         // open predicted frames kept (a stuck final frame cannot grow this without bound)
+    std::map<int, int> arr_open_;                       // predicted frame -> newest saved frame when it was first snapshotted
+    uint64_t arr_hist_[kArrBins] = {};
+    uint64_t arr_dropped_ = 0;
+    int arr_newest_ = -1, arr_max_ = 0;
 };
 
 } // namespace jspnet

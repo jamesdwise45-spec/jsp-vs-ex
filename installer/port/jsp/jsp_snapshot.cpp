@@ -405,7 +405,8 @@ std::atomic<uint32_t> g_exempt_tid[kExempt];
 void exempt_add(uint32_t tid) { for (auto& e : g_exempt_tid) { uint32_t z = 0; if (e.compare_exchange_strong(z, tid)) return; } }
 bool freeze_exempt(unsigned long tid) { for (const auto& e : g_exempt_tid) { const uint32_t x = e.load(std::memory_order_relaxed); if (!x) return false; if (x == tid) return true; } return false; }
 
-struct Th { void* h; unsigned long tid; bool paused = false, context = false; uintptr_t ip = 0; bool gone = false; };
+struct Th { void* h; unsigned long tid; bool paused = false, context = false; uintptr_t ip = 0; bool gone = false;
+            float stop_ms = 0, ctx_ms = 0; };   // DIAGNOSTIC (test10, freeze tail): this freeze pass's SuspendThread + GetThreadContext time, of it GetThreadContext
 // Why the last enumeration / freeze failed (raw numbers; formatted only after the threads run again). step: 1 snapshot, 2 enumeration end, 3 OpenThread, 4 SuspendThread, 5 GetThreadContext.
 // run soak-s1 stopped with a bare `failures=0x1` at k=3943, right after cellAudio's thread reported a failed endpoint, i.e. a thread was coming or going.
 struct PauseFail { int step = 0; unsigned long tid = 0, err = 0; };
@@ -515,12 +516,41 @@ std::vector<jss::Range> discover(uint64_t* excluded_bytes, bool* complete)
     return keep;
 }
 
+// ENHANCEMENT (test10, freeze tail; timing only): the freeze calls of two-copy runs had a tail of 30-730 ms (GetThreadContext returns only once the target
+// is really suspended). The calling thread runs at THREAD_PRIORITY_HIGHEST for the freeze calls (first SuspendThread to last GetThreadContext) and again for
+// the resume calls, and at its own priority in between: the frozen census, collect and page copy (whose pcopy::run spins on the ABOVE_NORMAL copy workers)
+// do not run boosted. Raised only, never lowered. It changes no thread set and no order: every thread is frozen exactly as before.
+// JSP_SNAPSHOT_FREEZE_BOOST=0 turns it off (A/B). The switch is read in Suspended::prepare() (threads running), never inside a freeze.
+static bool freeze_boost_on() { static const bool v = [] { const char* e = std::getenv("JSP_SNAPSHOT_FREEZE_BOOST"); return !(e && e[0] == '0'); }(); return v; }
+struct SelfBoost {
+    int prev = 0; bool on = false;
+    void begin(bool enabled)   // enabled: the cached switch (Suspended::boost_on), so no getenv or static-init guard runs while threads are frozen
+    {
+#ifdef _WIN32
+        if (on || !enabled) return;
+        const int p = GetThreadPriority(GetCurrentThread());
+        if (p == THREAD_PRIORITY_ERROR_RETURN || p >= THREAD_PRIORITY_HIGHEST) return;
+        if (SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST)) { prev = p; on = true; }
+#endif
+    }
+    void end()
+    {
+#ifdef _WIN32
+        if (on) { SetThreadPriority(GetCurrentThread(), prev); on = false; }
+#endif
+    }
+};
+
 // Thread enumeration/storage is prepared before freezing. Freeze only records raw IPs; formatting/logging is after resume.
 // Suspending workers does not rewind their host stacks: a proven simulation safe point is still required for shipping rollback.
 struct Suspended {
     std::vector<Th> th; bool complete = true;
     PauseFail fail; unsigned gone_n = 0, retries = 0;
     uint64_t ppu_alive_at_listing = 0;   // which PPU thread ids were alive when the host threads were listed
+    // DIAGNOSTIC (test10, freeze tail): the slowest thread to stop over every freeze pass of this operation (tid 0 = none measured). The calls run in
+    // order, so a thread that stops late shows its whole wait and the threads after it only what is left: the slowest one is the one that held the freeze.
+    unsigned long slow_tid = 0; double slow_ms = 0, slow_ctx_ms = 0; unsigned slow_over1 = 0, passes = 0;
+    SelfBoost boost; bool boost_on = false;   // boost_on: freeze_boost_on(), cached by prepare()
     // Alive PPU threads as a bit set (allocation-free table read). A PPU thread started or ended between the listing and the freeze changes it. Host-only threads
     // (cellAudio's wasapi opener, SPU job threads) are NOT PPU threads: they are covered by the ended-thread skip and the retry, not by this check; a host thread CREATED
     // after the listing stays unseen.
@@ -541,6 +571,7 @@ struct Suspended {
     void prepare()
     {
         fail = PauseFail(); gone_n = 0;
+        boost_on = freeze_boost_on();   // threads running: the first call's getenv and static init happen here
         if (g_thr_registry) {
             jtr::Registry& R = jsp_thread_registry();
             R.reclaim([](void* h) { jsp_thread_registry_close(h); }, [](void* h) { return jsp_thread_registry_ended(h); });
@@ -572,8 +603,15 @@ struct Suspended {
             for (size_t i = 0; i < n; i++) if (!freeze_exempt(buf[i].tid)) th.push_back({buf[i].h, buf[i].tid});   // capacity reserved in prepare(); exempt threads stay running
             ppu_alive_at_listing = ppu_alive_mask();
         }
+        boost.begin(boost_on);
+        struct BoostEnd { SelfBoost& b; ~BoostEnd() { b.end(); } } boost_end{boost};   // own priority again after the last GetThreadContext, on every return path
+        passes++;
         for (Th& t : th) {
-            if (SuspendThread((HANDLE)t.h) == (DWORD)-1) {
+            t.stop_ms = 0; t.ctx_ms = 0;
+            const auto ts = Clock::now();
+            const DWORD sr = SuspendThread((HANDLE)t.h);
+            t.stop_ms = (float)ms_since(ts);
+            if (sr == (DWORD)-1) {
                 const DWORD e = GetLastError();
                 if (exited(t.h)) { t.gone = true; gone_n++; continue; }
                 fail = {4, t.tid, e}; return false;
@@ -583,12 +621,23 @@ struct Suspended {
         for (Th& t : th) {
             if (t.gone) continue;
             CONTEXT cx; cx.ContextFlags = CONTEXT_CONTROL;
-            if (!GetThreadContext((HANDLE)t.h, &cx)) {
+            const auto tc = Clock::now();
+            const BOOL got = GetThreadContext((HANDLE)t.h, &cx);
+            t.ctx_ms = (float)ms_since(tc); t.stop_ms += t.ctx_ms;
+            if (!got) {
                 const DWORD e = GetLastError();
                 if (exited(t.h)) { t.gone = true; t.paused = false; gone_n++; continue; }   // killed while suspended: nothing left to resume
                 fail = {5, t.tid, e}; return false;
             }
             t.ip = (uintptr_t)cx.Rip; t.context = true;
+        }
+        {   // plain scalars: nothing allocates while frozen
+            unsigned over1 = 0;
+            for (const Th& t : th) {
+                if (t.stop_ms >= 1.0f) over1++;
+                if (t.stop_ms > slow_ms) { slow_ms = t.stop_ms; slow_ctx_ms = t.ctx_ms; slow_tid = t.tid; }
+            }
+            if (over1 > slow_over1) slow_over1 = over1;
         }
         if (ppu_alive_mask() != ppu_alive_at_listing) { fail = {6, 0, 0}; return false; }   // a PPU thread started or ended since the listing: this freeze is not of the thread set that exists now
 #endif
@@ -604,11 +653,13 @@ struct Suspended {
     bool resume()
     {
 #ifdef _WIN32
+        if (!th.empty()) boost.begin(boost_on);   // HIGHEST again for the resume calls only (ended below)
         const bool ok = jso::resume_threads(th, [](void* h) {
             if (ResumeThread((HANDLE)h) != (DWORD)-1) return true;
             g_rf_handle = h; g_rf_err = GetLastError(); g_rf_count = g_rf_count + 1;   // read by write_fatal_note (resume_failed)
             return false; });
         if (reg_frozen) { reg_frozen = false; jsp_thread_registry().freeze_end([](std::atomic<uint32_t>* a) { jsp_thread_registry_wake(a); }); }   // births go on
+        boost.end();
         return ok;
 #else
         return true;
@@ -789,6 +840,47 @@ bool quick_jobs_view(jsy::View* v)
 #else
     (void)v; return false;
 #endif
+}
+
+// DIAGNOSTIC (test10, freeze tail): one line for a save or restore over 30 ms that names the thread slowest to stop (threads running again; the thread
+// is opened by its id, so a thread that has ended since reads "?"). Rate-limited: at most one line per second and 120 per process; the lines skipped
+// in between are counted in the next one.
+static void slow_freeze_line(const char* what, uint32_t k, double real_ms, double freeze_call_ms, size_t threads, const Suspended& sp)
+{
+    static unsigned lines = 0, skipped = 0; static Clock::time_point last{}; static bool any = false;
+    if (lines >= 120 || (any && ms_since(last) < 1000.0)) { skipped++; return; }
+    any = true; last = Clock::now(); lines++;
+    char name[96] = "?", start[160] = "?"; int prio = 0;
+#ifdef _WIN32
+    if (HANDLE h = OpenThread(THREAD_QUERY_INFORMATION, FALSE, (DWORD)sp.slow_tid)) {   // not LIMITED: the start address query needs the full right
+        prio = GetThreadPriority(h);
+        using GTD = HRESULT(WINAPI*)(HANDLE, PWSTR*);   // Windows 10 1607+, looked up: older systems print "?"
+        if (GTD gtd = reinterpret_cast<GTD>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleA("kernel32.dll"), "GetThreadDescription")))) {
+            PWSTR w = nullptr;
+            if (SUCCEEDED(gtd(h, &w)) && w) {
+                if (!w[0]) std::snprintf(name, sizeof name, "unnamed");
+                else if (WideCharToMultiByte(CP_UTF8, 0, w, -1, name, (int)sizeof name, nullptr, nullptr) <= 0) std::snprintf(name, sizeof name, "?");
+                LocalFree(w);
+            }
+        }
+        using Q = LONG(NTAPI*)(HANDLE, int, PVOID, ULONG, PULONG);   // ThreadQuerySetWin32StartAddress = 9
+        Q q = reinterpret_cast<Q>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationThread")));
+        void* sa = nullptr;
+        if (q && q(h, 9, &sa, sizeof sa, nullptr) == 0 && sa) {
+            HMODULE m = nullptr; char path[MAX_PATH] = {0};
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)sa, &m) && GetModuleFileNameA(m, path, sizeof path)) {
+                const char* b = std::strrchr(path, '\\'); b = b ? b + 1 : path;
+                std::snprintf(start, sizeof start, "%s+0x%llx", b, (unsigned long long)((uintptr_t)sa - (uintptr_t)m));
+            } else std::snprintf(start, sizeof start, "0x%llx", (unsigned long long)(uintptr_t)sa);
+        }
+        CloseHandle(h);
+    }
+#endif
+    std::fprintf(stderr, "[snap] slow freeze k=%u %s real=%.1f freeze_call=%.1f ms: slowest thread tid %lu name \"%s\" start %s prio %d, %.2f ms to stop "
+                 "(GetThreadContext %.2f), %u thread(s) over 1 ms, %u freeze pass(es), %zu threads, boost %s; %u slow op(s) not logged before this line\n",
+                 k, what, real_ms, freeze_call_ms, sp.slow_tid, name, start, prio, sp.slow_ms, sp.slow_ctx_ms, sp.slow_over1, sp.passes, threads,
+                 freeze_boost_on() ? "on" : "off", skipped);
+    skipped = 0;
 }
 
 // jsy::gate adapter: suspend every other thread, sample, and (JSP_SNAPSHOT_SYNC=2) resume and retry until the sync state is idle.
@@ -1583,6 +1675,7 @@ bool ww_transaction(uint32_t k, ppu_context* c, uint32_t restore_to)
     }
     (restore_to == kNoTick ? g_cost_commit : g_cost_rb).add(save_ms, prep_ms, layout_ms, close_ms, audit_ms, op.presample_ms, op.gate_wait_ms, op.frozen_ms, op.collect_ms, op.apply_ms, op.gr, (uint32_t)nthr);
     g_hz_real_ms += real_ms; g_hz_gate_ms += op.suspend_ms; g_hz_ops++;   // DIAGNOSTIC (per-hitch line): jsp_snapshot_ext_cost_sum
+    if (real_ms > 30.0 && sp.slow_tid) slow_freeze_line(restore_to == kNoTick ? "commit" : "rollback", k, real_ms, op.freeze_call_ms, nthr, sp);   // DIAGNOSTIC (test10, freeze tail)
     if (g_ext && result.ok()) {   // ENHANCEMENT (measurement): the `[snap] cost window` percentiles (threads running)
         g_cw.note_op(restore_to == kNoTick, real_ms, op.presample_ms + op.gate_wait_ms, op.apply_ms, op.gr.freezes);
         if (restore_to != kNoTick) g_cw.rollback_done(real_ms);

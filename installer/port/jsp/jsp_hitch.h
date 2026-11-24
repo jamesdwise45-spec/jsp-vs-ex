@@ -77,15 +77,25 @@ inline const char* stage_name(int s)   // the same names as jsp_stepper.cpp's ma
 // kRenderMs comes FIRST: the clock thread only sees the flip ready after its drain walked the FIFO to the flip command and after main.cpp gave the loop
 // back, so a 40 ms drain or present makes ready_late +35 even when the guest queued the flip on time (review of diag/hitch, S1). Then a flip ready
 // kLateMs late = the guest was late (the samples name where); else the guest waited for the flip.
+// FIX (test10, honest causes): the guest competes with its excess only, so a normal 12-22 ms save in a gap where the guest took 28-37 ms won as "snapshot"
+// (s35: 5 of 6 written lines, 247 "snapshot" hitches against 207 saves over 30 ms). "snapshot" now also needs the snapshot to be the gap's largest part
+// against the WHOLE guest time; when the guest took at least as long, the gap goes down the guest branch (its split with the frame clock below).
+// The rows of cause()'s table, in order: kGuestIdx names the guest's row, and the table takes its causes from here, so the two cannot drift apart.
+inline constexpr int kCauseRows[] = { CSnapshot, CSession, CHold, CAudio, CSound, COther, CReplay, CGuest };
+inline constexpr int kGuestIdx = 7;
+static_assert(kCauseRows[kGuestIdx] == CGuest && sizeof kCauseRows / sizeof kCauseRows[0] == kGuestIdx + 1, "kGuestIdx must name the guest's row");
 inline int cause(const Gap& g, const Clock& c)
 {
     const double sess = g.part[Session] - g.part[Snapshot];
     struct { int c; double ms; } v[] = {
-        { CSnapshot, g.part[Snapshot] }, { CSession, sess > 0 ? sess : 0 }, { CHold, g.part[Hold] }, { CAudio, g.part[Audio] },
-        { CSound, g.part[Files] + g.part[Server] }, { COther, g.part[Other] }, { CReplay, g.part[Replay] }, { CGuest, g.part[Guest] - kGuestNominalMs } };
+        { kCauseRows[0], g.part[Snapshot] }, { kCauseRows[1], sess > 0 ? sess : 0 }, { kCauseRows[2], g.part[Hold] }, { kCauseRows[3], g.part[Audio] },
+        { kCauseRows[4], g.part[Files] + g.part[Server] }, { kCauseRows[5], g.part[Other] }, { kCauseRows[6], g.part[Replay] },
+        { kCauseRows[kGuestIdx], g.part[Guest] - kGuestNominalMs } };
+    static_assert(sizeof v / sizeof v[0] == sizeof kCauseRows / sizeof kCauseRows[0], "one table row per cause row");
     int best = 0;
     for (int i = 1; i < (int)(sizeof v / sizeof v[0]); i++) if (v[i].ms > v[best].ms) best = i;
     if (v[best].ms <= 0) return CNone;
+    if (v[best].c == CSnapshot && g.part[Guest] >= g.part[Snapshot]) best = kGuestIdx;   // the snapshot is not the largest part
     if (v[best].c != CGuest) return v[best].c;
     if (c.drain_max_ms >= kRenderMs || c.outside_max_ms >= kRenderMs) {   // the outer stretch's own split decides when it is the bigger one
         if (c.drain_max_ms >= c.outside_max_ms) return CDrain;

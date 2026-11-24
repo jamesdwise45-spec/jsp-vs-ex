@@ -100,6 +100,21 @@ int main()
         jph::Gap h; jph::add_boundary(h, 30.0, 25.0, 20.0, 1, 0.0, 0.0, 0.0, 0.0, 30.0);   // a hold that ended in an update with a 25 ms save: session 30, hold 0
         CHECK(jph::cause(h, jph::Clock()) == jph::CSnapshot);
     }
+    // test10 (honest causes): an ordinary 14 ms save in a 55 ms gap where the guest took 33 ms is not "snapshot" (s35 L2722-style lines): the guest is the
+    // largest part, so the guest branch decides (here: no late flip = the guest waited for the flip). A save longer than the whole guest time still is.
+    {
+        jph::Match m;
+        jph::add_boundary(m.gap, 16.0, 14.0, 9.0, 1, 0.0, 0.1, 3.0, 1.0, 21.0);
+        jph::add_guest(m.gap, 33.0, false);
+        CHECK(jph::cause(m.gap, jph::Clock()) == jph::CGuest);
+        jph::Clock late; late.ready_late_ms = 12.0;
+        CHECK(jph::cause(m.gap, late) == jph::CGuestLate);
+        CHECK(has(jph::close_gap(m, 55.0, 2722, jph::Clock()), "cause guest-flip-wait"));
+        jph::Gap e; jph::add_boundary(e, 16.0, 14.0, 9.0, 1, 0.0, 0.0, 0.0, 0.0, 16.0); jph::add_guest(e, 14.0, false);   // a tie goes to the guest
+        CHECK(jph::cause(e, jph::Clock()) == jph::CGuest);
+        jph::Gap b; jph::add_boundary(b, 32.0, 30.0, 26.0, 1, 0.0, 0.0, 0.0, 0.0, 32.0); jph::add_guest(b, 25.0, false);
+        CHECK(jph::cause(b, jph::Clock()) == jph::CSnapshot);
+    }
     // N1: nothing above 0 (all time unaccounted) is unexplained, not snapshot
     {
         jph::Match m; jph::add_guest(m.gap, 10.0, false);
