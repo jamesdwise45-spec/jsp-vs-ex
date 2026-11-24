@@ -72,7 +72,7 @@ inline constexpr const char* kRestoreBase = "effective value falls back to the l
 inline constexpr std::array<Rule, kCount> kRules{{
     { "JSP_ROLLBACK",       NetClass::MatchRule,     Type::Flag, Boundary::MatchStart, 0, 1, 0, kAnyValue, kRestoreBase },
     { "JSP_SIM_RATE_HZ",    NetClass::MatchRule,     Type::UInt, Boundary::MatchStart, 30, 30, 30, kAnyValue, kRestoreBase },   // 30 Hz only
-    { "JSP_INPUT_DELAY",    NetClass::MatchRule,     Type::UInt, Boundary::MatchStart, 0, 8, 2, kAnyValue, kRestoreBase },      // (A) range and default
+    { "JSP_INPUT_DELAY",    NetClass::MatchRule,     Type::UInt, Boundary::MatchStart, 0, 8, 3, kAnyValue, kRestoreBase },      // (A) range and default (3: every real link in the test bundles needed 3 at its first reading)
     // The KO target and the training/cheat fields are read ONCE at registration by their reader (the hook is installed only when
     // a value is set), so their effective boundary is Startup: the session value must equal the value the reader already holds.
     // Making them live (hook always installed, value read from the effective path) is a later reader change.

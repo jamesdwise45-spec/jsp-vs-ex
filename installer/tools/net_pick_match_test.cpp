@@ -124,7 +124,7 @@ static void test_wd_stop_per_match()
 
 // ---- 3. the input delay rule starts afresh in every match ----
 // A 200 ms link: rule 2 with the shipped Params. One match = 20 s from its sync, stepped every 100 ms (adapt_delay's poll), the session's delay
-// starting at the manifest's 2 (a new session per match). Returns the time from the sync of the first raise (to 3), or -1. With the state reset
+// starting at 2 (the manifest's default before test10, now 3; a start below the need is what this test needs) (a new session per match). Returns the time from the sync of the first raise (to 3), or -1. With the state reset
 // per match the raise comes from this match's own round trips: after the sync and by the first reading (first_ms + every_ms). This holds on
 // final2/test6 (the first reading at 4 s, guarded) and with the delay follow-up's slow-link start (about 1 s), so it does not depend on it.
 static int64_t run_match(jpdr::State& s, const jpdr::Params& p, uint64_t sync)
