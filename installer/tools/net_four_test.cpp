@@ -163,6 +163,16 @@ int main()
     // after the leaver, between matches: 3 humans left of 4 re-plan to 3; 2 left fall back to the 2-player path
     CHECK(jsp4::replan(4, jsp4::link_players(3, 0, 4), false, 4) && jsp4::link_players(3, 0, 4) == 3 && jsp4::link_players(2, 0, 4) == 2);
 
+    // ---- test10 friends (rooms 54/58): a link opened at 2 members, then a 3rd joined; the fight had 3 human records ----
+    // with 4 allowed the room is planned again for 3 between fights; with 2 the 2-player link closes and the room of 3 gets none (until it is 2 again)
+    CHECK(jsp4::replan(2, jsp4::link_players(3, 0, 4), false, 4) && jsp4::link_players(3, 0, 4) == 3);
+    CHECK(jsp4::link_players(3, 0, 2) == 0 && jsp4::link_players(2, 0, 2) == 2);
+    { jsp4::RoomView rv; rv.member[0] = 1; rv.member[1] = 2; rv.member[2] = 3; rv.member[3] = 0; rv.com[0] = rv.com[1] = rv.com[2] = false; rv.com[3] = true;   // the bundle's records
+      CHECK(jsp4::human_mask(rv) == 0x7 && jsp4::popcount4(jsp4::human_mask(rv)) == 3); }
+    CHECK(jsp4::count_text(3, 2, 4) == "Rollback off for this fight: it has 3 players, the rollback link was set up for 2. It is set up again for 3 after this fight.");
+    CHECK(jsp4::count_text(3, 2, 2).rfind("Rollback off: this fight has 3 players and rollback is set to at most 2", 0) == 0);
+    CHECK(jsp4::count_text(4, 3, 4).rfind("Rollback off for this fight: it has 4 players", 0) == 0);
+
     // ---- the takeover: battle slot s = GekkoNet slot s for every human record ----
     { uint32_t seen = 0;
       CHECK(jnf::take_human(0, 0xF, &seen) && jnf::take_human(3, 0xF, &seen) && !jnf::take_human(3, 0xF, &seen) && !jnf::take_human(4, 0xF, &seen) && !jnf::take_human(-1, 0xF, &seen));

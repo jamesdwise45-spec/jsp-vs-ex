@@ -145,4 +145,16 @@ enum class Leave { EndMatch, GoOn };
 inline Leave leave_policy(bool multi, unsigned connected, unsigned gone = 1) { return multi && connected >= 1 && gone == 1 ? Leave::GoOn : Leave::EndMatch; }
 inline std::string left_text(int handle) { return "Player " + std::to_string(handle + 1) + " left"; }
 
+// ---- a fight whose human count is not the plan's (test10 friends: a link opened for 2, a fight of 3) ----
+// The on-screen line when a session is refused because the fight has `humans` human players and the link was planned for `planned` (max = max_players()).
+// Starts with "Rollback off" (jsp_net_game.cpp shows it as it is, without the "could not start" prefix). The fight itself goes on, on the game's own connection.
+inline std::string count_text(int humans, int planned, int max)
+{
+    if (humans > max)
+        return "Rollback off: this fight has " + std::to_string(humans) + " players and rollback is set to at most " + std::to_string(max) +
+               " (JSP_ROLLBACK_MAX_PLAYERS). The game's own connection is used.";
+    return "Rollback off for this fight: it has " + std::to_string(humans) + " players, the rollback link was set up for " + std::to_string(planned) +
+           ". It is set up again for " + std::to_string(humans) + " after this fight.";
+}
+
 }  // namespace jsp4

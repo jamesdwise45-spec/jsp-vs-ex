@@ -563,6 +563,7 @@ int max_players()
 }
 bool multi_peer() { return max_players() > 2 && g.plan.remotes.size() > 1; }
 void g_nat_replan_next();   // ENHANCEMENT (4-player online): after a slot-mismatch refusal (defined with g_nat)
+int test_bots();            // ENHANCEMENT (4-player online): TEST ONLY extra peers (defined with g_nat)
 jpdr::Params g_ad_pm;      // ENHANCEMENT (4-player online): the rule's parameters with 3-4 peers (adapt_settings)
 jpdr::State g_ad;   // per match (reset_match)
 int g_ad_on = -1;   // the switches are read once per process
@@ -1266,7 +1267,10 @@ void pump_tick(uint64_t t)
                 g.flow.set_config(pc, kc);
                 std::fprintf(stderr, "[net] postgame: on for this link (2 players, this PC player %d slot %u; prompt idle %u s, pick idle %u s)\n", me,
                              (unsigned)g.plan.local_first, pc.idle_ms / 1000, kc.idle_ms / 1000);
-            } else std::fprintf(stderr, "[net] postgame: off for this link (the plan is not 2 players on the planned rollback seats 0 and 1)\n");
+            } else if (g.plan.total_players > 2)   // FIX (test11, 4-player): said plainly; the menu, the pick round and the roster write are 2-player only for now
+                std::fprintf(stderr, "[net] postgame: off for this link (%u players: the after-match menu is for 2 players in this build; after each match the room "
+                             "is the game's own, and the next match starts from there)\n", (unsigned)g.plan.total_players);
+            else std::fprintf(stderr, "[net] postgame: off for this link (the plan is not 2 players on the planned rollback seats 0 and 1)\n");
         }
         if (g.rrz && g.rrz->room_id()) g.presence_room = g.rrz->room_id();
         log("rendezvous", to_string(g.plan.remotes[0].ep) + (g.rrz ? std::string(" via re-psn, path ") + path_name(g.rrz->path()) + ", room " + std::to_string((unsigned long long)g.rrz->room_id()) : std::string()));
@@ -1653,7 +1657,27 @@ void start_session(ppu_context* c)
     // Not adjusted here: the two plans must agree, so a mismatch refuses the session on this side (and the handshake Cancel tells the other one).
     const bool native_online = jsp_native_fight_online() == 1;
     unsigned humans = 0;   // ENHANCEMENT (4-player online): the fight's human records (3-4 players); 0 = the native pad-take rule (2 players, unchanged)
-    if (native_online) {
+    // FIX (test10 friends, native rooms 54 and 58: a link opened for 2 players met a fight of 3 humans; the ownership check refused it, the match was cancelled,
+    // re-armed into the same fight and refused again, 5 times, then the link closed): the fight's human count against the plan's player count comes first.
+    // A different count is not a slot mix-up that a retry could fix: this session is refused once with a plain reason, no match is re-armed into this fight
+    // (native_maintain holds while replan_next is set), and after the fight the link is planned again for the room's count (native_poll), or, with more
+    // humans than JSP_ROLLBACK_MAX_PLAYERS allows, the room has no rollback link until it is back in range. Only a fight the ownership map below would refuse
+    // anyway is refused here (it needs exactly the plan's seats as humans), so a 2-player fight that starts today still starts.
+    if (native_online && !test_bots()) {
+        jsp4::RoomView rv, rv2; uint16_t me = 0; uint8_t com[4] = {1, 1, 1, 1}, com2[4] = {1, 1, 1, 1};
+        // a racy read of the room records (jsp_native_fight.h): two readings must agree, else the ownership map below decides as before
+        if (jsp_native_room_read(rv.member, com, &me) && jsp_native_room_read(rv2.member, com2, &me)) {
+            for (int i = 0; i < 4; i++) { rv.com[i] = com[i] != 0; rv2.com[i] = com2[i] != 0; }
+            const int nh = jsp4::popcount4(jsp4::human_mask(rv)), np = (int)g.plan.total_players, mp = max_players();
+            if (nh > 0 && nh != np && jsp4::human_mask(rv) == jsp4::human_mask(rv2)) {
+                std::fprintf(stderr, "[net] fight has %d human players, the rollback link was planned for %d (JSP_ROLLBACK_MAX_PLAYERS %d): no rollback for this fight, %s\n",
+                             nh, np, mp, nh <= mp ? "the link is planned again after it" : "and none in this room while it has more players than that");
+                why = jsp4::count_text(nh, np, mp);
+                g_nat_replan_next();
+            }
+        }
+    }
+    if (native_online && why.empty()) {
         const int slot = jsp_native_fight_slot();
         if (slot != (int)g.plan.local_first)   // with 3-4 players the claims made them equal (HELO claim = room record index); a mismatch means the records moved
             why = "the game's battle slot (" + std::to_string(slot) + ") is not the rollback slot (" + std::to_string((int)g.plan.local_first) + ")" +
@@ -1683,7 +1707,7 @@ void start_session(ppu_context* c)
     }
     if (!why.empty()) {   // a refusal becomes a handshake Cancel with a reason, so the other side learns why (and the layer is removed on both)
         { std::lock_guard<std::mutex> lk(g.pump.mutex()); if (g.host) g.mh->cancel(jpsm::Reason::SessionRefused); else g.mc->abort(jpsm::Reason::SessionRefused); }
-        end_with(std::string("Rollback session could not start: ") + why);   // (the handshake Cancel above already told the other side)
+        end_with(why.rfind("Rollback off", 0) == 0 ? why : std::string("Rollback session could not start: ") + why);   // (the handshake Cancel above already told the other side)
         return;
     }
     // TEST ONLY (two copies on one PC): JSP_NET_LINK="delay_ms,jitter_ms,loss_permille" impairs every datagram this copy sends from here on (the plan
@@ -2393,6 +2417,7 @@ void native_open(uint64_t room, bool owner, int players, int claim, const std::v
     std::string why; jpno::Refusal code = jpno::Refusal::None;
     if (!conn_open(c, &why, &code)) { conn_close(); log("native room: no rollback link", why); g_nat.given_up = room; return; }
     g_nat.link = true; g_nat.room = room; g_nat.tries++; g_nat.fails = 0; g_nat.rearm_at = 0; g_nat.away_since = 0; g_nat.players = players;
+    g_nat.replan_next = false;   // a new plan: an earlier refusal's re-plan is done
     std::fprintf(stderr, "[net] native room %llu: %d players, rollback link opening as %s (try %d), build %08x%s\n", (unsigned long long)room, players, owner ? "host (room owner)" : "client", g_nat.tries, g.caps.build,
                  players > 2 ? (", slot claim " + std::to_string(claim)).c_str() : "");
 }
@@ -2426,6 +2451,9 @@ void native_maintain(uint64_t now)
         else g_nat.retry_at = now + 5000;
         return;
     }
+    // FIX (test10 friends: 5 cancelled matches in one fight): a session refused because the fight's players do not fit the plan is not re-armed into the
+    // same fight (each re-arm met the same fight and was refused again); native_poll plans the link again once the fight is over. Not counted as a failure.
+    if (g_nat.replan_next) { g_nat.rearm_at = 0; return; }
     // ENHANCEMENT (post-game / pick): the next match is not armed while the prompt is open or the pick round runs (pick_frame acts on the outcome)
     { std::lock_guard<std::mutex> lk(g.pump.mutex()); if (g.flow.hold()) { g_nat.rearm_at = 0; return; } }
     if (!g_nat.rearm_at) { if (g.last_end_ok) g_nat.fails = 0; else g_nat.fails++; g_nat.rearm_at = now + (g.last_end_ok ? 300 : 2000); return; }

@@ -393,9 +393,10 @@ int main()
     // test10, the deadband (4 ms): a need just over a tick boundary keeps the delay; past the band it moves
     {
         // median 138 (margin 16): need (138 - 33.3) / 2 + 16 = 68.3 ms, 1.7 ms over 2 ticks: kept at 2 (without the band: 3)
-        Sim a; a.p.clamp(); a.cur = 2; a.rtt = [](uint64_t) { return 138.0; };
+        // (the slow-link start off, as the game reads it by default since test11: on, the 138 ms round trips would start this link at 3 at once)
+        Sim a; a.p.slow_ms = 0; a.p.clamp(); a.cur = 2; a.rtt = [](uint64_t) { return 138.0; };
         CHECK(a.run(40000) == 2); CHECK(a.changes == 0);
-        Sim a0; a0.p.deadband_ms = 0; a0.p.clamp(); a0.cur = 2; a0.rtt = [](uint64_t) { return 138.0; };
+        Sim a0; a0.p.deadband_ms = 0; a0.p.slow_ms = 0; a0.p.clamp(); a0.cur = 2; a0.rtt = [](uint64_t) { return 138.0; };
         CHECK(a0.run(40000) == 3);
         // median 146: need 72.3 ms, past 66.7 + 4: up at the first reading
         Sim b; b.p.clamp(); b.cur = 2; b.rtt = [](uint64_t) { return 146.0; };
