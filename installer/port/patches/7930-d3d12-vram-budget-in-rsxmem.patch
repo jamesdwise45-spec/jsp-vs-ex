@@ -1,0 +1,72 @@
+Patch 7930 (diagnostic, rollback netcode stalls): the [RSXMEM] line also shows video memory usage and budget.
+
+Why. test11 research (RESEARCH-TEST12.md) placed the desktop's 66-83 ms "present" runs inside render_frame_prepare's full GPU wait, so
+the GPU itself was slow for whole runs of frames. One suspect is video memory over-commit: when a process's GPU memory use goes over
+the budget the OS gives it, the video memory manager pages resources in and out and GPU work stalls. Nothing in the logs showed it.
+
+What. At init the device's adapter is kept as IDXGIAdapter3 (EnumAdapterByLuid on the device's LUID; NULL where the interface is
+missing). The [RSXMEM] line (patch 2016, every 30 s, on the thread that presents) now ends with
+  vram_local=<usage>/<budget>MB vram_nonlocal=<usage>/<budget>MB
+from QueryVideoMemoryInfo (local = the card's own memory, non-local = shared system memory), or " vram=?" without the adapter. Two
+queries per line, never on a per-frame path. The new fields are appended, so readers of the older fields keep working. Usage over
+budget means the OS is paging this process's GPU memory. The adapter is released at shutdown.
+
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+index 491cc30..0f69826 100644
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -1194,6 +1194,9 @@ static int d3d12_present_mode(void)
+ }
+ static int d3d12_vsync_off(void) { return d3d12_present_mode() == 2; }   /* the swap chain asks for tearing only then */
+ 
++/* 7930: the adapter the device runs on, for the video memory figures of the [RSXMEM] line (NULL: not available). */
++static IDXGIAdapter3* s_vram_ad = NULL;
++
+ static int init_d3d12(u32 width, u32 height)
+ {
+     HRESULT hr;
+@@ -1242,6 +1245,11 @@ static int init_d3d12(u32 width, u32 height)
+         factory->lpVtbl->Release(factory);
+         return -1;
+     }
++    {   /* 7930: keep the device's adapter as IDXGIAdapter3 for QueryVideoMemoryInfo (Windows 10+; NULL when it is not there) */
++        LUID luid = {0, 0};
++        s_d3d.device->lpVtbl->GetAdapterLuid(s_d3d.device, &luid);
++        if (FAILED(factory->lpVtbl->EnumAdapterByLuid(factory, luid, &IID_IDXGIAdapter3, (void**)&s_vram_ad))) s_vram_ad = NULL;
++    }
+ 
+     /* Create command queue */
+     D3D12_COMMAND_QUEUE_DESC queue_desc = {0};
+@@ -10096,10 +10104,22 @@ skip_dump_consider: ;
+           if (tnow - s_mt >= 30000) { s_mt = tnow;
+             PROCESS_MEMORY_COUNTERS pmc; memset(&pmc, 0, sizeof pmc); pmc.cb = sizeof pmc;
+             K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc);
+-            fprintf(stderr, "[RSXMEM] t=%llus frame=%u ws=%lluMB pagefile=%lluMB pipelines=%d removed=0x%08lX\n",
++            /* 7930: video memory, local (VRAM) and non-local (shared system memory): usage / the budget the OS gives this process, in MB.
++             * Queried here only, once per line (every 30 s); " vram=?" when the adapter has no IDXGIAdapter3. Appended at the end so
++             * readers of the older fields keep working. Usage over budget means the OS is paging this process's GPU memory. */
++            char vb[128] = " vram=?";
++            if (s_vram_ad) {
++                DXGI_QUERY_VIDEO_MEMORY_INFO lo, nl; memset(&lo, 0, sizeof lo); memset(&nl, 0, sizeof nl);
++                if (SUCCEEDED(s_vram_ad->lpVtbl->QueryVideoMemoryInfo(s_vram_ad, 0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &lo)) &&
++                    SUCCEEDED(s_vram_ad->lpVtbl->QueryVideoMemoryInfo(s_vram_ad, 0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &nl)))
++                    snprintf(vb, sizeof vb, " vram_local=%llu/%lluMB vram_nonlocal=%llu/%lluMB",
++                             (unsigned long long)(lo.CurrentUsage >> 20), (unsigned long long)(lo.Budget >> 20),
++                             (unsigned long long)(nl.CurrentUsage >> 20), (unsigned long long)(nl.Budget >> 20));
++            }
++            fprintf(stderr, "[RSXMEM] t=%llus frame=%u ws=%lluMB pagefile=%lluMB pipelines=%d removed=0x%08lX%s\n",
+                     (unsigned long long)(tnow / 1000), s_d3d.frame_count, (unsigned long long)(pmc.WorkingSetSize >> 20),
+                     (unsigned long long)(pmc.PagefileUsage >> 20), s_d3d.vp_fp_n,
+-                    (long)s_d3d.device->lpVtbl->GetDeviceRemovedReason(s_d3d.device)); } }
++                    (long)s_d3d.device->lpVtbl->GetDeviceRemovedReason(s_d3d.device), vb); } }
+         if (tnow - s_tt0 >= 1000) s_tpres = 0;
+         if (tnow - s_tt0 >= 1000 && s_d3d.hwnd) {
+             extern char g_rsx_title_base[128];
+@@ -13072,6 +13092,7 @@ void rsx_d3d12_backend_shutdown(void)
+     if (s_d3d.rtv_heap) s_d3d.rtv_heap->lpVtbl->Release(s_d3d.rtv_heap);
+     if (s_d3d.swap_chain) s_d3d.swap_chain->lpVtbl->Release(s_d3d.swap_chain);
+     if (s_d3d.cmd_queue) s_d3d.cmd_queue->lpVtbl->Release(s_d3d.cmd_queue);
++    if (s_vram_ad) { s_vram_ad->lpVtbl->Release(s_vram_ad); s_vram_ad = NULL; }   /* 7930 */
+     if (s_d3d.device) s_d3d.device->lpVtbl->Release(s_d3d.device);
+ 
+     if (s_d3d.hwnd) {   /* 7929: only the owner thread can destroy it */
