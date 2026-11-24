@@ -24,7 +24,8 @@ What goes in (text only: .log .txt .ini .cmd), every file and file name through 
   logs\\*.log, build\\**\\*.log (step logs), game\\run\\*.txt (play_stderr.prev.txt is the launch before the last one), the *.log, *.txt, *.ini and *.cmd files of the install folder
   (play_settings.txt, jsp-install.ini, build-again.cmd, paths.txt, VERSION.txt, tree.txt when present), the settings file in
   %APPDATA%\\JSP Fan Revival, and the newest two Inno Setup logs in %TEMP% that mention this app. Plus facts.txt.
-facts.txt: version, Windows, CPU count and model, AVX2, RAM, free space, the game exe, step markers, the GPU (from the game's log) and
+facts.txt: version, Windows, CPU count and model, AVX2, RAM, free space, the game exe, step markers, the GPU (from the last launch's log; a note when
+the game window's display is driven by another adapter, as on a hybrid laptop) and
 each display adapter's driver version (read from the registry, never changed), and each display (monitor name, size, refresh rate, which one
 the game window is on when the game is running; no serial numbers), and a Netcode section: the mode the settings files choose, decided as the
 game decides it (Off, Delay over re-psn, Rollback direct or over re-psn with host / join and the relay choice, or the refusal and why; server,
@@ -105,6 +106,8 @@ def collect(app, appdata=None, temp=None):
                 ext = p.suffix.lower()
                 if ext in DENIED_KINDS or denied(rel):
                     refused.append((rel, denied(rel) or "game data or save kind"))
+                elif rel.lower() == "facts.txt":                 # an unpacked earlier bundle's: another launch's (or PC's) facts
+                    refused.append((rel, "an earlier bundle's facts.txt; this bundle writes its own"))
                 elif ext not in TEXT_KINDS or (only_log and ext != ".log"):
                     not_text += 1
                 elif p.is_file() and not p.is_symlink():
@@ -402,17 +405,61 @@ def display_lines(mons, game):
     return out
 
 
+GPU_LOG = "game/run/play_stdout.txt"   # the last launch's stdout (the launcher writes it fresh each launch)
+_GPU_EXACT = re.compile(rb"\[D3D12\] (?:adapter|device(?: \([^)\n\r]{0,80}\))?): ([^\n\r]{1,160})")
+_GPU_LOOSE = re.compile(rb"(?i)\b(?:gpu|adapter|graphics (?:card|device)|video card)\b[^\n:=]{0,20}[:=]\s*([^\n\r]{3,120})")
+
+
+def _gpu_order(blobs):
+    """The last launch's stdout first, then the other logs by name; never a facts.txt (an earlier bundle's, left in the install folder,
+    names another launch's or PC's GPU: a test8 laptop bundle said RTX 3060 from one)."""
+    rest = sorted(n for n in blobs if n != GPU_LOG and not n.rsplit("/", 1)[-1].lower().startswith("facts"))
+    return ([GPU_LOG] if GPU_LOG in blobs else []) + rest
+
+
+def render_gpu(blobs):
+    """-> (text, name, VRAM MB or None) of the GPU the game drew on: the last Direct3D 12 start-up line of the last launch
+    ("[D3D12] adapter: NAME (VRAM N MB)", or the newer '[D3D12] device (...): "NAME" vendor=.. VRAM N MB', printed to the game's stdout,
+    which the launcher keeps in game/run/play_stdout.txt); else the first other log line that names a GPU or adapter (no name, no VRAM)."""
+    for name in _gpu_order(blobs):
+        found = _GPU_EXACT.findall(blobs[name])
+        if found:
+            t = found[-1].decode("utf-8", "replace").strip()
+            q = re.match(r'"([^"]{1,120})"', t)
+            gname = q.group(1) if q else re.split(r" \(VRAM", t)[0].strip()
+            v = re.search(r"VRAM (\d+) MB", t)
+            return f"{t} (from {name})", gname, int(v.group(1)) if v else None
+    for name in _gpu_order(blobs):
+        m = _GPU_LOOSE.search(blobs[name])
+        if m:
+            return f"{m.group(1).decode('utf-8', 'replace').strip()} (from {name})", "", None
+    return "not found in the logs", "", None
+
+
 def gpu_name(blobs):
-    """The GPU from the toolkit's Direct3D 12 start-up line ("[D3D12] adapter: NAME (VRAM N MB)", printed to the game's stdout,
-    which the launcher keeps in game\\run\\play_stdout.txt); else the first other log line that names a GPU or adapter."""
-    exact = re.compile(rb"\[D3D12\] adapter: ([^\n\r]{1,160})")
-    loose = re.compile(rb"(?i)\b(?:gpu|adapter|graphics (?:card|device)|video card)\b[^\n:=]{0,20}[:=]\s*([^\n\r]{3,120})")
-    for pat in (exact, loose):
-        for name in sorted(blobs):
-            m = pat.search(blobs[name])
-            if m:
-                return f"{m.group(1).decode('utf-8', 'replace').strip()} (from {name})"
-    return "not found in the logs"
+    """The facts.txt GPU text (render_gpu's first part)."""
+    return render_gpu(blobs)[0]
+
+
+def _gpu_key(n):
+    return re.sub(r"[^a-z0-9]+", " ", n.lower().replace("(r)", "").replace("(tm)", "")).strip()
+
+
+def hybrid_line(gpu, mons, game):
+    """A note when the display the game window is on (else the primary display) is driven by another adapter than the one the game
+    drew on: a hybrid laptop (or a monitor cabled to the other chip), where every frame is copied across. [] when they match or are unknown."""
+    if not gpu or not mons:
+        return []
+    gh = game[0] if game else None
+    on = [m for m in mons if gh is not None and m.get("handle") == gh]
+    which = "the game window's display"
+    if not on:
+        on, which = [m for m in mons if m.get("primary")], "the primary display (the game was not running)"
+    ad = on[0].get("adapter", "") if on else ""
+    if not ad or _gpu_key(ad) == _gpu_key(gpu):
+        return []
+    return [f"note: the game drew on {gpu}, but {which} is driven by {ad}: a hybrid laptop (or the monitor is on the other chip), "
+            "so each frame is copied to the display chip"]
 
 
 def present_mode(blobs):
@@ -964,10 +1011,13 @@ def facts(app, blobs, refused, not_text, cuts, names, net=None):
     mk = app / "build" / "markers"
     done = sorted(p.stem for p in mk.glob("*.done")) if mk.is_dir() else []
     L.append("first-run step markers: " + (", ".join(done) if done else "none") + "   (steps: " + ", ".join(firstrun.STEPS) + ")")
-    L.append(f"GPU: {gpu_name(blobs)}")
+    gtext, gname, _vram = render_gpu(blobs)
+    L.append(f"GPU: {gtext}")
     drivers = gpu_drivers()
     L.append("GPU driver: " + ("; ".join(drivers) if drivers else "not found (not Windows, or no display driver key)"))
-    L += display_lines(displays(), game_display(exe_name))
+    mons, game = displays(), game_display(exe_name)
+    L += display_lines(mons, game)
+    L += hybrid_line(gname, mons, game)
     L.append(f"present mode: {present_mode(blobs)}")
     L += cache_lines(app)
     net = net or {}
