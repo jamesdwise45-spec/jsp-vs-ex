@@ -474,11 +474,15 @@ bool drv_classify_now(unsigned long tid, HANDLE h)
 }
 // Registry mode, prepare() (threads running, outside any freeze): classify the LIVE slots that are new since the last pass and rebuild the skip list.
 // A slot read here can change under us (its thread ends): the creation time is read again after every query, and the freeze compares it a last time.
+// MUST NOT run while threads are suspended or the registry's birth gate is raised: GetModuleHandleExA / GetModuleFileNameA take the loader lock, and a
+// thread born during a freeze waits in its TLS attach callback HOLDING it (jsp_thread_registry.h). GateOps::suspend resumes (freeze_end) before it calls
+// prepare() again on a retry; keep that order. If the gate is up anyway, nothing is classified and every thread is frozen (the old way).
 void drv_refresh()
 {
     g_drv_skip.clear();
     g_drv_pass++;
     jtr::Registry& R = jsp_thread_registry();
+    if (R.freezing.load(std::memory_order_seq_cst)) return;   // never expected: see above
     for (int i = 0; i < jtr::kSlots; i++) {
         jsh::Ent& e = g_drv_ent[i];
         if (R.s[i].state.load(std::memory_order_acquire) != jtr::Live) { e = jsh::Ent(); continue; }
@@ -711,7 +715,8 @@ struct Suspended {
                 if (freeze_exempt(buf[i].tid)) continue;   // exempt threads stay running
                 // test11: a GPU driver thread classified by drv_refresh() stays running; the creation time proves the handle still names that thread
                 // (GetThreadTimes: a plain query, no lock, no allocation)
-                if (g_drv_skip.n && g_drv_skip.skip(buf[i].tid, buf[i].h, thread_ctime((HANDLE)buf[i].h))) { g_drv_left.fetch_add(1, std::memory_order_relaxed); continue; }
+                // (tid and handle first: only the few listed driver threads cost a GetThreadTimes inside the freeze)
+                if (g_drv_skip.find(buf[i].tid, buf[i].h) && g_drv_skip.skip(buf[i].tid, buf[i].h, thread_ctime((HANDLE)buf[i].h))) { g_drv_left.fetch_add(1, std::memory_order_relaxed); continue; }
                 th.push_back({buf[i].h, buf[i].tid});   // capacity reserved in prepare()
             }
             ppu_alive_at_listing = ppu_alive_mask();
