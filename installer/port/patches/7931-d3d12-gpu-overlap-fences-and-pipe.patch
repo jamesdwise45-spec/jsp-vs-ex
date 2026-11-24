@@ -17,12 +17,13 @@ What (all only with GPU_OVERLAP=1; off, the code paths are the old ones, plus a 
   scanout buffer is kept per frame index; the copy-rects target goes through the grave.
 - GPU_OVERLAP is no longer on PIPE's debug list. The fence is made at backend init; if it cannot be made, GPU_OVERLAP is off.
 - [OVERLAP] every 600 batches: allocator, upload-half and full waits (count, ms). The HITCH probe counts them as "gpu wait".
+- Shutdown clears the fence state (seq, alloc, par), so a later init cannot wait for a value its new fence never reaches.
 - The grave gets an SRW lock: tintrects_draw graves on the submit thread with PIPE=1 while the FIFO thread adds and sweeps.
 Guest memory: the backend gives nothing back to the RSX command processor (its callbacks return void); the only GPU-to-guest copy is
 RT_READBACK=1 (off by default), which still drains the GPU itself. So the overlap changes timing only, never what the guest reads.
 
 diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
-index 0f69826..f37dd62 100644
+index 0f69826..ea37cc1 100644
 --- a/libs/video/rsx_d3d12_backend.c
 +++ b/libs/video/rsx_d3d12_backend.c
 @@ -577,7 +577,7 @@ static int pipe_on(void)
@@ -304,11 +305,12 @@ index 0f69826..f37dd62 100644
  
      /* Set up backend callbacks */
      s_d3d12_backend.userdata          = &s_d3d;
-@@ -13082,6 +13201,7 @@ void rsx_d3d12_backend_shutdown(void)
+@@ -13082,6 +13201,8 @@ void rsx_d3d12_backend_shutdown(void)
      if (s_d3d.dsv_heap)     s_d3d.dsv_heap->lpVtbl->Release(s_d3d.dsv_heap);
      if (s_d3d.root_signature) s_d3d.root_signature->lpVtbl->Release(s_d3d.root_signature);
      if (s_d3d.fence) s_d3d.fence->lpVtbl->Release(s_d3d.fence);
-+    if (s_ovl.fence) { s_ovl.fence->lpVtbl->Release(s_ovl.fence); s_ovl.fence = NULL; }   /* 7931 */
++    if (s_ovl.fence) s_ovl.fence->lpVtbl->Release(s_ovl.fence);   /* 7931 */
++    memset(&s_ovl, 0, sizeof s_ovl);   /* 7931: a later init starts a new fence at 0, so no old value may be waited for */
      if (s_d3d.fence_event) CloseHandle(s_d3d.fence_event);
      if (s_d3d.cmd_list) s_d3d.cmd_list->lpVtbl->Release(s_d3d.cmd_list);
      if (s_d3d.tex_ring) s_d3d.tex_ring->lpVtbl->Release(s_d3d.tex_ring);

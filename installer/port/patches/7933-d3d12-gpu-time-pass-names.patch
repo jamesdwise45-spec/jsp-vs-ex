@@ -5,13 +5,13 @@ those batches (near 100 %: GPU-bound; low: the GPU waits for the CPU), then the 
 depth:<offset> WxH (depth-only), display WxH, start(uploads,copies) (texture uploads and copies before the first target switch),
 post(composite,AA,HUD,present), vram-copy (VPULL_VRAM, patch 7934), each with ms per batch, how many times it ran and its draws.
 The last query slot is kept for the end mark, so a batch with more than 1023 target switches still measures its whole span
-("marks dropped" says so). Off (GPU_TIME unset): nothing is recorded, as before.
+("marks dropped" says so; the last recorded pass keeps counting the draws after it). Off (GPU_TIME unset): nothing is recorded, as before.
 
 diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
-index 05376f2..1f2e9c1 100644
+index 3c72543..ed3b644 100644
 --- a/libs/video/rsx_d3d12_backend.c
 +++ b/libs/video/rsx_d3d12_backend.c
-@@ -8411,6 +8411,8 @@ float (*g_rsx_ui_scale)(u32 rt_off, const float box[4], float* ax, float* ay) =
+@@ -8419,6 +8419,8 @@ float (*g_rsx_ui_scale)(u32 rt_off, const float box[4], float* ax, float* ay) =
  int (*g_rsx_aa_mode)(u32 rt_off) = 0;
  int (*g_rsx_cutout)(float* out) = 0;
  
@@ -20,7 +20,7 @@ index 05376f2..1f2e9c1 100644
  /* Patch 2906 (diagnostic, experiment line): GPU_TIME=1 puts a timestamp query at the start of each frame's command
   * list, at every render-target switch of the replay (key: the colour target's guest offset, or the depth surface's
   * offset | 1 for a depth-only pass, 2 for the display), before the after-replay work (key 0xE: composite, edge
-@@ -8427,26 +8429,61 @@ static int gput_on(void)
+@@ -8435,26 +8437,61 @@ static int gput_on(void)
  static ID3D12QueryHeap* s_gput_heap = NULL;
  static ID3D12Resource* s_gput_rb[FRAME_COUNT];
  static u32 s_gput_n[FRAME_COUNT], s_gput_key[FRAME_COUNT][GPUT_MAX];
@@ -44,7 +44,7 @@ index 05376f2..1f2e9c1 100644
  {
      if (!gput_on() || !s_gput_heap) return;
      const u32 fi = s_gput_cur_fi, i = s_gput_n[fi];
-+    if (i > 0) s_gput_draws[fi][i - 1] = s_gput_dctr - s_gput_dctr_at;
++    if (i > 0) s_gput_draws[fi][i - 1] += s_gput_dctr - s_gput_dctr_at;   /* +=: after dropped marks the last pass keeps adding */
 +    s_gput_dctr_at = s_gput_dctr;
 +    /* 7933: the last slot is kept for the end mark, so a batch with very many switches still measures its whole span
 +     * (the extra switches' time then goes to the last recorded pass; counted as "marks dropped"). */
@@ -89,7 +89,7 @@ index 05376f2..1f2e9c1 100644
  }
  
  /* After the frame index's allocator reset: read its last frame, then start this one. */
-@@ -8475,26 +8512,40 @@ static void gput_begin(u32 fi)
+@@ -8483,26 +8520,40 @@ static void gput_begin(u32 fi)
          void* p = NULL; D3D12_RANGE r = {0, (SIZE_T)n * 8};
          if (SUCCEEDED(s_gput_rb[fi]->lpVtbl->Map(s_gput_rb[fi], 0, &r, &p)) && p) {
              const u64* t = (const u64*)p;
@@ -136,7 +136,7 @@ index 05376f2..1f2e9c1 100644
      gput_mark(0xF0000000u);   /* frame start: uploads and work before the first switch */
  }
  
-@@ -9516,7 +9567,8 @@ static void render_frame_submit(const RfFrame* f)
+@@ -9526,7 +9577,8 @@ static void render_frame_submit(const RfFrame* f)
                      cur_sc = bsc;
                      D3D12_RECT sc = {0, 0, (LONG)vp.Width, (LONG)vp.Height};
                      vp_last_w = vp.Width; vp_last_h = vp.Height;
@@ -146,7 +146,7 @@ index 05376f2..1f2e9c1 100644
                      s_d3d.cmd_list->lpVtbl->OMSetRenderTargets(s_d3d.cmd_list, dr->no_color ? 0 : nrt,
                                                                 dr->no_color ? NULL : rh, FALSE, &cur_dsv);
                      s_d3d.cmd_list->lpVtbl->RSSetViewports(s_d3d.cmd_list, 1, &vp);
-@@ -9783,13 +9835,16 @@ static void render_frame_submit(const RfFrame* f)
+@@ -9793,13 +9845,16 @@ static void render_frame_submit(const RfFrame* f)
                                  VPULL_RP_TAB, vpull_tab_va + (u64)dr->cb_slot * RSX_VPULL_TAB_BYTES);
                              s_d3d.cmd_list->lpVtbl->DrawIndexedInstanced(s_d3d.cmd_list,
                                  dr->index_count, 1, dr->ib_first, 0, 0);
