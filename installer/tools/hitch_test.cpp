@@ -154,6 +154,18 @@ int main()
         CHECK(has(s, "[perf] hitch causes: audio-lock 65 | 60 lines written, 5 not (cap 60)"));
         CHECK(has(jph::summary(jph::Match()), "hitch causes: none | 0 lines written, 0 not"));
     }
+    // the pipelines part (toolkit 2922): counted from the match's first measured frame; absent while no counter is wired (the test default)
+    {
+        static long warm = 5, cold = 2; static double ms = 30.0;
+        CHECK(!has(jph::summary(jph::Match()), "pipelines"));
+        jph::g_pipeline_counts = [](long* w, long* c, double* t) { *w = warm; *c = cold; *t = ms; };
+        jph::Match m; ordinary(m.gap); jph::close_gap(m, 33.0, 1, jph::Clock());
+        warm += 7; cold += 3; ms += 120.0;
+        const std::string s = jph::summary(m);
+        CHECK(has(s, " | pipelines: 7 warm, 3 cold (120 ms building)\n"));
+        CHECK(has(s, "hitch causes: none | 0 lines written, 0 not (cap 60) | pipelines"));
+        jph::g_pipeline_counts = nullptr;
+    }
     // a boundary whose stages exceed its total (timer granularity) adds no negative "other"
     {
         jph::Gap g; jph::add_boundary(g, 5.0, 0.0, 0.0, 0, 0.0, 0.0, 3.0, 3.0, 10.0);
