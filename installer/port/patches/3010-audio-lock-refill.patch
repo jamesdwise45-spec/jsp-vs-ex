@@ -1,0 +1,482 @@
+Patch 3010: the tick-locked audio's output pays lost game time back faster: absolute feedback gain, a debt of concealed time with a boosted refill, a quick slow-pace entry, and one log line per gap (AUDIO_LOCK_REFILL=0 turns it off).
+
+Symptom (test10 friends' bundles, test11 FORENSICS.md): the sound is short by the game time the match loses (wall time - ticks / 30; a late tick is
+never caught up), and 59-77 % of that came out as concealed gaps in every fight, whatever the cushion (50, 90 or 180 ms). There is no bug in the
+trigger (concealment starts only under AUDIO_LOCK_LOW_MS, 12 ms; a positive rate is the slower playback that refills); the output repaid too little.
+Replaying the per-second fps of rooms 69 and 71 ([RSXFPS]) through the real output in virtual time gives 78 / 146 gaps (4.2 / 7.9 s concealed;
+the fights logged 99 / 190 and 4.3 / 6.9 s); with this patch 61 / 115 (3.2 / 5.4 s).
+
+Output only (blocks mixed, read index and notify events are exactly as in 3005; muted re-run blocks are never submitted):
+- the feedback's gain is absolute: 1 % per 10 ms off the cushion (was the error divided by the cushion, so a deeper cushion corrected less), capped
+  as before at AUDIO_LOCK_DRC/256 both ways;
+- the level it reads follows a fall at once (the 0.9 / 0.1 EMA only for a rise), so a stall is answered at the next burst;
+- concealed time is owed (at most 500 ms); while anything is owed the refill cap is AUDIO_LOCK_DRC_BOOST/256 (default 16 = 6.25 %; the feedback and
+  feed-forward total stays capped at 8 %), and the frames the resampler makes over each block's own pay it down;
+- the slow pace (3009) also enters on a short run of slow ticks: two 333 ms buckets in a row under 90 % arrival, neither holding one tick of
+  150 ms or more (a single hitch, even 300 ms, never enters). Engaged this way it follows the arrival rate of the last ~1 s and goes down at up to
+  0.5 per second, until 3009's own 1 s buckets take over; the way back is 3009's;
+- one "[audio-lock] gap N: tick T, X ms after the last burst began, level before that burst L ms, Y ms concealed, owed D ms" line per gap (the first
+  40 of a lock, then every 10th);
+- the "[audio-lock]" line keeps every field and their order and appends: "refill: debt max D ms, P ms paid back, quick slow pace N times, boost
+  B %, on|off";
+- not done here: a pitch-preserving time stretch (WSOLA) for the refill and the slow pace; the playback still changes pitch with its rate;
+- tests: libs/audio/tests/test_audio_lock_race.c part 6, virtual time, 300 ms fake device: steady 30 ticks/s conceals nothing after the start;
+  29 fps with a 50-100 ms tick every ~2 s: 21 gaps after 15 s against 76 (3009); runs of 5 / 15 slow ticks: fewer gaps (runs of 80-100 ms ticks
+  still mostly conceal: a run loses ~50 ms a tick); single 76 ms and 150-300 ms hitches never engage the slow pace; 20 ticks/s is gap-free once
+  settled. Parts 1-4 run with it on (part 4: the feedback still settles at the cushion, not pinned); part 5 runs with it off, so its numbers are
+  3009's. audio_lock_measure.c adds a "bundle hitches ~2 s" scenario (50-100 ms every 1-3 s) with the owed time per hitch.
+
+diff --git a/libs/audio/cellAudio.c b/libs/audio/cellAudio.c
+index 3eebc27..74263d8 100644
+--- a/libs/audio/cellAudio.c
++++ b/libs/audio/cellAudio.c
+@@ -922,6 +922,40 @@ static double s_lk_sb_r[LK_SLOW_WIN];                      /* the last complete
+ static lk_slow_mark s_lk_sb[LK_SLOW_WIN];                  /* the start of the bucket being filled [0] and of the ones before it */
+ static lk_slow_mark s_lk_sr[LK_SLOW_RING];                 /* the last bursts */
+ static double s_lk_sr_ffb, s_lk_sr_last_ff; static unsigned long long s_lk_sr_last_b;   /* the running sum, and the last burst's feed-forward and start */
++/* J-Stars patch 3010 (AUDIO_LOCK_REFILL=0 turns it off: 3009 as it was): the output pays the lost game time back faster. Over a fight the sound is
++ * short by the game time the match loses (wall time - ticks / 30: a late tick is never caught up), and in the test10 friends' fights 59-77 % of it
++ * came out as concealed gaps, whatever the cushion (50, 90 or 180 ms; test11 FORENSICS.md). The trigger is right (concealment starts only under
++ * AUDIO_LOCK_LOW_MS); the output repaid too little:
++ *  - the feedback's gain was divided by the cushion (a 60 ms shortfall got 2.1 % at cushion 90, 1.0 % at 180). It is now absolute: LK_FB_PCT_PER_10MS
++ *    per 10 ms under (or over) the cushion, capped as before at AUDIO_LOCK_DRC/256 on both sides;
++ *  - the level it reads fell slowly (an EMA of 0.9 / 0.1 per burst), so after a stall it saw a modest dip. It now follows a fall at once and a rise
++ *    as before;
++ *  - concealed time is a debt: the frames a gap concealed are owed, and while anything is owed the cap to refill is AUDIO_LOCK_DRC_BOOST/256
++ *    (default 16 = 6.25 %, the feedback and feed-forward total still capped at LK_SKEW_MAX); the extra frames the resampler makes pay it down;
++ *  - the slow pace (3009) also enters on a short run of slow ticks: two LK_Q_BUCKET_MS buckets in a row under LK_Q_ENTER, neither holding a
++ *    single tick longer than LK_Q_HITCH_MS (one hitch, even a long one, stays the cushion's and the concealment's). Engaged this way, it follows the
++ *    arrival rate of the last LK_Q_WIN buckets (about 1 s) until the 1 s buckets of 3009 take over, and goes down at LK_SLOW_DOWN_Q per second.
++ *    The runs of 5-19 slow ticks (0.3-3 s) that made most of room 71's gaps fall between the cushion and 3009's 3 s entry.
++ * One "[audio-lock] gap" line per concealed gap (at most LK_GAP_LOG per lock, then every LK_GAP_LOG_EVERY-th): the tick (blocks / 6.25 since the lock
++ * began), the ms since the last burst began, the level before that burst and the gap's length.
++ * Output only, like 3007-3009: the blocks mixed, the read index and the notify events are untouched. */
++#define LK_FB_PCT_PER_10MS 1.0            /* the feedback's gain: % of rate per 10 ms off the cushion */
++#define LK_DEBT_MAX_MS     500.0          /* the debt never holds more than this */
++#define LK_Q_BUCKET_MS     333.0
++#define LK_Q_WIN           3              /* quick buckets the engaged rate follows (~1 s) */
++#define LK_Q_ENTER         0.90
++#define LK_Q_HITCH_MS      150.0          /* a bucket with a single tick this long is a hitch, not a pace */
++#define LK_SLOW_DOWN_Q     0.5            /* rate per second, down, once the quick path engaged */
++#define LK_GAP_LOG         40
++#define LK_GAP_LOG_EVERY   10
++static int    s_lk_refill = 1, s_lk_drc_boost = 16;
++static double s_lk_debt = 0.0, s_lk_debt_max = 0.0;          /* frames owed (concealed, not yet paid back by the resampler) */
++static unsigned long long s_lk_paid;                          /* frames paid back */
++static int    s_lk_q_n = 0, s_lk_q_eng = 0; static unsigned long long s_lk_q_entries;
++static double s_lk_q_r[LK_Q_WIN], s_lk_q_long[LK_Q_WIN];      /* the last complete quick buckets' rates and longest ticks (ms), newest first */
++static double s_lk_q_longest = 0.0, s_lk_burst_t = -1.0, s_lk_burst_lvl = 0.0;
++static double s_lk_gap_t = -1.0, s_lk_gap_since = 0.0, s_lk_gap_lvl = 0.0;   /* the gap being concealed: when, ms since the burst, level before it */
++static lk_slow_mark s_lk_q[LK_Q_WIN + 1];                    /* patch 3010: the start of the quick bucket being filled [0] and of the ones before it */
+ static double lk_now_ms(void)
+ {
+     static LARGE_INTEGER f; LARGE_INTEGER t;
+@@ -956,14 +990,30 @@ static void lk_slow_burst(double ff, int level, int cushion)
+         s_lk_sb_r[0] = lk_rate_between(&s_lk_sb[0], &cur); s_lk_sb[0] = cur;
+         if (s_lk_sb_n < LK_SLOW_WIN) s_lk_sb_n++;
+     }
++    if (s_lk_refill) {   /* patch 3010: the quick buckets, and the longest tick in each (the time since the last burst) */
++        if (s_lk_sr_w == 2) { s_lk_q[0] = s_lk_sr[0]; s_lk_q_longest = 0.0; }
++        const double tick_ms = now - s_lk_sr[(s_lk_sr_w - 2) % LK_SLOW_RING].t;
++        if (tick_ms > s_lk_q_longest) s_lk_q_longest = tick_ms;
++        if (now - s_lk_q[0].t >= LK_Q_BUCKET_MS) {
++            for (int i = LK_Q_WIN; i > 0; i--) s_lk_q[i] = s_lk_q[i - 1];
++            for (int i = LK_Q_WIN - 1; i > 0; i--) { s_lk_q_r[i] = s_lk_q_r[i - 1]; s_lk_q_long[i] = s_lk_q_long[i - 1]; }
++            s_lk_q_r[0] = lk_rate_between(&s_lk_q[1], &cur); s_lk_q_long[0] = s_lk_q_longest; s_lk_q[0] = cur; s_lk_q_longest = 0.0;
++            if (s_lk_q_n < LK_Q_WIN) s_lk_q_n++;
++        }
++    }
+     if (!s_lk_slow_min) return;
++    if (s_lk_refill && !s_lk_slow_eng && s_lk_q_n >= 2 && s_lk_q_r[0] < LK_Q_ENTER && s_lk_q_r[1] < LK_Q_ENTER
++        && s_lk_q_long[0] < LK_Q_HITCH_MS && s_lk_q_long[1] < LK_Q_HITCH_MS) {   /* patch 3010: a short run of slow ticks */
++        s_lk_slow_eng = 1; s_lk_q_eng = 1; s_lk_slow_entries++; s_lk_q_entries++;
++    }
+     if (!s_lk_slow_eng && s_lk_sb_n >= LK_SLOW_NB) {
+         double hi = 0.0; for (int i = 0; i < LK_SLOW_NB; i++) if (s_lk_sb_r[i] > hi) hi = s_lk_sb_r[i];
+         if (hi < LK_SLOW_ENTER) { s_lk_slow_eng = 1; s_lk_slow_entries++; }
+     }
++    if (s_lk_q_eng && s_lk_sb_n >= LK_SLOW_NB) s_lk_q_eng = 0;   /* patch 3010: 3009's own window from here */
+     double target = 1.0;
+     if (s_lk_slow_eng) {
+-        target = lk_rate_between(&s_lk_sb[s_lk_sb_n - 1], &cur);
++        target = s_lk_q_eng ? lk_rate_between(&s_lk_q[s_lk_q_n], &cur) : lk_rate_between(&s_lk_sb[s_lk_sb_n - 1], &cur);   /* patch 3010: quick window */
+         if (s_lk_sr_w > LK_SLOW_QUICK) {
+             const double quick = lk_rate_between(&s_lk_sr[(s_lk_sr_w - 1 - LK_SLOW_QUICK) % LK_SLOW_RING], &cur);
+             if (quick >= LK_SLOW_EXIT) target = 1.0;   /* the pace is back */
+@@ -971,9 +1021,12 @@ static void lk_slow_burst(double ff, int level, int cushion)
+         if (target >= LK_SLOW_EXIT) target = 1.0;
+         const double lo = s_lk_slow_min / 100.0; if (target < lo) target = lo;
+     }
+-    if (target < s_lk_slow && level <= cushion) { s_lk_slow -= LK_SLOW_DOWN * dt; if (s_lk_slow < target) s_lk_slow = target; }
++    const double down = s_lk_q_eng ? LK_SLOW_DOWN_Q : LK_SLOW_DOWN;   /* patch 3010 */
++    if (target < s_lk_slow && level <= cushion) { s_lk_slow -= down * dt; if (s_lk_slow < target) s_lk_slow = target; }
+     else if (target > s_lk_slow) { s_lk_slow += LK_SLOW_UP * dt; if (s_lk_slow > target) s_lk_slow = target; }
+-    if (s_lk_slow_eng && target >= 1.0 && s_lk_slow >= 1.0 && level <= cushion + cushion / 4) { s_lk_slow_eng = 0; s_lk_sb_n = 0; s_lk_sb[0] = cur; }
++    if (s_lk_slow_eng && target >= 1.0 && s_lk_slow >= 1.0 && level <= cushion + cushion / 4) {
++        s_lk_slow_eng = 0; s_lk_sb_n = 0; s_lk_sb[0] = cur; s_lk_q_eng = 0; s_lk_q_n = 0; s_lk_q[0] = cur; s_lk_q_longest = 0.0;
++    }
+     double out = s_lk_slow;
+     /* the level trim, while engaged only. It aims at LK_SLOW_AIM x the cushion while the 3007 feedback (fb, capped at AUDIO_LOCK_DRC/256) still aims
+      * at the cushion itself: in slow mode the trough settles between the two (about 75 ms of a 90 ms cushion), the trim being much the stronger.
+@@ -985,7 +1038,7 @@ static void lk_slow_burst(double ff, int level, int cushion)
+         if (out > 1.0 + LK_SLOW_LVL) out = 1.0 + LK_SLOW_LVL;
+     }
+     /* what the resampler plays: no faster a change than the ramps (the trim does not jump in at engaging) */
+-    if (out < s_lk_slow_out - LK_SLOW_DOWN * dt) out = s_lk_slow_out - LK_SLOW_DOWN * dt;
++    if (out < s_lk_slow_out - down * dt) out = s_lk_slow_out - down * dt;
+     if (out > s_lk_slow_out + LK_SLOW_UP * dt) out = s_lk_slow_out + LK_SLOW_UP * dt;
+     s_lk_slow_out = out; s_lk_slow_from = s_lk_slow_play; s_lk_slow_i = 0;
+     if (s_lk_slow_out < s_lk_slow_lo) s_lk_slow_lo = s_lk_slow_out;
+@@ -1024,6 +1077,8 @@ static void lk_begin(void)
+         s_lk_ff = lk_env(getenv("AUDIO_LOCK_FF"), 1) != 0;   /* patch 3008 */
+         s_lk_slow_min = lk_env(getenv("AUDIO_LOCK_SLOW_MIN"), 60);   /* patch 3009: 0 or 100 = off; never under LK_SLOW_FLOOR_PCT */
+         if (s_lk_slow_min <= 0 || s_lk_slow_min >= 100) s_lk_slow_min = 0; else if (s_lk_slow_min < LK_SLOW_FLOOR_PCT) s_lk_slow_min = LK_SLOW_FLOOR_PCT;
++        s_lk_refill = lk_env(getenv("AUDIO_LOCK_REFILL"), 1) != 0;   /* patch 3010 */
++        s_lk_drc_boost = lk_env(getenv("AUDIO_LOCK_DRC_BOOST"), 16); if (s_lk_drc_boost < 0) s_lk_drc_boost = 0; if (s_lk_drc_boost > 20) s_lk_drc_boost = 20;
+     }
+     s_lk_active = 1; s_lk_burst = 1; s_lk_have_last = 0; s_lk_pos = 0.0; s_lk_ema = -1.0; s_lk_skew = 0.0; s_lk_ring_w = 0; s_lk_conc = 0;
+     s_lk_blocks = s_lk_dry = s_lk_conceals = s_lk_conc_frames = s_lk_long_gaps = s_lk_drops = s_lk_squeezed = s_lk_bursts = 0;
+@@ -1031,6 +1086,8 @@ static void lk_begin(void)
+     s_lk_ff_bursts = 0; s_lk_ff_sum = 0; s_lk_ff_max = 0; s_lk_tot_min = s_lk_tot_max = 0;   /* patch 3008 */
+     s_lk_slow = s_lk_slow_out = s_lk_slow_lo = s_lk_slow_play = s_lk_slow_from = 1.0; s_lk_slow_i = 0; s_lk_slow_eng = 0; s_lk_slow_ms = 0.0; s_lk_slow_t = -1.0; s_lk_slow_entries = 0;   /* patch 3009 */
+     s_lk_sb_n = 0; s_lk_sr_w = 0; s_lk_sr_ffb = s_lk_sr_last_ff = 0.0; s_lk_sr_last_b = 0;
++    s_lk_debt = s_lk_debt_max = 0.0; s_lk_paid = 0; s_lk_q_n = 0; s_lk_q_eng = 0; s_lk_q_entries = 0; s_lk_q_longest = 0.0;   /* patch 3010 */
++    s_lk_burst_t = s_lk_gap_t = -1.0; s_lk_burst_lvl = s_lk_gap_since = s_lk_gap_lvl = 0.0;
+ }
+ static int lk_cushion_frames(void)
+ {
+@@ -1045,7 +1102,8 @@ static void lk_report(const char* why)
+     fprintf(stderr, "[audio-lock] %s: %llu blocks, %llu device underruns, %llu concealed gaps (%.0f ms, %llu longer than %d ms), %llu blocks squeezed, %llu dropped, "
+                     "rate %+.2f..%+.2f %%, level before a burst min %.1f ms mean %.1f ms, cushion %.1f ms, device buffer %.1f ms, smoothing %s, "
+                     "stretch fed forward: %llu bursts, mean %.0f us, max %d us, total rate %+.2f..%+.2f %%, feed-forward %s, "
+-                    "slow pace: %llu times, %.1f s, rate min %.3f, floor %d %%, %s\n",
++                    "slow pace: %llu times, %.1f s, rate min %.3f, floor %d %%, %s, "
++                    "refill: debt max %.0f ms, %.0f ms paid back, quick slow pace %llu times, boost %.2f %%, %s\n",
+             why, s_lk_blocks, s_lk_dry, s_lk_conceals, s_lk_conc_frames / fpms, s_lk_long_gaps, s_lk_conceal_ms, s_lk_squeezed, s_lk_drops,
+             s_lk_skew_min * 100.0, s_lk_skew_max * 100.0, s_lk_trough_min < 0 ? 0.0 : s_lk_trough_min / fpms, s_lk_bursts ? s_lk_trough_sum / s_lk_bursts / fpms : 0.0,
+             lk_cushion_frames() / fpms, lk_cap_frames() / fpms, s_lk_smooth ? "on" : "off (AUDIO_LOCK_SMOOTH=0)",
+@@ -1055,7 +1113,10 @@ static void lk_report(const char* why)
+             !s_lk_smooth ? "off (smoothing off)" : s_lk_ff ? "on" : "off (AUDIO_LOCK_FF=0)",
+             /* patch 3009, appended: how often and how long the playback followed a slow pace down, and how low it went (1.000 = never) */
+             s_lk_slow_entries, s_lk_slow_ms / 1000.0, s_lk_slow_lo, s_lk_slow_min,
+-            !s_lk_smooth ? "off (smoothing off)" : s_lk_slow_min ? "on" : "off (AUDIO_LOCK_SLOW_MIN=0)");
++            !s_lk_smooth ? "off (smoothing off)" : s_lk_slow_min ? "on" : "off (AUDIO_LOCK_SLOW_MIN=0)",
++            /* patch 3010, appended: the most concealed time owed at once, what the resampler paid back, the slow pace's quick entries, the cap while owing */
++            s_lk_debt_max / fpms, s_lk_paid / fpms, s_lk_q_entries, s_lk_drc_boost * 100.0 / LK_N,
++            !s_lk_smooth ? "off (smoothing off)" : s_lk_refill ? "on" : "off (AUDIO_LOCK_REFILL=0)");
+ }
+ static void lk_end(void) { if (!s_lk_active) return; s_lk_active = 0; lk_report("lock ended"); }
+ static void lk_send(const float* f, u32 n)   /* to the device, and into the history */
+@@ -1085,6 +1146,9 @@ static void lk_conc_frame(float* o)
+ }
+ static void lk_conc_start(void)
+ {
++    if (s_lk_refill) {   /* patch 3010: for the gap line */
++        s_lk_gap_t = lk_now_ms(); s_lk_gap_since = s_lk_burst_t < 0 ? -1.0 : s_lk_gap_t - s_lk_burst_t; s_lk_gap_lvl = s_lk_burst_lvl;
++    }
+     for (int i = 0; i < LK_H; i++) { const u32 r = (u32)((s_lk_ring_w - LK_H + i) % LK_H); s_lk_seg[i * 2] = s_lk_ring[r * 2]; s_lk_seg[i * 2 + 1] = s_lk_ring[r * 2 + 1]; }
+     s_lk_conc = 1; s_lk_conc_first = 1; s_lk_conc_p = 0; s_lk_conc_t = 0; s_lk_conceals++;
+ }
+@@ -1093,6 +1157,14 @@ static void lk_conc_stop(void)
+     s_lk_conc_frames += (unsigned long long)s_lk_conc_t;
+     if (s_lk_conc_t > (long)s_lk_conceal_ms * (CELL_AUDIO_SAMPLE_RATE / 1000)) s_lk_long_gaps++;
+     s_lk_conc = 0;
++    if (s_lk_refill) {   /* patch 3010: owed, and one line */
++        const double fpms = CELL_AUDIO_SAMPLE_RATE / 1000.0;
++        s_lk_debt += (double)s_lk_conc_t; if (s_lk_debt > LK_DEBT_MAX_MS * fpms) s_lk_debt = LK_DEBT_MAX_MS * fpms;
++        if (s_lk_debt > s_lk_debt_max) s_lk_debt_max = s_lk_debt;
++        if (s_lk_conceals <= LK_GAP_LOG || s_lk_conceals % LK_GAP_LOG_EVERY == 0)
++            fprintf(stderr, "[audio-lock] gap %llu: tick %.0f, %.0f ms after the last burst began, level before that burst %.1f ms, %.1f ms concealed, owed %.0f ms\n",
++                    s_lk_conceals, (double)s_lk_blocks * 4.0 / 25.0, s_lk_gap_since, s_lk_gap_lvl, s_lk_conc_t / fpms, s_lk_debt / fpms);
++    }
+ }
+ /* Idle between ticks (every ~2 ms): keep the device over the low-water mark with concealment while no real block comes. */
+ static void lk_idle_tail(void)
+@@ -1124,9 +1196,15 @@ static void lk_submit_block(void)
+     if (s_lk_burst) {   /* the first block after an idle wait: the level now is the low point before this tick's burst */
+         s_lk_burst = 0; s_lk_bursts++; s_lk_trough_sum += level; if (s_lk_trough_min < 0 || level < s_lk_trough_min) s_lk_trough_min = level;
+         if (level == 0 && s_lk_have_last && !s_lk_conc) s_lk_dry++;
+-        s_lk_ema = s_lk_ema < 0 ? level : s_lk_ema * 0.9 + level * 0.1;
++        if (s_lk_refill) { s_lk_burst_t = lk_now_ms(); s_lk_burst_lvl = level / (CELL_AUDIO_SAMPLE_RATE / 1000.0); }   /* patch 3010: for the gap line */
++        s_lk_ema = s_lk_ema < 0 ? level : s_lk_refill && level < s_lk_ema ? level : s_lk_ema * 0.9 + level * 0.1;   /* patch 3010: a fall at once */
+         double fb = 0.0;
+-        if (s_lk_smooth && s_lk_drc > 0 && cushion > 0) {
++        if (s_lk_smooth && s_lk_drc > 0 && cushion > 0 && s_lk_refill) {   /* patch 3010: absolute gain; while owing, the boosted cap to refill */
++            const double hi = (s_lk_debt > 0.0 && s_lk_drc_boost > s_lk_drc ? s_lk_drc_boost : s_lk_drc) / (double)LK_N, lo = -s_lk_drc / (double)LK_N;
++            fb = (cushion - s_lk_ema) / (CELL_AUDIO_SAMPLE_RATE / 100.0) * (LK_FB_PCT_PER_10MS / 100.0);
++            if (fb > hi) fb = hi; if (fb < lo) fb = lo;
++            if (fb < s_lk_skew_min) s_lk_skew_min = fb; if (fb > s_lk_skew_max) s_lk_skew_max = fb;
++        } else if (s_lk_smooth && s_lk_drc > 0 && cushion > 0) {
+             double e = (cushion - s_lk_ema) / cushion; if (e > 1) e = 1; if (e < -1) e = -1;
+             fb = e * s_lk_drc / (double)LK_N;
+             if (fb < s_lk_skew_min) s_lk_skew_min = fb; if (fb > s_lk_skew_max) s_lk_skew_max = fb;
+@@ -1161,6 +1239,9 @@ static void lk_submit_block(void)
+         m++; s_lk_pos += step;
+     }
+     s_lk_pos -= LK_N; s_lk_prev[0] = s_mix_buffer[(LK_N - 1) * 2]; s_lk_prev[1] = s_mix_buffer[(LK_N - 1) * 2 + 1];
++    if (s_lk_refill && s_lk_debt > 0.0 && m > LK_N) {   /* patch 3010: the frames over the block's own pay the debt */
++        const double x = (double)(m - LK_N) < s_lk_debt ? (double)(m - LK_N) : s_lk_debt; s_lk_debt -= x; s_lk_paid += (unsigned long long)x;
++    }
+     if (s_lk_conc) {   /* back from concealment: crossfade the loop out and the real block in */
+         for (u32 i = 0; i < LK_F && i < m; i++) { float f[2]; lk_conc_frame(f); const float w = (float)(i + 1) / LK_F;
+             s_lk_out[i * 2] = s_lk_out[i * 2] * w + f[0] * (1.0f - w); s_lk_out[i * 2 + 1] = s_lk_out[i * 2 + 1] * w + f[1] * (1.0f - w); }
+diff --git a/libs/audio/tests/audio_lock_measure.c b/libs/audio/tests/audio_lock_measure.c
+index d1caa9c..3c198f3 100644
+--- a/libs/audio/tests/audio_lock_measure.c
++++ b/libs/audio/tests/audio_lock_measure.c
+@@ -10,6 +10,8 @@
+  * feed-forward, for the A/B.
+  * Patch 3009: slow-pace scenarios (20 ticks/s even and uneven, 20 then 30 ticks/s) with a line every 2 s (rate, level, concealed gaps so far) and the
+  * concealed gaps from 15 s on (settled); AUDIO_LOCK_SLOW_MIN=0 runs them without the slow pace, for the A/B.
++ * Patch 3010: a "bundle hitches" scenario (50-100 ms every 1-3 s, as the friends' test10 fight logged them); each hitch line also gives the
++ * concealed time still owed, and the run ends with the gaps after the first 30 s; AUDIO_LOCK_REFILL=0 runs it as 3009, for the A/B.
+  *   x86_64-w64-mingw32-clang -std=gnu11 -O2 -Wall -Wextra -I include libs/audio/tests/audio_lock_measure.c -lole32 -lwinmm -o audio_lock_measure.exe
+  *   audio_lock_measure.exe [seconds per scenario, default 10] [scenario names, comma-separated prefixes]     (the AUDIO_LOCK_* and PS3_AUDIO_BUF_MS settings apply as in the game) */
+ #include "../cellAudio.c"
+@@ -39,7 +41,8 @@ static unsigned s_rng = 1;
+ static double rnd(void) { s_rng = s_rng * 1103515245u + 12345u; return ((s_rng >> 8) & 0xFFFF) / 65536.0; }
+ static int cmp_d(const void* a, const void* b) { const double x = *(const double*)a, y = *(const double*)b; return x < y ? -1 : x > y; }
+ 
+-/* stall_ms < 0: game hitches as test6 matches logged them ("[perf] hitches > 50 ms", p50 76 ms, max about 300): one about every stall_every_s
++/* patch 3010: stall_ms == -2: hitches of 50-100 ms (uniform) about every stall_every_s (+-1 s), as the friends' test10 fight logged them.
++ * stall_ms == -1: game hitches as test6 matches logged them ("[perf] hitches > 50 ms", p50 76 ms, max about 300): one about every stall_every_s
+  * (+-1 s), 76 ms, every third one 150-300 ms. min_s: the scenario runs at least that long (a few hitches). */
+ /* patch 3009: tick_ms (0 = 1000/30) until switch_s, then tick2_ms; uneven_ms > 0: each tick 33.3 ms plus an exponential wait of that mean. */
+ typedef struct { const char* name; double jitter_ms, stretch_ms, stall_ms, stall_every_s, min_s, tick_ms, switch_s, tick2_ms, uneven_ms; } scenario;
+@@ -63,12 +66,14 @@ static void run(const scenario* sc, double seconds, IAudioClock* clk, UINT64 clk
+     int hitches = 0, hid = 0; unsigned long long gaps_before = 0, gaps0 = 0; double hitch_ms = 0.0, lvl0 = 0.0, gap_s = sc->stall_every_s - 1.0 + 2.0 * rnd();
+     const int paced = sc->tick_ms > 0 || sc->uneven_ms > 0;   /* patch 3009: a slow-pace scenario */
+     unsigned long long gaps15 = 0, gaps_sw = 0; int at15 = 0, at_sw = 0; double next_line = 2000.0, back_ms = -1.0;
++    unsigned long long gaps30 = 0; int at30 = 0;   /* patch 3010 */
+     while (now_ms() - t_start < seconds * 1000.0) {
+         /* the tick boundary: 1/30 s, plus this scenario's lateness */
+         double due = next + rnd() * sc->jitter_ms;
+         if (sc->stall_ms > 0 && due - last_stall >= sc->stall_every_s * 1000.0) { due += sc->stall_ms; last_stall = due; }
+         if (sc->stall_ms < 0 && due - last_stall >= gap_s * 1000.0) {
+-            hitch_ms = ++hitches % 3 ? 76.0 : 150.0 + 150.0 * rnd(); due += hitch_ms; last_stall = due; gap_s = sc->stall_every_s - 1.0 + 2.0 * rnd();
++            hitch_ms = sc->stall_ms <= -2.0 ? (++hitches, 50.0 + 50.0 * rnd()) : ++hitches % 3 ? 76.0 : 150.0 + 150.0 * rnd();   /* patch 3010: -2 */
++            due += hitch_ms; last_stall = due; gap_s = sc->stall_every_s - 1.0 + 2.0 * rnd();
+             if (hitches == 1) gaps_before = s_lk_conceals;   /* the gaps of the start (an empty device) */
+             gaps0 = s_lk_conceals; lvl0 = (lk_cap_frames() - audio_backend_room()) / 48.0;
+         }
+@@ -85,7 +90,9 @@ static void run(const scenario* sc, double seconds, IAudioClock* clk, UINT64 clk
+         if (rm0 >= 0 && rm1 >= 0 && nd < 20000) { before[nd] = (cap - rm0) / 48.0; after[nd] = (cap - rm1) / 48.0; nd++; }
+         if (hitches != hid) {   /* the burst after a hitch: did the hitch conceal a gap? */
+             hid = hitches;
+-            printf("  hitch %d: %.0f ms, level when it began %.1f ms, concealed gaps +%llu\n", hitches, hitch_ms, lvl0, s_lk_conceals - gaps0);
++            printf("  hitch %d: %.0f ms, level when it began %.1f ms, concealed gaps +%llu, owed %.0f ms\n", hitches, hitch_ms, lvl0, s_lk_conceals - gaps0,
++                   s_lk_debt / 48.0);   /* patch 3010: the concealed time not paid back yet */
++            if (!at30 && now_ms() - t_start >= 30000.0) { gaps30 = s_lk_conceals; at30 = 1; }
+         }
+         if (paced) {   /* patch 3009 */
+             const double el = now_ms() - t_start;
+@@ -110,6 +117,9 @@ static void run(const scenario* sc, double seconds, IAudioClock* clk, UINT64 clk
+     stats("oldest frame of a burst", before, nd); stats("newest", after, nd);
+     printf(" %d ticks; played-clock lag %.1f ms over %.1f s\n", nd, wall - played_ms, wall / 1000.0);
+     if (hitches) printf("  %d hitches; concealed gaps before the first (the start): %llu\n", hitches, gaps_before);
++    if (at30) printf("  concealed gaps from 30 s on: %llu in %.1f s (%.1f per minute); %.0f ms paid back, quick slow pace %llu times, refill %s\n",
++                     s_lk_conceals - gaps30, (wall - 30000.0) / 1000.0, (s_lk_conceals - gaps30) * 60000.0 / (wall - 30000.0), s_lk_paid / 48.0,
++                     s_lk_q_entries, s_lk_refill ? "on" : "off (AUDIO_LOCK_REFILL=0)");   /* patch 3010 */
+     if (paced) {   /* patch 3009 */
+         printf("  slow pace: concealed gaps from 15 s on: %llu in %.1f s (%.1f per minute); rate at the end %.3f, lowest %.3f, slow %.1f s",
+                s_lk_conceals - gaps15, (wall - 15000.0) / 1000.0, wall > 15000.0 ? (s_lk_conceals - gaps15) * 60000.0 / (wall - 15000.0) : 0.0,
+@@ -150,6 +160,8 @@ int main(int argc, char** argv)
+         { "80 ms stall every 3 s",  2.0, 0.0, 80.0, 3.0, 0.0, 0, 0, 0, 0 },
+         { "76 ms hitch every 12 s", 2.0, 0.0, 76.0, 12.0, 60.0, 0, 0, 0, 0 },
+         { "field hitches ~11 s",    2.0, 0.0, -1.0, 11.0, 90.0, 0, 0, 0, 0 },
++        /* patch 3010: the friends' test10 fight, 50-100 ms hitches every 1-3 s */
++        { "bundle hitches ~2 s",    2.0, 0.0, -2.0, 2.0, 120.0, 0, 0, 0, 0 },
+         /* patch 3009: slow pace */
+         { "slow 20 ticks/s",        2.0, 0.0, 0.0, 0.0, 60.0, 50.0, 0, 0, 0 },
+         { "slow uneven ~20 ticks/s", 0.0, 0.0, 0.0, 0.0, 60.0, 0, 0, 0, 16.7 },
+diff --git a/libs/audio/tests/test_audio_lock_race.c b/libs/audio/tests/test_audio_lock_race.c
+index 7093b67..9ab3cec 100644
+--- a/libs/audio/tests/test_audio_lock_race.c
++++ b/libs/audio/tests/test_audio_lock_race.c
+@@ -15,7 +15,12 @@
+  *    game's hitches (76 ms about 5 a minute, also 150-300 ms) never slow the playback; a sustained 20 ticks/s (even, uneven, with the 2 ms stretch fed
+  *    forward) does, to about 2/3, with no concealed gap once it settled; back to 30 ticks/s the rate returns to 1 smoothly with nothing dropped;
+  *    AUDIO_LOCK_SLOW_MIN=0 is 3008 as it was. A slow pace made of big time-sync stretches (test9: up to 25 ms, of which the feed-forward plays
+- *    8 %) engages too; a 2 s stall while engaged moves the rate no more than a normal tick does. */
++ *    8 %) engages too; a 2 s stall while engaged moves the rate no more than a normal tick does.
++ * 6. patch 3010: the refill, in the same virtual time on a 300 ms device (AUDIO_LOCK_BUF_MS as the J-Stars port sets it now): steady 30 ticks/s
++ *    conceals nothing after the start; a 29 fps fight with a 50-100 ms tick every ~2 s and one with runs of 5-15 slow ticks (as room 71) conceal far
++ *    fewer gaps than 3009; single hitches (76 ms, 150-300 ms) never enter the quick slow pace; 20 ticks/s is still gap-free once settled.
++ *    Parts 1-4 run with it on (part 4: the absolute feedback still settles at the cushion, not pinned); part 5 runs with it off, so its numbers are
++ *    3009's. */
+ #include "../cellAudio.c"
+ #include <assert.h>
+ 
+@@ -220,6 +225,7 @@ static ff_result run_stretch(double stretch_ms, int ff, int seconds)
+     ps3r_audio_dev_opened(&s_wasapi_st, GetTickCount64() + 3600 * 1000ull);
+     lk_begin(); s_lk_ff = ff;
+     const int slow_min = s_lk_slow_min; if (!ff) s_lk_slow_min = 0;   /* patch 3009: off with the feed-forward off (3007 as it was) */
++    const int rf = s_lk_refill; if (!ff) s_lk_refill = 0;               /* patch 3010: likewise */
+     s_lk_test_ms = 0.0;
+     g_ps3_audio_lock_stretch_us = (int)(stretch_ms * 1000.0 + 0.5);   /* what the game thread writes at every boundary */
+     const int ticks = seconds * 30, warm = 10 * 30;   /* the first 10 s fill the cushion from an empty device (as at a real lock start) */
+@@ -236,7 +242,7 @@ static ff_result run_stretch(double stretch_ms, int ff, int seconds)
+     CHECK(s_lk_slow_entries == 0 && s_lk_slow_lo == 1.0);   /* patch 3009: a stretch fed forward is not a slow pace */
+     ff_result r = { s_lk_conceals - c0, s_lk_dry - d0, s_lk_bursts, s_lk_ff_bursts, s_lk_skew_max, s_lk_tot_max, nl ? lsum / nl / 48.0 : 0.0 };
+     lk_end();
+-    s_lk_slow_min = slow_min; s_lk_test_ms = -1.0;
++    s_lk_slow_min = slow_min; s_lk_test_ms = -1.0; s_lk_refill = rf;
+     g_ps3_audio_lock_stretch_us = 0;
+     return r;
+ }
+@@ -270,24 +276,30 @@ static void test_stretch_feed_forward(void)
+ /* tick_ms for the whole run, or until switch_s and tick2_ms after it; uneven_ms > 0: each tick 33.3 ms plus an exponential wait of that mean;
+  * hitch_every_s: a 76 ms hitch about that often (+-1 s), with big_hitches every third one 150-300 ms; stretch_ms: published at every boundary and
+  * added to the tick (as the time sync does); stall_ms at stall_s: one long stall */
+-typedef struct { const char* name; double tick_ms, tick2_ms, switch_s, stretch_ms, uneven_ms, hitch_every_s; int big_hitches; double seconds, stall_s, stall_ms; } pace;
+-typedef struct { unsigned long long conceals, conceals_late, conceals2, squeezed, drops, entries;
+-                 double slow_end, slow_lo, slow_ms, max_step, lvl_mean, slow_mid, back_ms; } pace_result;
++/* patch 3010: hitch_lo_ms..hitch_hi_ms > 0: each hitch adds that much to its tick instead (uniform); run_n > 1: each hitch is a run of that many
++ * slow ticks, each one 33.3 ms + 40-60 ms (room 71's 80-100 ms runs) */
++typedef struct { const char* name; double tick_ms, tick2_ms, switch_s, stretch_ms, uneven_ms, hitch_every_s; int big_hitches; double seconds, stall_s, stall_ms;
++                 double hitch_lo_ms, hitch_hi_ms; int run_n; } pace;
++typedef struct { unsigned long long conceals, conceals_late, conceals2, squeezed, drops, entries, quick;
++                 double slow_end, slow_lo, slow_ms, max_step, lvl_mean, slow_mid, back_ms, debt_max, paid; } pace_result;
++static int s_pace_rf = -1;           /* patch 3010: -1 part 5 (no refill: 3009's numbers), 0 / 1 part 6 with it off / on */
++static UINT32 s_pace_dev = 9600;     /* the fake device's frames: 200 ms (3009), 300 ms (3010) */
+ static unsigned s_prng = 99;
+ static double prnd(void) { s_prng = s_prng * 1103515245u + 12345u; return ((s_prng >> 8) & 0xFFFF) / 65536.0; }
+ static pace_result run_pace(const pace* pc, int slow_min)
+ {
+     static fake_dev d;
+-    fake_init(&d, 9600);   /* 200 ms, AUDIO_LOCK_BUF_MS as the J-Stars port sets it */
++    fake_init(&d, s_pace_dev);   /* 200 ms (3009) or 300 ms (3010), AUDIO_LOCK_BUF_MS as the J-Stars port sets it */
+     wasapi_dev w = fake_wasapi(&d, 60); wasapi_adopt(&w);
+     ps3r_audio_dev_opened(&s_wasapi_st, GetTickCount64() + 3600 * 1000ull);
+     lk_begin();
+-    const int cu = s_lk_cushion_ms, drc = s_lk_drc, sm = s_lk_slow_min;
++    const int cu = s_lk_cushion_ms, drc = s_lk_drc, sm = s_lk_slow_min, rf = s_lk_refill;
+     s_lk_cushion_ms = 90; s_lk_drc = 8; s_lk_ff = 1; s_lk_slow_min = slow_min; s_prng = 99;
++    s_lk_refill = s_pace_rf > 0;
+     s_lk_test_ms = 0.0;
+     pace_result r; memset(&r, 0, sizeof r); r.back_ms = -1.0;
+     unsigned long long c_late = 0, c_sw = 0; int late_set = 0, sw_set = 0;
+-    double owed = 0.0, lsum = 0.0, next_hitch = pc->hitch_every_s * 1000.0, prev = 1.0; long long blocks = 0; int nl = 0, hitches = 0, stalled = 0;
++    double owed = 0.0, lsum = 0.0, next_hitch = pc->hitch_every_s * 1000.0, prev = 1.0; long long blocks = 0; int nl = 0, hitches = 0, stalled = 0, run_left = 0;
+     for (int t = 0; s_lk_test_ms < pc->seconds * 1000.0; t++) {
+         const double now = s_lk_test_ms;
+         const int phase2 = pc->switch_s > 0 && now >= pc->switch_s * 1000.0;
+@@ -301,8 +313,12 @@ static pace_result run_pace(const pace* pc, int slow_min)
+         if (sw_set && r.back_ms < 0 && !s_lk_slow_eng) r.back_ms = now - pc->switch_s * 1000.0;
+         double period = (phase2 ? pc->tick2_ms : pc->tick_ms) + pc->stretch_ms;
+         if (pc->uneven_ms > 0 && !phase2) period = 1000.0 / 30.0 + pc->stretch_ms - log(1.0 - prnd() * 0.999) * pc->uneven_ms;
+-        if (pc->hitch_every_s > 0 && now >= next_hitch) {
+-            hitches++; period += pc->big_hitches && hitches % 3 == 0 ? 150.0 + 150.0 * prnd() : 76.0;
++        if (run_left > 0) { run_left--; period += 40.0 + 20.0 * prnd(); }   /* patch 3010: the rest of a run of slow ticks */
++        else if (pc->hitch_every_s > 0 && now >= next_hitch) {
++            hitches++;
++            if (pc->run_n > 1) { run_left = pc->run_n - 1; period += 40.0 + 20.0 * prnd(); }   /* patch 3010 */
++            else if (pc->hitch_hi_ms > 0) period += pc->hitch_lo_ms + (pc->hitch_hi_ms - pc->hitch_lo_ms) * prnd();   /* patch 3010 */
++            else period += pc->big_hitches && hitches % 3 == 0 ? 150.0 + 150.0 * prnd() : 76.0;
+             next_hitch += (pc->hitch_every_s - 1.0 + 2.0 * prnd()) * 1000.0;
+         }
+         if (pc->stall_ms > 0 && !stalled && now >= pc->stall_s * 1000.0) { period += pc->stall_ms; stalled = 1; }
+@@ -313,32 +329,35 @@ static pace_result run_pace(const pace* pc, int slow_min)
+     r.conceals = s_lk_conceals; r.conceals_late = s_lk_conceals - c_late; r.conceals2 = sw_set ? s_lk_conceals - c_sw : 0;
+     r.squeezed = s_lk_squeezed; r.drops = s_lk_drops; r.entries = s_lk_slow_entries;
+     r.slow_end = s_lk_slow_out; r.slow_lo = s_lk_slow_lo; r.slow_ms = s_lk_slow_ms; r.lvl_mean = nl ? lsum / nl / 48.0 : 0.0;
+-    printf("slow pace %-26s %s: %4llu concealed gaps (%3llu after 15 s), %2llu squeezed, %2llu dropped, slow %llu times %.1f s, rate min %.3f end %.3f,"
+-           " largest step per tick %.4f, level from 15 s %.1f ms\n", pc->name, slow_min ? "on " : "off", r.conceals, r.conceals_late,
++    r.quick = s_lk_q_entries; r.debt_max = s_lk_debt_max / 48.0; r.paid = s_lk_paid / 48.0;   /* patch 3010 */
++    printf("%s %-26s %s: %4llu concealed gaps (%3llu after 15 s), %2llu squeezed, %2llu dropped, slow %llu times %.1f s, rate min %.3f end %.3f,"
++           " largest step per tick %.4f, level from 15 s %.1f ms\n", s_pace_rf >= 0 ? "refill   " : "slow pace", pc->name,
++           s_pace_rf >= 0 ? (s_lk_refill ? "on " : "off") : (slow_min ? "on " : "off"), r.conceals, r.conceals_late,
+            r.squeezed, r.drops, r.entries, r.slow_ms / 1000.0, r.slow_lo, r.slow_end, r.max_step, r.lvl_mean);
++    if (s_pace_rf > 0) printf("    refill: %llu quick slow-pace entries, debt max %.0f ms, %.0f ms paid back\n", r.quick, r.debt_max, r.paid);
+     if (sw_set) printf("    at the switch to %.1f ms ticks the rate was %.3f; back to 1 and disengaged %.0f ms later; %llu concealed gaps after the switch\n",
+                        pc->tick2_ms, r.slow_mid, r.back_ms, r.conceals2);
+     g_ps3_audio_lock_stretch_us = 0;
+     lk_end();
+-    s_lk_cushion_ms = cu; s_lk_drc = drc; s_lk_slow_min = sm; s_lk_test_ms = -1.0;
++    s_lk_cushion_ms = cu; s_lk_drc = drc; s_lk_slow_min = sm; s_lk_test_ms = -1.0; s_lk_refill = rf;
+     return r;
+ }
+ static void test_slow_pace(void)
+ {
+-    static const pace steady = { "steady 30 ticks/s",        1000.0 / 30.0, 0, 0, 0.0, 0, 0, 0, 60, 0, 0 };
+-    static const pace hitch  = { "76 ms hitches ~12 s",      1000.0 / 30.0, 0, 0, 0.0, 0, 12.0, 0, 120, 0, 0 };
+-    static const pace field  = { "field hitches ~11 s",      1000.0 / 30.0, 0, 0, 0.0, 0, 11.0, 1, 120, 0, 0 };
+-    static const pace dense  = { "76 ms hitches ~3 s",       1000.0 / 30.0, 0, 0, 0.0, 0, 3.0, 0, 120, 0, 0 };
+-    static const pace slow   = { "20 ticks/s",               50.0, 0, 0, 0.0, 0, 0, 0, 60, 0, 0 };
+-    static const pace slows  = { "20 ticks/s, 2 ms stretch", 48.0, 0, 0, 2.0, 0, 0, 0, 60, 0, 0 };
++    static const pace steady = { "steady 30 ticks/s",        1000.0 / 30.0, 0, 0, 0.0, 0, 0, 0, 60, 0, 0, 0, 0, 0 };
++    static const pace hitch  = { "76 ms hitches ~12 s",      1000.0 / 30.0, 0, 0, 0.0, 0, 12.0, 0, 120, 0, 0, 0, 0, 0 };
++    static const pace field  = { "field hitches ~11 s",      1000.0 / 30.0, 0, 0, 0.0, 0, 11.0, 1, 120, 0, 0, 0, 0, 0 };
++    static const pace dense  = { "76 ms hitches ~3 s",       1000.0 / 30.0, 0, 0, 0.0, 0, 3.0, 0, 120, 0, 0, 0, 0, 0 };
++    static const pace slow   = { "20 ticks/s",               50.0, 0, 0, 0.0, 0, 0, 0, 60, 0, 0, 0, 0, 0 };
++    static const pace slows  = { "20 ticks/s, 2 ms stretch", 48.0, 0, 0, 2.0, 0, 0, 0, 60, 0, 0, 0, 0, 0 };
+     /* test9's time sync stretches the fast PC's ticks by up to 25 ms to follow a slow peer: the feed-forward plays at most 8 % of it */
+-    static const pace big1   = { "20/s = 33.3 + 16.7 stretch", 1000.0 / 30.0, 0, 0, 16.7, 0, 0, 0, 60, 0, 0 };
+-    static const pace big2   = { "23/s with a 25 ms stretch", 1000.0 / 23.0 - 25.0, 0, 0, 25.0, 0, 0, 0, 60, 0, 0 };
+-    static const pace big3   = { "17/s = 33.3 + 25 stretch", 1000.0 / 30.0, 0, 0, 25.0, 0, 0, 0, 60, 0, 0 };
+-    static const pace uneven = { "uneven ~20 ticks/s",       0, 0, 0, 0.0, 16.7, 0, 0, 60, 0, 0 };
+-    static const pace rec    = { "20 -> 30 ticks/s at 30 s", 50.0, 1000.0 / 30.0, 30.0, 0.0, 0, 0, 0, 60, 0, 0 };
+-    static const pace stall  = { "20 ticks/s, 2 s stall",    50.0, 0, 0, 0.0, 0, 0, 0, 60, 30.0, 2000.0 };
+-    static const pace slower = { "12 ticks/s",               1000.0 / 12.0, 0, 0, 0.0, 0, 0, 0, 40, 0, 0 };
++    static const pace big1   = { "20/s = 33.3 + 16.7 stretch", 1000.0 / 30.0, 0, 0, 16.7, 0, 0, 0, 60, 0, 0, 0, 0, 0 };
++    static const pace big2   = { "23/s with a 25 ms stretch", 1000.0 / 23.0 - 25.0, 0, 0, 25.0, 0, 0, 0, 60, 0, 0, 0, 0, 0 };
++    static const pace big3   = { "17/s = 33.3 + 25 stretch", 1000.0 / 30.0, 0, 0, 25.0, 0, 0, 0, 60, 0, 0, 0, 0, 0 };
++    static const pace uneven = { "uneven ~20 ticks/s",       0, 0, 0, 0.0, 16.7, 0, 0, 60, 0, 0, 0, 0, 0 };
++    static const pace rec    = { "20 -> 30 ticks/s at 30 s", 50.0, 1000.0 / 30.0, 30.0, 0.0, 0, 0, 0, 60, 0, 0, 0, 0, 0 };
++    static const pace stall  = { "20 ticks/s, 2 s stall",    50.0, 0, 0, 0.0, 0, 0, 0, 60, 30.0, 2000.0, 0, 0, 0 };
++    static const pace slower = { "12 ticks/s",               1000.0 / 12.0, 0, 0, 0.0, 0, 0, 0, 40, 0, 0, 0, 0, 0 };
+     pace_result a = run_pace(&steady, 60), a0 = run_pace(&steady, 0);
+     CHECK(a.entries == 0 && a.slow_lo == 1.0 && a.conceals == a0.conceals && a.squeezed == a0.squeezed && a.drops == a0.drops);   /* (a) as before */
+     pace_result b = run_pace(&hitch, 60), b0 = run_pace(&hitch, 0);
+@@ -372,6 +391,43 @@ static void test_slow_pace(void)
+            c.slow_end, d.back_ms, fl.slow_lo);
+ }
+ 
++/* ---- 6. patch 3010: the refill ---- */
++static pace_result run_refill(const pace* pc, int rf)
++{
++    s_pace_rf = rf; const pace_result r = run_pace(pc, 60); s_pace_rf = -1;
++    return r;
++}
++static void test_refill(void)
++{
++    static const pace steady = { "steady 30 ticks/s",          1000.0 / 30.0, 0, 0, 0.0, 0, 0, 0, 60, 0, 0, 0, 0, 0 };
++    /* the friends' room 69: 29.1 ticks/s, a 50-100 ms tick about every 2 s */
++    static const pace bundle = { "29 fps, 50-100 ms hitches",  33.6, 0, 0, 0.0, 0, 2.0, 0, 180, 0, 0, 16.7, 66.7, 0 };
++    /* room 71: runs of slow ticks (80-100 ms each) */
++    static const pace runs5  = { "runs of 5 slow ticks ~4 s",  1000.0 / 30.0, 0, 0, 0.0, 0, 4.0, 0, 180, 0, 0, 0, 0, 5 };
++    static const pace runs15 = { "runs of 15 slow ticks ~8 s", 1000.0 / 30.0, 0, 0, 0.0, 0, 8.0, 0, 180, 0, 0, 0, 0, 15 };
++    static const pace field  = { "field hitches ~11 s",        1000.0 / 30.0, 0, 0, 0.0, 0, 11.0, 1, 120, 0, 0, 0, 0, 0 };
++    static const pace dense  = { "76 ms hitches ~3 s",         1000.0 / 30.0, 0, 0, 0.0, 0, 3.0, 0, 120, 0, 0, 0, 0, 0 };
++    static const pace slow   = { "20 ticks/s",                 50.0, 0, 0, 0.0, 0, 0, 0, 60, 0, 0, 0, 0, 0 };
++    s_pace_dev = 14400;   /* 300 ms */
++    pace_result a = run_refill(&steady, 1);
++    CHECK(a.conceals_late == 0 && a.entries == 0 && a.drops == 0 && a.squeezed == 0 && fabs(a.lvl_mean - 90.0) < 3.0);
++    pace_result b = run_refill(&bundle, 1), b0 = run_refill(&bundle, 0);
++    CHECK(b.conceals_late * 2 < b0.conceals_late && b.drops == 0);
++    pace_result r5 = run_refill(&runs5, 1), r50 = run_refill(&runs5, 0);
++    CHECK(r5.conceals_late < r50.conceals_late && r5.drops == 0);
++    pace_result r15 = run_refill(&runs15, 1), r150 = run_refill(&runs15, 0);
++    CHECK(r15.quick > 0 && r15.conceals_late < r150.conceals_late && r15.drops == 0);
++    pace_result f = run_refill(&field, 1), f0 = run_refill(&field, 0);
++    CHECK(f.entries == 0 && f.slow_lo == 1.0 && f.conceals <= f0.conceals);   /* single hitches, even 300 ms, are not a pace */
++    pace_result dn = run_refill(&dense, 1);
++    CHECK(dn.entries == 0 && dn.slow_lo == 1.0);
++    pace_result sl = run_refill(&slow, 1);
++    CHECK(sl.entries >= 1 && sl.conceals_late == 0 && sl.drops == 0 && fabs(sl.slow_end - 2.0 / 3.0) < 0.03);
++    s_pace_dev = 9600;
++    printf("refill: concealed gaps after 15 s, on / 3009: 29 fps %llu / %llu, runs of 5 %llu / %llu, runs of 15 %llu / %llu; single hitches never a pace\n",
++           b.conceals_late, b0.conceals_late, r5.conceals_late, r50.conceals_late, r15.conceals_late, r150.conceals_late);
++}
++
+ int main(int argc, char** argv)
+ {
+     vm_base = (uint8_t*)VirtualAlloc(NULL, 0x100000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+@@ -381,6 +437,7 @@ int main(int argc, char** argv)
+     test_conceal_room();
+     test_stretch_feed_forward();
+     test_slow_pace();
++    test_refill();
+     puts("audio lock: all passed");
+     return 0;
+ }
