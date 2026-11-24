@@ -57,7 +57,8 @@ public:
                 // change what any frame simulates: GekkoNet's Poll (game_session.cpp Poll -> HandleReceivedInputs) only files received remote inputs into
                 // its input buffer (AddRemoteInput, which marks a misprediction as an incorrect frame) and re-sends unacked local inputs; Advance, Load and
                 // Save events are made only by UpdateSession, which begins with the very same Poll, so the next update sees exactly the inputs it would have
-                // seen anyway (the keepalive thread already polls at arbitrary moments). FinalFrame stops before a pending incorrect frame, so a poll that finds
+                // seen anyway (the keepalive thread already polls at arbitrary moments, and so does the snapshot gate's idle_service, the hook jsp_net_game.cpp
+                // sets, at most every 20 ms in its retry waits and precheck spins with the threads running). FinalFrame stops before a pending incorrect frame, so a poll that finds
                 // a misprediction only lowers it: a frame a later Load can target is never skipped.
                 int ff = -1;
                 if (skip_final_) {
