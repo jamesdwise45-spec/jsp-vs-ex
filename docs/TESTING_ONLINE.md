@@ -101,7 +101,8 @@ with "Online Battle + rollback (2 vs 2)". You can change your online name there.
 ## Known limits
 
 - Experimental: expect bugs.
-- Two players per room, one per PC, 2 vs 2. Friendly Match only; Rank Match is not tested. 3 vs 3 is offline only.
+- Two players per room, one per PC, 2 vs 2, unless every PC sets `JSP_ROLLBACK_MAX_PLAYERS=3` or `4` (experimental: 3 or 4 players, one per PC; the after-match menu is off then). Friendly Match only; Rank Match is not tested. 3 vs 3 is offline only.
+- If a player joins after the rollback link opened and the fight starts before the link is set up again, that fight shows "Rollback off for this fight" and uses the game's own connection; the link is set up again for the new count after the fight.
 - Only the host picks characters.
 - A sudden gap in the connection itself (a tenth of a second or more with no data) can still cause a short hitch.
 - Gameplay mods turn the game's own online off for the session.

@@ -35,6 +35,7 @@ posix   | installer/tools/net_pick_drive_test.sh
 posix   | installer/tools/net_pick_match_test.sh
 posix   | installer/tools/net_pick_page_test.sh
 posix   | installer/tools/pick_art_test.sh
+posix   | installer/tools/net_four_test.sh {scratch}
 posix   | installer/tools/net_report_test.sh
 posix   | installer/tools/build_id_test.py {scratch}
 posix   | installer/tools/net_repsn_test.sh {toolkit} {scratch}
@@ -70,7 +71,9 @@ posix   | installer/tools/pad_join_test.c {toolkit}
 posix   | installer/tools/psow_file_test.c {toolkit}
 posix   | installer/tools/psow_file_source_test.py --toolkit {toolkit}
 posix   | installer/tools/session_manifest_test.sh
-posix   | installer/tools/net_session_test.sh {scratch}
+# net_session_test.py's scenarios in two parts, each its own row under the 600 s limit per test (net_session_test.sh K/N)
+posix   | installer/tools/net_session_test.sh {scratch} 1/2
+posix   | installer/tools/net_session_test.sh {scratch} 2/2
 posix   | installer/tools/net_session_driver_test.py
 posix   | installer/tools/stepper_test.sh
 posix   | installer/tools/snapshot_ring_test.sh
@@ -95,6 +98,7 @@ exclude | installer/tools/net_pick_drive_test.cpp | compiled and run by net_pick
 exclude | installer/tools/net_pick_match_test.cpp | compiled and run by net_pick_match_test.sh
 exclude | installer/tools/net_pick_page_test.cpp | compiled and run by net_pick_page_test.sh
 exclude | installer/tools/pick_art_test.cpp | compiled and run by pick_art_test.sh
+exclude | installer/tools/net_four_test.cpp | compiled and run by net_four_test.sh
 exclude | installer/tools/net_report_test.cpp | compiled and run by net_report_test.sh
 exclude | installer/tools/net_repsn_test.cpp | compiled and run by net_repsn_test.sh
 exclude | installer/tools/net_repsn_client_test.cpp | compiled and run by net_repsn_test.sh

@@ -67,6 +67,7 @@ constexpr uint32_t kToc = 0x008D3888u;
 constexpr uint32_t kOnlineVt = 0x00878A70u, kOfflineVt = 0x008789D0u;
 
 bool armed() { return g_jsp_native_fight_armed != 0; }
+uint8_t g_humans = 0;   // ENHANCEMENT (4-player online): jsp_native_fight_set_humans; constant for a whole session, like g_armed
 // FIX (swapped controls): jsp_native_fight_map's net slot -> port (rollback slot) table, constant for a whole session like g_armed; g_local_port = this PC's
 // rollback slot; g_me = this PC's battle player; g_drove[i] = pad takes in which this PC's port gave battle player i a non-neutral sample (diagnostic only).
 bool g_port_on = false;
@@ -133,7 +134,8 @@ uint32_t take_armed(ppu_context* c, uint32_t mode)
             // the builder numbers net slots in team placement order, not record order). Without a map (never in a session: map refuses) port = slot as before.
             const int32_t port = g_port_on && slot >= 0 && slot < (int32_t)jnf::kRecCount ? g_port[slot] : slot;
             if (port < 0) continue;
-            if (!jnf::take_slot(slot, (int32_t)c->gpr[3], &seen)) continue;
+            // ENHANCEMENT (4-player online): a 3-4 player session names its human records (jsp_native_fight_set_humans); 0 = the native rule
+            if (g_humans ? !jnf::take_human(port, g_humans, &seen) : !jnf::take_slot(slot, (int32_t)c->gpr[3], &seen)) continue;
             const uint32_t rec = mode + jnf::kRecBase + (uint32_t)slot * jnf::kRecStride;   // 0x0F7344..0x0F7364: slot*16 + slot*4 + mode + 0x14C
             // The 12-byte sample, built as the send 0x4844DC builds the LOCAL one (0x48452C..0x484588) but into the record, from port `slot`:
             vm_write32(rec + 0x0u, 0);                   // buttons = 0 (0x0BE3D4 only ORs bits in)
@@ -597,6 +599,33 @@ extern "C" int jsp_native_fight_slot(void)
     return s >= 0 && s < (int32_t)jnf::kRecCount ? s : -1;
 }
 
+// ENHANCEMENT (4-player online): see the header. Reads only (the mutex 0x0047E6E0 takes around the list walk is not taken: a racy read, which the caller
+// repeats until two readings agree).
+extern "C" int jsp_native_room_read(uint16_t member[4], uint8_t com[4], uint16_t* my_member)
+{
+    *my_member = 0;
+    if (!g_supported) return 0;   // FIX (region): US 1.00 layout only
+    const uint32_t R = vm_read32(0x0095839Cu);
+    if (!plausible(R)) return 0;
+    for (uint32_t i = 0; i < 4; i++) { const uint32_t r = R + 0x68u + 0x24u * i; member[i] = (uint16_t)vm_read16(r + 0x08u); com[i] = (uint8_t)vm_read8(r + 0x1Au); }
+    const uint32_t p = vm_read32(kToc + 0x59F8u);
+    const uint32_t mgr = plausible(p) ? vm_read32(p) : 0;
+    if (!plausible(mgr)) return 1;
+    const uint32_t x = vm_read32(mgr + 0xA70u);
+    if (!plausible(x)) return 1;
+    uint8_t mine[36]; for (uint32_t k = 0; k < 36; k++) mine[k] = (uint8_t)vm_read8(mgr + 0xA78u + k);
+    uint32_t node = vm_read32(x + 0xD00u);
+    for (int guard = 0; plausible(node) && guard < 64; guard++, node = vm_read32(node)) {
+        const uint32_t m = vm_read32(node + 4u);
+        if (!plausible(m) || !vm_read32(m + 4u)) continue;
+        bool same = true;
+        for (uint32_t k = 0; k < 36 && same; k++) same = (uint8_t)vm_read8(m + 0xEu + k) == mine[k];
+        if (same) { *my_member = (uint16_t)vm_read16(m + 0xCu); break; }
+    }
+    return 1;
+}
+extern "C" void jsp_native_fight_set_humans(unsigned mask) { g_humans = (uint8_t)(mask & 0xFu); }
+
 // FIX (swapped controls): see the header. Guest reads only: G = *(*(TOC - 0x7A90)) (0x00030A14), players G+0x60+i*0x94 (+0x70 net slot, +0x78 member id),
 // "me" = *(G + 0x48158) (the builder 0x002EF6B8 stores the battle index of the record whose member id is this PC's), room records R+0x68+0x24*r.
 extern "C" int jsp_native_fight_map(int local_slot, unsigned seats, char* msg, int n)
@@ -698,6 +727,7 @@ extern "C" int jsp_native_fight_arm(int on)
     const bool was = g_jsp_native_fight_armed != 0;
     const bool normal = g_end_normal.exchange(0) != 0;   // FIX (rematch black screen): consumed by every disarm call, so it never leaks to a later one
     g_jsp_native_fight_armed = 0;
+    g_humans = 0;   // ENHANCEMENT (4-player online): the next session sets its own (a 2-player one leaves the native rule)
     g_port_on = false;   // FIX (swapped controls): the next session maps its own fight (jsp_native_fight_map); the counts stay for a last owner check
     if (was) {
         const uint32_t sp = share_pad();
