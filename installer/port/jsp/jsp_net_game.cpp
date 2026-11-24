@@ -136,6 +136,8 @@ unsigned long long jsp_native_room_seen_ms(void);   // jsp_net_native.cpp (ENHAN
 unsigned long long jsp_native_loading_seen_ms(void);   // jsp_net_native.cpp (FIX, mapping run U4): when the online loading scene last ran (0 = never)
 unsigned long long jsp_native_page_seen_ms(void);   // jsp_net_native.cpp (ENHANCEMENT, JSP_PICK_NATIVE_SELECT=1): when the Battle settings page last ran (0 = never)
 uint32_t cellGcm_flip_request_count(void);   // toolkit (FIX pick7, the freeze owner while the after-match menu is up): flips the game requested
+void jsp_sound_preload_install(void);        // jsp_sound_preload.cpp (FIX, test8 sound-barrier hitches): the sound archive held in RAM (JSP_SOUND_PRELOAD_MB)
+void jsp_sound_preload_fight_start(void);    // jsp_sound_preload.cpp: each session start, how much is still in RAM; the rest read again
 }
 
 namespace {
@@ -1615,6 +1617,7 @@ void start_session(ppu_context* c)
     jsp_stepper_lockstep(1);   // FIX (rollback determinism): 2 vblanks per flip in the live ticks too (jsp_stepper.cpp)
     guest_clock_start();
     cri_lock_start();
+    jsp_sound_preload_fight_start();   // FIX (test8 sound-barrier hitches): logs how much of the sound archive is still in RAM, reads the rest again
     show("Connecting to opponent...");
 }
 
@@ -2732,6 +2735,7 @@ extern "C" void jsp_net_game_install(void)
     uint32_t net_build = 0;
     if (!jsp_mods_net_build(build_id(), &net_build)) { std::fprintf(stderr, "[net] rollback refused: %s: off\n", jmods::kModsNotAsListed); return; }
     g_net_build = net_build;
+    jsp_sound_preload_install();   // FIX (test8 sound-barrier hitches): before the guest opens the sound archive; the barrier (fs_wait) is unchanged
     {   // ENHANCEMENT (rollback bench): no socket, no handshake; armed at once, the first fight tick starts the local stress session (start_bench)
         char bb[8] = {};
         if (jsp_setting_get(jpno::kKeyBench, bb, sizeof bb) && jpno::flag_on(bb)) {
