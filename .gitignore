@@ -184,6 +184,8 @@ __pycache__/
 !/installer/tools/net_perf_test.sh
 !/installer/tools/hitch_test.cpp
 !/installer/tools/hitch_test.sh
+!/installer/tools/snapshot_hostthr_test.cpp
+!/installer/tools/snapshot_hostthr_test.sh
 !/installer/tools/native_fight_test.cpp
 !/installer/tools/native_fight_test.sh
 !/installer/tools/discord_test.cpp
