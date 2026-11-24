@@ -517,15 +517,17 @@ std::vector<jss::Range> discover(uint64_t* excluded_bytes, bool* complete)
 }
 
 // ENHANCEMENT (test10, freeze tail; timing only): the freeze calls of two-copy runs had a tail of 30-730 ms (GetThreadContext returns only once the target
-// is really suspended). The calling thread runs at THREAD_PRIORITY_HIGHEST from its first SuspendThread to the end of the resume, then gets its own priority
-// back (raised only, never lowered). It changes no thread set and no order: every thread is frozen exactly as before. JSP_SNAPSHOT_FREEZE_BOOST=0 turns it off (A/B).
+// is really suspended). The calling thread runs at THREAD_PRIORITY_HIGHEST for the freeze calls (first SuspendThread to last GetThreadContext) and again for
+// the resume calls, and at its own priority in between: the frozen census, collect and page copy (whose pcopy::run spins on the ABOVE_NORMAL copy workers)
+// do not run boosted. Raised only, never lowered. It changes no thread set and no order: every thread is frozen exactly as before.
+// JSP_SNAPSHOT_FREEZE_BOOST=0 turns it off (A/B). The switch is read in Suspended::prepare() (threads running), never inside a freeze.
 static bool freeze_boost_on() { static const bool v = [] { const char* e = std::getenv("JSP_SNAPSHOT_FREEZE_BOOST"); return !(e && e[0] == '0'); }(); return v; }
 struct SelfBoost {
     int prev = 0; bool on = false;
-    void begin()
+    void begin(bool enabled)   // enabled: the cached switch (Suspended::boost_on), so no getenv or static-init guard runs while threads are frozen
     {
 #ifdef _WIN32
-        if (on || !freeze_boost_on()) return;
+        if (on || !enabled) return;
         const int p = GetThreadPriority(GetCurrentThread());
         if (p == THREAD_PRIORITY_ERROR_RETURN || p >= THREAD_PRIORITY_HIGHEST) return;
         if (SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST)) { prev = p; on = true; }
@@ -548,7 +550,7 @@ struct Suspended {
     // DIAGNOSTIC (test10, freeze tail): the slowest thread to stop over every freeze pass of this operation (tid 0 = none measured). The calls run in
     // order, so a thread that stops late shows its whole wait and the threads after it only what is left: the slowest one is the one that held the freeze.
     unsigned long slow_tid = 0; double slow_ms = 0, slow_ctx_ms = 0; unsigned slow_over1 = 0, passes = 0;
-    SelfBoost boost;
+    SelfBoost boost; bool boost_on = false;   // boost_on: freeze_boost_on(), cached by prepare()
     // Alive PPU threads as a bit set (allocation-free table read). A PPU thread started or ended between the listing and the freeze changes it. Host-only threads
     // (cellAudio's wasapi opener, SPU job threads) are NOT PPU threads: they are covered by the ended-thread skip and the retry, not by this check; a host thread CREATED
     // after the listing stays unseen.
@@ -569,6 +571,7 @@ struct Suspended {
     void prepare()
     {
         fail = PauseFail(); gone_n = 0;
+        boost_on = freeze_boost_on();   // threads running: the first call's getenv and static init happen here
         if (g_thr_registry) {
             jtr::Registry& R = jsp_thread_registry();
             R.reclaim([](void* h) { jsp_thread_registry_close(h); }, [](void* h) { return jsp_thread_registry_ended(h); });
@@ -600,7 +603,8 @@ struct Suspended {
             for (size_t i = 0; i < n; i++) if (!freeze_exempt(buf[i].tid)) th.push_back({buf[i].h, buf[i].tid});   // capacity reserved in prepare(); exempt threads stay running
             ppu_alive_at_listing = ppu_alive_mask();
         }
-        boost.begin();   // ended by resume() (also on every failure path: the caller resumes, the destructor too)
+        boost.begin(boost_on);
+        struct BoostEnd { SelfBoost& b; ~BoostEnd() { b.end(); } } boost_end{boost};   // own priority again after the last GetThreadContext, on every return path
         passes++;
         for (Th& t : th) {
             t.stop_ms = 0; t.ctx_ms = 0;
@@ -649,6 +653,7 @@ struct Suspended {
     bool resume()
     {
 #ifdef _WIN32
+        if (!th.empty()) boost.begin(boost_on);   // HIGHEST again for the resume calls only (ended below)
         const bool ok = jso::resume_threads(th, [](void* h) {
             if (ResumeThread((HANDLE)h) != (DWORD)-1) return true;
             g_rf_handle = h; g_rf_err = GetLastError(); g_rf_count = g_rf_count + 1;   // read by write_fatal_note (resume_failed)
