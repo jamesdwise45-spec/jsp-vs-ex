@@ -1,0 +1,49 @@
+The game's pipeline requests that miss the in-memory cache are counted as warm (built ahead by the 2068 warm-up) or cold (built on request), with the cold build time; rsx_d3d12_pipeline_counts reads the totals.
+
+The 2068 warm-up says once, in the menus, how many requests so far were warm. A title port can now read the running totals
+(warm, cold, cold build ms) at any time and print them per match, so a support log shows how many pipelines a fight still had
+to build. Counted on any thread (the async pipeline queue builds through the same function). Nothing else changes.
+
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+index 1525363..0e391e9 100644
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -2779,16 +2779,35 @@ static void psow_report(void)
+ }
+ static HRESULT sc_pipeline(D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, ID3D12PipelineState** out);
+ /* patch 2068: a warmed pipeline first; a guest-FP pipeline built here is noted for the next start */
++/* 2922: the game's pipeline requests that missed the in-memory cache, split into warm (a pipeline the warm-up of patch 2068 had already
++ * built) and cold (built on request: from the pipelines.bin blob or by the driver), with the time the cold builds took. Any thread
++ * (the async pipeline queue builds here too). rsx_d3d12_pipeline_counts reads the running totals; the port prints them per match. */
++static volatile LONG s_pl_warm, s_pl_cold;
++static volatile LONG64 s_pl_cold_us;
++static HRESULT sc_pipeline_cold(D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, ID3D12PipelineState** out)
++{
++    const double t0 = perf_now();
++    const HRESULT hr = sc_pipeline(pd, out);
++    InterlockedIncrement(&s_pl_cold);
++    InterlockedExchangeAdd64(&s_pl_cold_us, (LONG64)((perf_now() - t0) * 1e6));
++    return hr;
++}
++void rsx_d3d12_pipeline_counts(long* warm, long* cold, double* cold_ms)
++{
++    if (warm) *warm = (long)InterlockedCompareExchange(&s_pl_warm, 0, 0);
++    if (cold) *cold = (long)InterlockedCompareExchange(&s_pl_cold, 0, 0);
++    if (cold_ms) *cold_ms = (double)InterlockedCompareExchange64(&s_pl_cold_us, 0, 0) / 1000.0;
++}
+ static HRESULT sc_pipeline_warm(D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd, ID3D12PipelineState** out)
+ {
+     if (psow_on() && psow_guest(pd)) {
+         const u64 k = psow_key(pd);
+-        if ((*out = psow_take(k)) != NULL) return S_OK;
+-        const HRESULT hr = sc_pipeline(pd, out);
++        if ((*out = psow_take(k)) != NULL) { InterlockedIncrement(&s_pl_warm); return S_OK; }   /* 2922 */
++        const HRESULT hr = sc_pipeline_cold(pd, out);   /* 2922 */
+         if (SUCCEEDED(hr) && *out) psow_note(pd, k);
+         return hr;
+     }
+-    return sc_pipeline(pd, out);
++    return sc_pipeline_cold(pd, out);   /* 2922 */
+ }
+ static HRESULT sc_compile(const char* hlsl, const char* name, const char* target, ID3DBlob** out, ID3DBlob** err)
+ { const double t0 = hz_ms() ? hz_now() : 0; HRESULT r = sc_compile_hz_impl(hlsl, name, target, out, err); if (t0) { s_hz_t[1] += hz_now() - t0; s_hz_n[1]++; } return r; }
