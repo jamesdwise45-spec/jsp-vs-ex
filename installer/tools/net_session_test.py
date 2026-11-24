@@ -665,8 +665,14 @@ def main():
             if not fl and name.startswith("skip_final"):   # the switch must have skipped saves on both peers, or the scenario tested nothing
                 for n_, s_ in (("host", hs), ("client", cs)):
                     if num(s_, "skipped", 0) <= 0: fl.append(f"{n_}: no save was skipped (skipped={num(s_, 'skipped', -1)})")
+                    # DIAGNOSTIC (test12, rollback cost): no Load may target a frame its save found below the final frame (those saves are skipped)
+                    if num(s_, "loads_below_ff", 0) != 0: fl.append(f"{n_}: {num(s_, 'loads_below_ff')} Load(s) of a frame below the final frame at its save")
             print(f"{'PASS' if not fl else 'FAIL'} {name} ({time.monotonic() - t0:.1f} s)", flush=True)
             for s in (hs, cs): print("   ", s[:330])
+            if "skip_final" in name or name in ("adv_20pct_loss", "impaired_2x2"):   # the save / load split (test12 ROLLBACK-COST.md)
+                for n_, s_ in (("host", hs), ("client", cs)):
+                    print(f"    {n_} saves={num(s_, 'saves')} skipped={num(s_, 'skipped')} rerun_saves={num(s_, 'rerun_saves')} rerun_skipped={num(s_, 'rerun_skipped')} "
+                          f"at_final={num(s_, 'at_final')} loads below/at/above ff={num(s_, 'loads_below_ff')}/{num(s_, 'loads_at_ff')}/{num(s_, 'loads_above_ff')} unknown={num(s_, 'loads_unknown')}")
             for x in fl: print("   !", x)
             if problems:
                 for x in tails(tmp, ho, co): print("   |", x)
