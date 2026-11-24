@@ -227,10 +227,20 @@ int main(int argc, char** argv)
         std::function<bool(uint32_t, uint32_t*)> hp;
     } tg;
     const bool skip_final = atoi(arg(argc, argv, "--skip-final", "0")) != 0;
-    if (skip_final) tg.hp = [&](uint32_t tick, uint32_t* h) { ring.erase(tick); *h = fold(cur); ko_rec(tick); return true; };
+    // DIAGNOSTIC (test12, rollback cost): for every tick, the GekkoNet frame of its last save and the final frame at that save; every Load is then sorted
+    // by where its target lay against that final frame. below = a Load of a frame the skip test called final (must be 0: such a save is skipped with
+    // --skip-final 1); at = a Load of exactly the final frame of its save (why "at or below the confirmed frame" would break: those saves must keep a snapshot).
+    Glue* gp = nullptr;
+    std::map<uint32_t, std::pair<int, int>> save_at;   // tick -> (save frame, final frame then)
+    uint64_t loads_below = 0, loads_at = 0, loads_above = 0, loads_unknown = 0;
+    auto note_save = [&](uint32_t tick) { if (gp) save_at[tick] = {gp->current_save_frame(), gp->current_final_frame() >= 0 ? gp->current_final_frame() : s.final_frame()}; };
+    if (skip_final) tg.hp = [&](uint32_t tick, uint32_t* h) { note_save(tick); ring.erase(tick); *h = fold(cur); ko_rec(tick); return true; };
     tg.d = [&] { return done; };
-    tg.c = [&](uint32_t tick, uint32_t* h, uint32_t* k) { ring[tick] = cur; commits++; *h = fold(cur); *k = ++serial; while (ring.size() > 64) ring.erase(ring.begin()); ko_rec(tick); return true; };
-    tg.r = [&](uint32_t tick) { auto it = ring.find(tick); if (it == ring.end()) return false; cur = it->second; done = tick; kr.drop_after(tick); return true; };
+    tg.c = [&](uint32_t tick, uint32_t* h, uint32_t* k) { note_save(tick); ring[tick] = cur; commits++; *h = fold(cur); *k = ++serial; while (ring.size() > 64) ring.erase(ring.begin()); ko_rec(tick); return true; };
+    tg.r = [&](uint32_t tick) {
+        { auto sa = save_at.find(tick);
+          if (sa == save_at.end()) loads_unknown++; else if (sa->second.first < sa->second.second) loads_below++; else if (sa->second.first == sa->second.second) loads_at++; else loads_above++; }
+        auto it = ring.find(tick); if (it == ring.end()) return false; cur = it->second; done = tick; kr.drop_after(tick); return true; };
     // --idle-from N: from update N on this copy sends the all-zero wire input, which is also what GekkoNet fills in for a disconnected peer (so the peer's
     // predictions of it are never corrected when it goes: its predicted saves stay, as when a real player stops pressing before the link dies)
     const int idle_from = atoi(arg(argc, argv, "--idle-from", "-1"));
@@ -243,6 +253,7 @@ int main(int argc, char** argv)
     };
     Glue glue(s, stepper, tg);
     glue.set_skip_final(skip_final);
+    gp = &glue;
     // One iteration = ONE call of glue.iteration(); a Run executes the granted tick. Rate bookkeeping for --min-rate (see below).
     int poll_stall_at = -1, poll_stall_ms = 0; bool poll_stalled = false; if (const char* ps = arg(argc, argv, "--poll-stall", "")) std::sscanf(ps, "%d,%d", &poll_stall_at, &poll_stall_ms);   // --poll-stall TICK,MS: from that tick the loop only polls (as a long commit gate does) for MS
     // --busy-stall TICK,MS: from that tick the loop sleeps for MS WITHOUT calling the session (a replay or a slow render on the game thread); only the keepalive thread can keep the peer alive
@@ -456,11 +467,14 @@ int main(int argc, char** argv)
         std::printf("OWN role=%s local_slot=%u ok=%u,%u,%u,%u bad=%u none=%u first_bad=%u ticks=%zu\n", role.c_str(), plan.local_first, ok[0], ok[1], ok[2], ok[3], bad, none, first_bad, pads_of.size());
     }
     std::printf("SUMMARY role=%s slots=%u..%u/%u maxtick=%u rollbacks=%u maxdepth=%u resim=%llu saves=%llu loads=%llu stalls=%u deferred=%llu desync=%d failed=%s "
-                "ref_ticks=%d ref_bad=%d tail_neutral=%d rate=%.3f all_rate=%.3f iters=%llu paced=%llu paced_ms=%llu keepalive_polls=%llu sent=%llu dropped=%llu skipped=%llu round=%d/%d events:%s\n",
+                "ref_ticks=%d ref_bad=%d tail_neutral=%d rate=%.3f all_rate=%.3f iters=%llu paced=%llu paced_ms=%llu keepalive_polls=%llu sent=%llu dropped=%llu skipped=%llu "
+                "rerun_saves=%llu rerun_skipped=%llu at_final=%llu loads_below_ff=%llu loads_at_ff=%llu loads_above_ff=%llu loads_unknown=%llu round=%d/%d events:%s\n",
                 role.c_str(), plan.local_first, plan.local_first + plan.local_count - 1, plan.total_players, max_tick, st.rollbacks, st.max_rollback_frames,
                 (unsigned long long)st.resimulated, (unsigned long long)st.saves, (unsigned long long)st.loads, st.stalls, (unsigned long long)st.deferred,
                 s.first_desync_tick(), s.failed() ? s.failure().c_str() : "-", ref_n, ref_bad, tail_neutral, rate, all_rate, (unsigned long long)iters_after_first_run, (unsigned long long)paced_n, (unsigned long long)paced_ms, (unsigned long long)st.keepalive_polls, (unsigned long long)mux.sent,
-                (unsigned long long)mux.dropped, (unsigned long long)glue.skipped(), round, rounds, evlog.c_str());
+                (unsigned long long)mux.dropped, (unsigned long long)glue.skipped(),
+                (unsigned long long)glue.rerun_commits(), (unsigned long long)glue.rerun_skipped(), (unsigned long long)glue.at_final(),
+                (unsigned long long)loads_below, (unsigned long long)loads_at, (unsigned long long)loads_above, (unsigned long long)loads_unknown, round, rounds, evlog.c_str());
     std::fflush(stdout);
     // two rules for 7: live ticks per iteration (sparse inputs) and Runs (live + replay) per iteration
     const int rc = s.failed() ? 4 : ((min_rate > 0 && rate < min_rate) || (min_all > 0 && all_rate < min_all)) ? 7 : ref_bad ? 5 : 0;

@@ -313,11 +313,16 @@ static void test_gate_precheck()
         FakeGateOps o; o.busy_frozen = 2;
         const jsy::GateResult g = jsy::gate(o, jsy::Mode::Wait, nullptr, 100, off);
         CHECK(g.ok && g.freezes == 3 && o.presamples == 0 && o.spins == 0 && g.first_reasons == (unsigned)jsy::MutexHeld);
+        CHECK(g.pre_wait_reasons == 0);   // no precheck: nothing waited unfrozen
     }
     {   // on: the precheck waits out the unfrozen condition, then ONE freeze passes
         FakeGateOps o; o.busy_unfrozen = 5; o.busy_frozen = 0;
         const jsy::GateResult g = jsy::gate(o, jsy::Mode::Wait, nullptr, 100, on);
         CHECK(g.ok && g.suspended && g.freezes == 1 && o.spins == 5 && g.prechecks == 6 && g.wakes == 5 && o.frozen && o.sampled_frozen_only);
+        // DIAGNOSTIC (test12, rollback cost): the precheck's wait is attributed to the reason that made it wait; the frozen first sample is clean
+        CHECK(g.pre_wait_reasons == (unsigned)jsy::MutexHeld && g.pre_wait_by[1] == 5 && g.first_reasons == 0);
+        unsigned other = 0; for (int b = 0; b < 18; b++) if (b != 1) other += g.pre_wait_by[b];
+        CHECK(other == 0);
     }
     {   // on: a condition only the frozen sample sees is still refused (the frozen judge decides), and the gate retries as before
         FakeGateOps o; o.busy_unfrozen = 0; o.busy_frozen = 2;

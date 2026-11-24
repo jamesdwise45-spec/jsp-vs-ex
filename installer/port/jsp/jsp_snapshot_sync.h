@@ -281,6 +281,11 @@ struct GateResult {
     unsigned retry_immediate = 0, persist[16] = {0}, timeout_by[16] = {0};
     bool site_waited = false, site_gave_up = false;   // SiteMoved blocked at least once / was dropped after Cfg::site_wait_ms
     uint32_t site_tid = 0, site_lr_was = 0, site_lr_now = 0;   // the first moved thread of the first sample that saw one (the log)
+    // DIAGNOSTIC (test12, rollback cost): what the UNFROZEN precheck waited for (Cfg::precheck_us spins, Cfg::prewait_ms waits, gate_ev precheck waits).
+    // pre_wait_by[b] = precheck waits (one spin / one sequence wait each) while reason bit b blocked; pre_wait_reasons = the OR of those reasons.
+    // The frozen first sample (first_reasons) is usually clean because the precheck already waited: this says what the wait was for.
+    unsigned pre_wait_reasons = 0, pre_wait_by[18] = {0};   // 18 = every Reason bit up to SiteMoved
+    void note_pre_wait(unsigned r) { pre_wait_reasons |= r; for (int b = 0; b < 18; b++) if (r & (1u << b)) pre_wait_by[b]++; }
 };
 
 // Ops: bool suspend() / bool resume() (all other threads), void sample(View*) (while suspended: no allocation, no logging), void yield().
@@ -309,7 +314,7 @@ template<class O> auto prewait_(O& ops, const View* saved, const Cfg& cfg, GateR
         g.prechecks++;
         if (!r) return;
         if (std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count() >= (long long)cfg.prewait_ms) return;
-        g.wakes++;
+        g.wakes++; g.note_pre_wait(r);
         if (!ops.wait(s0, 1)) g.wake_timeouts++;
     }
 }
@@ -338,7 +343,7 @@ template<class O> auto precheck_(O& ops, const View* saved, const Cfg& cfg, Gate
         g.prechecks++;
         const double us = std::chrono::duration<double, std::micro>(SC::now() - t0).count();
         if (!r || *used_us + us >= (double)cfg.precheck_us || (max_ms && since_ms >= (long long)max_ms)) { *used_us += us; return; }
-        g.wakes++;
+        g.wakes++; g.note_pre_wait(r);
         ops.spin();
     }
 }
@@ -425,7 +430,7 @@ template<class Ops> GateResult gate_ev(Ops& ops, Mode mode, const View* saved, c
         if (pd.reasons) {
             if (g.wakes >= lim.max_wakes) { g.ok = false; g.wake_stop = true; g.suspended = false; g.reasons = pd.reasons; g.verdict = pd; g.view = pv; return g; }
             if (woke_prev) for (int b = 0; b < 16; b++) if (pd.reasons & prev_reasons & (1u << b)) g.persist[b]++;   // woken by a bump, same reason still there
-            g.wakes++;
+            g.wakes++; g.note_pre_wait(pd.reasons);
             const bool woken = ops.wait(s0, lim.timeout_ms);
             if (!woken) { g.wake_timeouts++; for (int b = 0; b < 16; b++) if (pd.reasons & (1u << b)) g.timeout_by[b]++; }
             woke_prev = woken; prev_reasons = pd.reasons;
