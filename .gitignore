@@ -185,6 +185,8 @@ __pycache__/
 !/installer/tools/net_perf_test.sh
 !/installer/tools/hitch_test.cpp
 !/installer/tools/hitch_test.sh
+!/installer/tools/snapshot_hostthr_test.cpp
+!/installer/tools/snapshot_hostthr_test.sh
 !/installer/tools/native_fight_test.cpp
 !/installer/tools/native_fight_test.sh
 !/installer/tools/discord_test.cpp
@@ -221,6 +223,8 @@ __pycache__/
 !/installer/tools/net_pick_page_test.sh
 !/installer/tools/pick_art_test.cpp
 !/installer/tools/pick_art_test.sh
+!/installer/tools/net_four_test.cpp
+!/installer/tools/net_four_test.sh
 !/installer/tools/net_report_test.cpp
 !/installer/tools/net_report_test.sh
 !/installer/tools/net_repsn_test.cpp

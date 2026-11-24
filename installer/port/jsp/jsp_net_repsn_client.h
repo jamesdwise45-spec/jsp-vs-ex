@@ -125,9 +125,9 @@ public:
         if (!search_done_) return false;
         out = rooms_; search_done_ = false; search_req_ = 0; return true;
     }
-    void create_room(uint32_t flags, const std::string& external, const std::string& member_data) override
+    void create_room(uint32_t flags, const std::string& external, const std::string& member_data, uint8_t max_members) override
     {
-        std::vector<uint8_t> b; b.push_back(2);   // max = 2: a rollback match has two players
+        std::vector<uint8_t> b; b.push_back(max_members);   // 2 for a two-player match; ENHANCEMENT (four players): up to 4 (the server takes any max, re-psn rooms.go)
         put32(b, flags); put_blob(b, external); put_blob(b, std::string()); put_blob(b, member_data);
         room_req_ = c_.load() ? psnr_send(c_.load(), PSNR_CREATE_ROOM, b.data(), (uint32_t)b.size()) : 0;
         if (!room_req_) sticky_fail("re-psn: the room could not be created (the request could not be sent)");
@@ -173,7 +173,41 @@ public:
     bool probed() const { return probe_ok_.load(); }
     std::atomic<uint64_t> relay_tx{0}, relay_rx{0}, relay_rx_dropped{0}, control_dropped{0};   // counters
     int rtt_ms() const { psnr_client* c = c_.load(); return c ? psnr_rtt_ms(c) : -1; }
+    // ---- ENHANCEMENT (four players): one link per other member (RePsnRendezvous mesh mode), next to the single peer above (which the 2-player path keeps using).
+    // A link is relayed only for that member: the tx hook wraps datagrams to ITS endpoint, the rx hook maps its relayed datagrams back to that endpoint. When a member
+    // relays to us first (it never heard our PUNCH), we follow (relay on for that link) if the player allowed the relay: the server only relays between members of one room.
+    void set_link(uint32_t user, const Endpoint& ep, bool relay) override { std::lock_guard<std::mutex> lk(lmu_); MeshLink& l = mesh_[user]; l.ep = ep; l.relay = l.relay || relay; }
+    void punch_link(uint32_t user) override
+    {
+        psnr_client* c = c_.load(); Endpoint ep; bool heard;
+        { std::lock_guard<std::mutex> lk(lmu_); auto it = mesh_.find(user); if (!c || it == mesh_.end()) return; ep = it->second.ep; heard = it->second.heard; }   // never hold lmu_ into the mux (the hooks take them the other way round)
+        // the PUNCH plus one byte of ours: 1 = "I hear you" (both ends are this build: the member records matched). psnr_is_control still matches it; the server never sees it.
+        uint8_t p[PSNR_UDP_PUNCH_LEN + 1]; psnr_punch_packet(c, p); p[PSNR_UDP_PUNCH_LEN] = heard ? 1 : 0; mux_.send_control(ep, p, sizeof p);
+    }
+    unsigned link_seen(uint32_t user) override
+    {
+        std::lock_guard<std::mutex> lk(lmu_); auto it = mesh_.find(user);
+        return it == mesh_.end() ? 0u : (it->second.heard ? 1u : 0u) | (it->second.relay ? 2u : 0u) | (it->second.acked ? 4u : 0u);
+    }
 private:
+    struct MeshLink { Endpoint ep; bool relay = false, heard = false, acked = false; };
+    std::mutex lmu_; std::map<uint32_t, MeshLink> mesh_;   // by user id; the hooks (mux thread) and the pump thread
+    // rx hook: a relayed datagram from member `fu` -> its endpoint (false: not a mesh member, or the relay is not allowed)
+    bool mesh_relay_from(uint32_t fu, Endpoint* ep)
+    {
+        std::lock_guard<std::mutex> lk(lmu_); auto it = mesh_.find(fu);
+        if (it == mesh_.end() || (!it->second.relay && !allow_relay_)) return false;
+        it->second.relay = true; *ep = it->second.ep; return true;
+    }
+    // rx hook: a PUNCH ("PSNR" 02 | user u32, psnr_punch_packet; ours add 1 byte: it hears us) from a member's own endpoint
+    void mesh_heard(const Endpoint& from, const uint8_t* buf, int n)
+    {
+        if (n < (int)PSNR_UDP_PUNCH_LEN || buf[4] != 0x02) return;
+        std::lock_guard<std::mutex> lk(lmu_); auto it = mesh_.find(psnr_get32(buf + 5));
+        if (it != mesh_.end() && it->second.ep == from) { it->second.heard = true; it->second.acked = it->second.acked || (n > (int)PSNR_UDP_PUNCH_LEN && buf[PSNR_UDP_PUNCH_LEN] == 1); }
+    }
+    // tx hook: the user to relay to when `to` is a relayed mesh link's endpoint (0: send direct)
+    uint32_t mesh_relay_to(const Endpoint& to) { std::lock_guard<std::mutex> lk(lmu_); for (const auto& l : mesh_) if (l.second.relay && l.second.ep == to) return l.first; return 0; }
     struct Shared { std::mutex mu; int state = 0; std::string fail; psnr_client* c = nullptr; uint32_t user = 0; uint8_t ip[4] = {}; uint16_t port = 0; bool abandoned = false, taken = false; };   // state: 0 connecting, 1 up, 2 failed
     void sticky_fail(const std::string& why) { sticky_ = why; }
     // Takes the connected client over from the worker (once). True when the client is up.
@@ -194,7 +228,7 @@ private:
     static Endpoint ep_of(const psnr_member& m) { Endpoint e; std::memcpy(&e.ip_be, m.ip, 4); e.port = m.p2p_port; return e; }
     static PsnrMember conv(const psnr_member& m)
     {
-        PsnrMember r; r.user = m.user_id; r.member_id = m.member_id; r.ep = ep_of(m);
+        PsnrMember r; r.user = m.user_id; r.member_id = m.member_id; r.ep = ep_of(m); r.name = m.online_id;
         if (m.data && m.data_len) r.data.assign((const char*)m.data, m.data_len);
         return r;
     }
@@ -215,18 +249,24 @@ private:
                 uint8_t sip[4]; std::memcpy(sip, &from.ip_be, 4);
                 uint32_t fu = 0; const uint8_t* pl = nullptr; size_t pn = 0;
                 if (psnr_relay_unwrap_from(c, sip, from.port, buf, (size_t)n, &fu, &pl, &pn)) {
-                    // only while the relay path is chosen, only from the room's other player
+                    // only while the relay path is chosen, only from the room's other player; four players: from a mesh member, per link
+                    Endpoint mep;
+                    if (pn && !(relay_on_.load() && have_peer_.load() && fu == peer_user_.load()) && mesh_relay_from(fu, &mep)) { std::memmove(buf, pl, pn); n = (int)pn; from = mep; relay_rx++; return 2; }
                     if (!relay_on_.load() || !have_peer_.load() || fu != peer_user_.load() || pn == 0) { relay_rx_dropped++; return 1; }
                     std::memmove(buf, pl, pn); n = (int)pn; from = peer_ep(); relay_rx++; return 2;
                 }
+                mesh_heard(from, buf, n);
                 control_dropped++;   // a PUNCH from the peer, or anything else that starts with "PSNR": never reaches the session
                 return 1;
             },
             [this](const Endpoint& to, const std::vector<uint8_t>& bytes) -> bool {
                 psnr_client* c = c_.load(std::memory_order_acquire);
-                if (!c || !relay_on_.load() || !have_peer_.load() || !(to == peer_ep())) return false;
+                if (!c) return false;
+                const bool single = relay_on_.load() && have_peer_.load() && to == peer_ep();
+                const uint32_t mu = single ? 0 : mesh_relay_to(to);   // four players: a relayed link
+                if (!single && !mu) return false;
                 uint8_t out[UdpMux::kMaxDatagram + 64];
-                const size_t n = psnr_relay_wrap(c, peer_user_.load(), bytes.data(), bytes.size(), out, sizeof out);
+                const size_t n = psnr_relay_wrap(c, single ? peer_user_.load() : mu, bytes.data(), bytes.size(), out, sizeof out);
                 if (!n) return true;   // does not fit: dropped like any lost datagram (never sent direct while the relay is chosen)
                 mux_.send_control(server_ep(), out, n); relay_tx++; return true;
             });

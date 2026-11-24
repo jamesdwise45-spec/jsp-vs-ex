@@ -60,7 +60,8 @@
 #include "jsp_snapshot_sync.h"
 #include "jsp_snapshot_flow.h"
 #include "jsp_thread_registry.h"
-#include "jsp_audit_start.h"   // jau::Starter: the background audit worker's start and the synchronous fallback (registry_audit_tick)
+#include "jsp_snapshot_hostthr.h"   // jsh: GPU driver threads the freeze leaves running (JSP_SNAPSHOT_SKIP_DRIVER)
+#include "jsp_audit_start.h"  // jau::Starter: the background audit worker's start and the synchronous fallback (registry_audit_tick)
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -405,6 +406,108 @@ std::atomic<uint32_t> g_exempt_tid[kExempt];
 void exempt_add(uint32_t tid) { for (auto& e : g_exempt_tid) { uint32_t z = 0; if (e.compare_exchange_strong(z, tid)) return; } }
 bool freeze_exempt(unsigned long tid) { for (const auto& e : g_exempt_tid) { const uint32_t x = e.load(std::memory_order_relaxed); if (!x) return false; if (x == tid) return true; } return false; }
 
+// ENHANCEMENT (rollback latency, test11 freeze tail): GPU driver / graphics runtime threads are left running by the freeze (why it is safe:
+// jsp_snapshot_hostthr.h). JSP_SNAPSHOT_SKIP_DRIVER=0 freezes them as before. Classified outside the freeze (threads running: the start module lookup
+// takes the loader lock, the description allocates); inside the freeze only GetThreadTimes (a plain query, no lock, no allocation) confirms that the
+// handle still names the thread that was classified.
+bool g_skip_drv = true;
+jsh::SkipList g_drv_skip;                          // registry mode: rebuilt by drv_refresh() in prepare(), read by suspend()
+jsh::Ent g_drv_ent[jtr::kSlots];                   // registry mode: per slot (main thread only)
+uint32_t g_drv_pass = 0, g_drv_lines = 0;
+std::atomic<uint32_t> g_drv_left{0};               // threads left running, summed over every freeze pass (logged with the driver lines)
+#ifdef _WIN32
+uint64_t thread_ctime(HANDLE h)
+{
+    FILETIME c{}, e{}, k{}, u{};
+    if (!GetThreadTimes(h, &c, &e, &k, &u)) return 0;
+    return ((uint64_t)c.dwHighDateTime << 32) | c.dwLowDateTime;
+}
+// The class from the start address (ThreadQuerySetWin32StartAddress = 9); `start` gets module+offset for the log.
+jsh::Cls drv_start_class(HANDLE h, char* start, size_t n)
+{
+    std::snprintf(start, n, "?");
+    using Q = LONG(NTAPI*)(HANDLE, int, PVOID, ULONG, PULONG);
+    static const Q q = reinterpret_cast<Q>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationThread")));
+    void* sa = nullptr;
+    if (!q || q(h, 9, &sa, sizeof sa, nullptr) != 0 || !sa) return jsh::Maybe;
+    HMODULE m = nullptr; char path[MAX_PATH] = {0};
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)sa, &m) || !GetModuleFileNameA(m, path, sizeof path)) {
+        std::snprintf(start, n, "0x%llx", (unsigned long long)(uintptr_t)sa);
+        return jsh::Maybe;
+    }
+    const char* b = std::strrchr(path, '\\'); b = b ? b + 1 : path;
+    std::snprintf(start, n, "%s+0x%llx", b, (unsigned long long)((uintptr_t)sa - (uintptr_t)m));
+    return jsh::from_start(b, m == GetModuleHandleA(nullptr));
+}
+// The thread's description in UTF-8 ("" = none or unreadable; Windows 10 1607+, looked up).
+void drv_name(HANDLE h, char* out, size_t n)
+{
+    out[0] = 0;
+    using GTD = HRESULT(WINAPI*)(HANDLE, PWSTR*);
+    static const GTD gtd = reinterpret_cast<GTD>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleA("kernel32.dll"), "GetThreadDescription")));
+    PWSTR w = nullptr;
+    if (!gtd || FAILED(gtd(h, &w)) || !w) return;
+    if (w[0] && WideCharToMultiByte(CP_UTF8, 0, w, -1, out, (int)n, nullptr, nullptr) <= 0) out[0] = 0;
+    LocalFree(w);
+}
+// One line per thread the freeze starts to leave running (threads running; at most 40 per process).
+void drv_log(unsigned long tid, HANDLE h, const char* start, const char* name)
+{
+    if (g_drv_lines >= 40) return;
+    g_drv_lines++;
+    std::fprintf(stderr, "[snap] freeze leaves a GPU driver thread running: tid %lu start %s name \"%s\" prio %d (%u left running so far over all freeze passes; JSP_SNAPSHOT_SKIP_DRIVER=0 freezes it)\n",
+                 tid, start, name[0] ? name : "unnamed", GetThreadPriority(h), g_drv_left.load(std::memory_order_relaxed));
+}
+// Toolhelp mode (collect_threads, threads running): classify one thread now, with no cache. true = leave it running.
+bool drv_classify_now(unsigned long tid, HANDLE h)
+{
+    char start[160], name[96];
+    jsh::Cls c = drv_start_class(h, start, sizeof start);
+    name[0] = 0;
+    if (c == jsh::Maybe) { drv_name(h, name, sizeof name); if (jsh::driver_name(name)) c = jsh::Driver; }
+    if (c != jsh::Driver) return false;
+    static uint32_t seen[64]; static int ns = 0;   // log each tid once
+    bool known = false;
+    for (int i = 0; i < ns; i++) known = known || seen[i] == (uint32_t)tid;
+    if (!known) { if (ns < 64) seen[ns++] = (uint32_t)tid; if (!name[0]) drv_name(h, name, sizeof name); drv_log(tid, h, start, name); }
+    return true;
+}
+// Registry mode, prepare() (threads running, outside any freeze): classify the LIVE slots that are new since the last pass and rebuild the skip list.
+// A slot read here can change under us (its thread ends): the creation time is read again after every query, and the freeze compares it a last time.
+void drv_refresh()
+{
+    g_drv_skip.clear();
+    g_drv_pass++;
+    jtr::Registry& R = jsp_thread_registry();
+    for (int i = 0; i < jtr::kSlots; i++) {
+        jsh::Ent& e = g_drv_ent[i];
+        if (R.s[i].state.load(std::memory_order_acquire) != jtr::Live) { e = jsh::Ent(); continue; }
+        const uint32_t tid = R.s[i].tid; void* const h = R.s[i].h;
+        if (R.s[i].state.load(std::memory_order_acquire) != jtr::Live || !h) { e = jsh::Ent(); continue; }
+        char start[160] = "?", name[96] = "";
+        if (e.cls == jsh::Unknown || e.tid != tid || e.h != h) {
+            e = jsh::Ent(); e.tid = tid; e.h = h;
+            e.ctime = thread_ctime((HANDLE)h);
+            e.cls = e.ctime ? drv_start_class((HANDLE)h, start, sizeof start) : jsh::Other;
+            if (thread_ctime((HANDLE)h) != e.ctime) { e = jsh::Ent(); continue; }   // the handle changed meaning under the query: classify again next pass
+        }
+        if (jsh::want_name_check(e, g_drv_pass)) {
+            drv_name((HANDLE)h, name, sizeof name);
+            if (thread_ctime((HANDLE)h) != e.ctime) { e = jsh::Ent(); continue; }
+            jsh::name_checked(e, jsh::driver_name(name));
+        }
+        if (e.cls != jsh::Driver) continue;
+        if (!e.logged) {
+            e.logged = true;
+            if (!std::strcmp(start, "?")) (void)drv_start_class((HANDLE)h, start, sizeof start);
+            if (!name[0]) drv_name((HANDLE)h, name, sizeof name);
+            drv_log(tid, (HANDLE)h, start, name);
+        }
+        g_drv_skip.add(tid, h, e.ctime);
+    }
+}
+#endif
+
 struct Th { void* h; unsigned long tid; bool paused = false, context = false; uintptr_t ip = 0; bool gone = false;
             float stop_ms = 0, ctx_ms = 0; };   // DIAGNOSTIC (test10, freeze tail): this freeze pass's SuspendThread + GetThreadContext time, of it GetThreadContext
 // Why the last enumeration / freeze failed (raw numbers; formatted only after the threads run again). step: 1 snapshot, 2 enumeration end, 3 OpenThread, 4 SuspendThread, 5 GetThreadContext.
@@ -440,6 +543,7 @@ std::vector<Th> collect_threads(bool* complete, PauseFail* why = nullptr, unsign
     for (; found; found = Thread32Next(s, &t)) {
         if (t.th32OwnerProcessID != pid || t.th32ThreadID == self || freeze_exempt(t.th32ThreadID)) continue;
         HANDLE h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, t.th32ThreadID);
+        if (h && g_skip_drv && drv_classify_now(t.th32ThreadID, h)) { CloseHandle(h); g_drv_left.fetch_add(1, std::memory_order_relaxed); continue; }   // a GPU driver thread: left running (test11)
         if (h) v.push_back({h, t.th32ThreadID});
         else {
             const DWORD e = GetLastError();
@@ -576,6 +680,9 @@ struct Suspended {
             jtr::Registry& R = jsp_thread_registry();
             R.reclaim([](void* h) { jsp_thread_registry_close(h); }, [](void* h) { return jsp_thread_registry_ended(h); });
             th.clear(); th.reserve(jtr::kSlots); complete = true;
+#ifdef _WIN32
+            if (g_skip_drv) drv_refresh(); else g_drv_skip.clear();   // test11: the GPU driver threads this freeze leaves running
+#endif
             return;
         }
         ppu_alive_at_listing = ppu_alive_mask(); th = collect_threads(&complete, &fail, &gone_n);
@@ -600,7 +707,13 @@ struct Suspended {
             const size_t n = R.copy_live(buf, jtr::kSlots, (uint32_t)GetCurrentThreadId(), &ovf);
             if (ovf) { fail = {7, 0, 2}; return false; }
             th.clear();
-            for (size_t i = 0; i < n; i++) if (!freeze_exempt(buf[i].tid)) th.push_back({buf[i].h, buf[i].tid});   // capacity reserved in prepare(); exempt threads stay running
+            for (size_t i = 0; i < n; i++) {
+                if (freeze_exempt(buf[i].tid)) continue;   // exempt threads stay running
+                // test11: a GPU driver thread classified by drv_refresh() stays running; the creation time proves the handle still names that thread
+                // (GetThreadTimes: a plain query, no lock, no allocation)
+                if (g_drv_skip.n && g_drv_skip.skip(buf[i].tid, buf[i].h, thread_ctime((HANDLE)buf[i].h))) { g_drv_left.fetch_add(1, std::memory_order_relaxed); continue; }
+                th.push_back({buf[i].h, buf[i].tid});   // capacity reserved in prepare()
+            }
             ppu_alive_at_listing = ppu_alive_mask();
         }
         boost.begin(boost_on);
@@ -1907,6 +2020,8 @@ extern "C" int jsp_snapshot_init(uint32_t hash_start, uint32_t hash_n)
         }
     }
     ev = std::getenv("JSP_SNAPSHOT_LS"); g_ls = ev && *ev && ev[0] != '0';
+    ev = std::getenv("JSP_SNAPSHOT_SKIP_DRIVER"); g_skip_drv = !(ev && *ev == '0');   // test11 freeze tail (jsp_snapshot_hostthr.h)
+    std::fprintf(stderr, "[snap] GPU driver threads: %s (JSP_SNAPSHOT_SKIP_DRIVER)\n", g_skip_drv ? "left running by the freeze (=0 freezes them, the old way)" : "frozen with the others (=0)");
     ev = std::getenv("JSP_SNAPSHOT_DIRTY"); g_dirty = ev && *ev && ev[0] != '0';
     ev = std::getenv("JSP_SNAPSHOT_WW"); g_ww = ev && *ev && ev[0] != '0' ? (ev[0] == '2' ? 2 : 1) : 0;
     ev = std::getenv("JSP_SNAPSHOT_WW_DEPTH"); if (ev && *ev) g_ww_depth = (uint32_t)std::strtoul(ev, nullptr, 10);

@@ -30,14 +30,18 @@ constexpr uint32_t kRoomFlagRollback = 0x40000000u;
 // ENHANCEMENT (native-room pairing, jsp_net_game.cpp native_poll): an optional pair key, the id of the game's own Online Battle room (Matching2) both players are in,
 // appended as ";pair=<16 hex digits>". A record with a pair key matches only the same build AND the same key: a joiner takes only the rollback room of ITS native room,
 // a host refuses a member from another native room. pair 0 = the plain record (the start-up and lobby paths, unchanged).
-inline std::string make_record(uint32_t build, uint64_t pair = 0)
+// ENHANCEMENT (4-player online, review): the rollback player count of a 3-4 player mesh, appended as ";n=<digit>" (2 players: nothing, the record is byte for byte
+// the old one). A client joins only a host room planned for the same count, so a host's stale 2-player room (or a 3-player one after a 4th joined) is never taken.
+inline std::string make_record(uint32_t build, uint64_t pair = 0, int players = 2)
 {
     char b[64];
     if (pair) std::snprintf(b, sizeof b, "rb=1;ver=%08x;pair=%016llx", (unsigned)build, (unsigned long long)pair);
     else std::snprintf(b, sizeof b, "rb=1;ver=%08x", (unsigned)build);
-    return b;
+    std::string s = b;
+    if (players > 2 && players <= 4) s += ";n=" + std::to_string(players);
+    return s;
 }
-inline bool record_matches(const std::string& blob, uint32_t build, uint64_t pair = 0) { return blob == make_record(build, pair); }
+inline bool record_matches(const std::string& blob, uint32_t build, uint64_t pair = 0, int players = 2) { return blob == make_record(build, pair, players); }
 namespace detail {
 inline bool lower_hex(const std::string& s, size_t from, size_t n, uint64_t* out)
 {
@@ -52,8 +56,11 @@ inline bool lower_hex(const std::string& s, size_t from, size_t n, uint64_t* out
 }
 }  // namespace detail
 // The build word (and the pair key, 0 for a plain record) of a well-formed record (for the "another version was seen" hint); false for anything else.
-inline bool record_build(const std::string& blob, uint32_t* build, uint64_t* pair = nullptr)
+inline bool record_build(const std::string& blob_in, uint32_t* build, uint64_t* pair = nullptr, int* players = nullptr)
 {
+    std::string blob = blob_in; int np = 2;   // ENHANCEMENT (4-player online): an ";n=D" tail (make_record)
+    if (blob.size() >= 4 && blob.compare(blob.size() - 4, 3, ";n=") == 0 && blob.back() >= '3' && blob.back() <= '4') { np = blob.back() - '0'; blob.resize(blob.size() - 4); }
+    if (players) *players = np;
     const bool plain = blob.size() == 17, paired = blob.size() == 39 && blob.compare(17, 6, ";pair=") == 0;
     if ((!plain && !paired) || blob.compare(0, 9, "rb=1;ver=") != 0) return false;
     uint64_t v = 0, k = 0;
@@ -122,15 +129,29 @@ inline std::string meet_advice(uint32_t build, int window_ms)
 
 // Field widths follow re-psn docs/api.md "Rooms" (v0.8.0): room ids are u64, member ids u16, user ids u32. ROOM_LIST names the owner by online id (no user id).
 struct PsnrRoom { uint64_t id = 0; uint32_t flags = 0; std::string external; uint32_t owner = 0 /* user id when known, 0 from ROOM_LIST */; uint8_t members = 0, max_members = 0; std::string owner_name; };
-struct PsnrMember { uint32_t user = 0; uint16_t member_id = 0; Endpoint ep; std::string data; };
+struct PsnrMember { uint32_t user = 0; uint16_t member_id = 0; Endpoint ep; std::string data; std::string name /* online id */; };
+// ENHANCEMENT (four players): a rollback client's online name as the players know it (rollback_name undone: "Bob-rb" -> "Bob", a hashed long name keeps its 11 characters).
+inline std::string player_label(const std::string& rb)
+{
+    if (rb.size() > 3 && rb.compare(rb.size() - 3, 3, "-rb") == 0) return rb.substr(0, rb.size() - 3);
+    if (rb.size() == 16 && rb[11] == '-') return rb.substr(0, 11) + "...";
+    return rb.empty() ? std::string("a player") : rb;
+}
+// "Bob", "Bob and Carol", "Bob, Carol and Dan"
+inline std::string name_list(const std::vector<std::string>& v)
+{
+    std::string s;
+    for (size_t i = 0; i < v.size(); i++) s += (i == 0 ? "" : i + 1 == v.size() ? " and " : ", ") + v[i];
+    return s;
+}
 
 // ROOM_LIST entries a rollback client may join: the flag bit, the same build record, and not full. Sorted by room id (the first is the oldest).
 // pair != 0 (native-room pairing): only the rooms whose record carries that pair key (another native room's rollback room is never joined).
-inline std::vector<PsnrRoom> filter_rooms(const std::vector<PsnrRoom>& all, uint32_t build, uint64_t pair = 0)
+inline std::vector<PsnrRoom> filter_rooms(const std::vector<PsnrRoom>& all, uint32_t build, uint64_t pair = 0, int players = 2)
 {
     std::vector<PsnrRoom> r;
     for (const PsnrRoom& x : all)
-        if ((x.flags & kRoomFlagRollback) && record_matches(x.external, build, pair) && x.members < x.max_members) r.push_back(x);
+        if ((x.flags & kRoomFlagRollback) && record_matches(x.external, build, pair, players) && x.members < x.max_members) r.push_back(x);
     std::sort(r.begin(), r.end(), [](const PsnrRoom& a, const PsnrRoom& b) { return a.id < b.id; });
     return r;
 }
@@ -160,11 +181,16 @@ public:
     virtual uint32_t self_user() = 0;
     virtual bool relay_offered() = 0;            // HELLO_ACK flag bit 0
     virtual bool search(std::vector<PsnrRoom>& out) = 0;   // true when a ROOM_LIST answer is available (rooms searched with the rollback flag)
-    virtual void create_room(uint32_t flags, const std::string& external, const std::string& member_data) = 0;
+    virtual void create_room(uint32_t flags, const std::string& external, const std::string& member_data, uint8_t max_members) = 0;
     virtual void join_room(uint64_t room_id, const std::string& member_data) = 0;
     virtual bool poll_event(PsnrEvent& ev) = 0;
     virtual void send_punch(const Endpoint& to) = 0;   // PUNCH from the P2P socket (our mux)
     virtual void leave_room() = 0;
+    // ENHANCEMENT (four players, mesh): one link per other member, by user id. relay is sticky (never turned off again).
+    virtual void set_link(uint32_t user, const Endpoint& ep, bool relay) { (void)user; (void)ep; (void)relay; }
+    virtual void punch_link(uint32_t user) { (void)user; }                 // a PUNCH to that member's endpoint (saying whether we hear it)
+    // bit 0: its PUNCH arrived from its endpoint; bit 1: the link is relayed (by us, or it relays to us); bit 2: its PUNCH says it hears ours
+    virtual unsigned link_seen(uint32_t user) { (void)user; return 0; }
 };
 
 enum class Path { None, Punch, Direct, Relay };
@@ -202,7 +228,19 @@ public:
         int lookup_every_ms = kLookupEveryMs;   // joiner: the pause between two room lists without a matching room
         int progress_every_ms = kProgressEveryMs;
         std::string release;            // this game's release name (release.txt; "" = a local build): the version mismatch message
+        // ENHANCEMENT (four players, DESIGN 4P section 3: full mesh, the server relay per link). players = the room's size (JSP_ROLLBACK_MAX_PLAYERS caps it in the glue).
+        // 2 = the code path above, unchanged. 3..4 = mesh: everyone waits for players-1 other members, then one link per member (punch, relay per link), then make_mesh_inner.
+        uint8_t players = 2;
+        int link_ms = 10000;                   // mesh: all links up and the inner plan ready within this, from "everyone is in the room" (6 links of 4 players: about 10 s worst case)
+        std::vector<std::string> expect_names; // mesh, optional: the other players' rollback online names, so a wait that ends names who never joined
     };
+    // ENHANCEMENT (four players): one link per other member (mesh mode)
+    struct LinkInfo { uint32_t user = 0; uint16_t member_id = 0; Endpoint ep; std::string name; Path path = Path::Punch; };
+    // What the N-peer HELO/PLAN (jsp_net_session, piece 1) is built from, once every link is up. Endpoints are THIS PC's view of the members (re-psn may hand a member on the
+    // same public address a LAN address); relayed datagrams arrive rewritten to these endpoints. members: member-id order, self included; the owner hosts; session id = room id.
+    struct MeshStart { bool host = false; uint64_t session_id = 0; uint8_t local_count = 1; uint32_t self_user = 0, owner_user = 0; std::vector<PsnrMember> members; };
+    std::function<IRendezvous*(const MeshStart&)> make_mesh_inner;
+    std::function<void(const LinkInfo&)> on_link;   // mesh: a link became direct or relayed (log)
     RePsnRendezvous(IPsnrTransport& t, UdpMux& mux, MessageHub& hub, const Config& c) : t_(t), mux_(mux), hub_(hub), c_(c) {}
     // when the path changes: Relay means the mux must send through the server from now on (psnr_relay_wrap / psnr_relay_unwrap_from); the glue sets that up
     std::function<void(Path, uint32_t peer_user)> on_path;
@@ -230,7 +268,7 @@ public:
         if (state_ < kPunch) progress(t);   // after the connect step: a game that is already connected never reports "connecting"
         if (state_ == kConnect) return 0;
         if (state_ == kLookup) {
-            if (c_.host) { t_.create_room(kRoomFlagRollback, make_record(c_.build, c_.pair), make_record(c_.build, c_.pair)); state_ = kRoom; }   // listed until the host leaves (give-up, failure or the end)
+            if (c_.host) { t_.create_room(kRoomFlagRollback, make_record(c_.build, c_.pair, np_()), make_record(c_.build, c_.pair, np_()), mesh() ? c_.players : 2); state_ = kRoom; }   // listed until the host leaves (give-up, failure or the end)
             else {
                 if (next_lookup_ && t < next_lookup_) return 0;   // the last list had no room for us: wait before asking again
                 std::vector<PsnrRoom> all;
@@ -251,13 +289,13 @@ public:
                             return 0;
                         }
                     }
-                const std::vector<PsnrRoom> ok = filter_rooms(all, c_.build, c_.pair);
+                const std::vector<PsnrRoom> ok = filter_rooms(all, c_.build, c_.pair, np_());
                 uint64_t pick = 0;
                 if (c_.join_room) { for (const auto& r : ok) if (r.id == c_.join_room) pick = r.id;
                     if (!pick) return fail("re-psn: that room is gone, full, or from another build"); }
                 else if (!ok.empty()) pick = ok.front().id;
                 else { next_lookup_ = t + (uint64_t)c_.lookup_every_ms; return 0; }   // no host yet (it may start later): keep looking until the window ends
-                t_.join_room(pick, make_record(c_.build, c_.pair)); room_ = pick; state_ = kRoom;
+                t_.join_room(pick, make_record(c_.build, c_.pair, np_())); room_ = pick; state_ = kRoom;
             }
         }
         PsnrEvent ev;
@@ -271,17 +309,20 @@ public:
                 }
             }
             else if (ev.kind == PsnrEvent::MemberLeft) {
+                if (mesh() && state_ >= kPunch)
+                    for (const LinkInfo& l : links_) if (l.user == ev.user) { if (const int r = links_failed(l.path == Path::Punch ? 0 : l.user /* its own link still down: name it too */, l.name)) return r; return fail("re-psn: " + l.name + " left the room"); }
                 members_.erase(std::remove_if(members_.begin(), members_.end(), [&](const PsnrMember& m) { return m.user == ev.user; }), members_.end());
                 if (ev.user == peer_user_ && state_ >= kPunch) return fail("re-psn: the other player left the room");
                 if (ev.user == owner_ && !c_.host) return fail("re-psn: the host left the room");   // a session cannot move its host
             }
         }
+        if (mesh()) return mesh_step(t);
         if (state_ == kRoom && room_) {
             // every OTHER member's record is checked; a mismatching member is refused (never played with). The host waits for the first match, the client looks at the owner.
             for (const PsnrMember& m : members_) {
                 if (m.user == t_.self_user()) continue;
                 { uint32_t b = 0; if (other_version(m, &b)) return fail_version(b); }   // ENHANCEMENT (version mismatch message): a player of our native room on another version
-                if (!record_matches(m.data, c_.build, c_.pair)) {
+                if (!record_matches(m.data, c_.build, c_.pair, np_())) {
                     if (!c_.host) return fail("re-psn: the host's build or settings record does not match (refused)");
                     if (!rejected_.count(m.user)) { rejected_.insert(m.user); ++rejected_members; t_.kick(m.user); }   // never played with, and removed from the room so it cannot hold the slot
                     continue;
@@ -325,7 +366,115 @@ public:
     const std::string& notice1() const { return n1_; }
     const std::string& notice2() const { return n2_; }
     bool version_mismatch() const { return mismatch_; }   // the failure was the other player's version: notice1() is version_mismatch_text, no retry can help
+    // ENHANCEMENT (four players): this PC's links (mesh; empty with 2 players) and the "Rollback on" line of the screen
+    const std::vector<LinkInfo>& links() const { return links_; }
+    std::string path_line() const
+    {
+        if (!mesh()) return path_ == Path::Relay ? std::string("Rollback on: connected through the server") : std::string("Rollback on: ") + path_name(path_) + " connection";
+        size_t relayed = 0; for (const LinkInfo& l : links_) relayed += l.path == Path::Relay;
+        if (!relayed) return "Rollback on: direct connection";
+        return "Rollback on: " + std::to_string(relayed) + " of " + std::to_string(links_.size()) + " links through the server";
+    }
 private:
+    bool mesh() const { return c_.players > 2; }
+    int np_() const { return mesh() ? c_.players : 2; }   // ENHANCEMENT (4-player online): the count in the room record (make_record)
+    // ---- ENHANCEMENT (four players): the mesh. Everyone waits for players-1 other members with a matching record (a refused member is kicked by the owner and named),
+    // then punches every member; a link is Direct when that member's PUNCH arrived from its room endpoint AND says it hears ours (one-way is not direct), Relay after
+    // punch_ms (or as soon as the member relays to us)
+    // when allowed and offered. Once every link is up, make_mesh_inner runs the N-peer HELO/PLAN. One bound (link_ms) from "all present" to the plan.
+    int mesh_step(uint64_t t)
+    {
+        const uint32_t self = t_.self_user();
+        if (state_ == kRoom && room_) {
+            std::vector<PsnrMember> ok; bool owner_ok = c_.host;
+            for (const PsnrMember& m : members_) {
+                if (m.user == self) { ok.push_back(m); continue; }
+                { uint32_t b = 0; if (other_version(m, &b)) return fail_version(b); }   // ENHANCEMENT (version mismatch message): a player of our native room on another version: no mesh can run
+                if (!record_matches(m.data, c_.build, c_.pair, np_())) {
+                    if (!c_.host && m.user == owner_) return fail("re-psn: the host's build or settings record does not match (refused)");
+                    if (c_.host && !rejected_.count(m.user)) { rejected_.insert(m.user); ++rejected_members; refused_.push_back(member_text(m)); t_.kick(m.user); }
+                    continue;   // a client leaves a refused member to the owner's kick
+                }
+                if (m.ep.port == 0) continue;
+                owner_ok = owner_ok || m.user == owner_;
+                ok.push_back(m);
+            }
+            if (!owner_ok || ok.size() < c_.players) return 0;
+            std::sort(ok.begin(), ok.end(), [](const PsnrMember& a, const PsnrMember& b) { return a.member_id < b.member_id; });
+            ok.resize(c_.players);
+            mesh_.host = c_.host; mesh_.session_id = room_; mesh_.local_count = c_.local_count; mesh_.self_user = self; mesh_.owner_user = c_.host ? self : owner_; mesh_.members = ok;
+            local_index_ = player_index(ok, self);
+            const bool force = c_.force_relay && c_.allow_relay && t_.relay_offered();   // TEST ONLY: see Config::force_relay
+            path_ = Path::Punch; punch_start_ = t; last_punch_ = 0; state_ = kPunch;
+            for (const PsnrMember& m : ok) {
+                if (m.user == self) continue;
+                LinkInfo l; l.user = m.user; l.member_id = m.member_id; l.ep = m.ep; l.name = player_label(m.name);
+                t_.set_link(l.user, l.ep, false); links_.push_back(l);
+                if (force) set_link_path(links_.back(), Path::Relay);
+            }
+        }
+        if (state_ != kPunch) return 0;
+        const bool relay_ok = c_.allow_relay && t_.relay_offered();
+        bool all = true;
+        for (LinkInfo& l : links_) {
+            const unsigned s = t_.link_seen(l.user);
+            if (l.path != Path::Relay && (s & 2)) set_link_path(l, Path::Relay);   // it relays to us (it never heard us): we relay to it too
+            else if (l.path == Path::Punch && (s & 5) == 5) { set_link_path(l, Path::Direct); t_.punch_link(l.user); }   // both ways; tell it at once that we hear it too
+            else if (l.path == Path::Punch && relay_ok && t - punch_start_ > (uint64_t)c_.punch_ms) set_link_path(l, Path::Relay);
+            all = all && l.path != Path::Punch;
+        }
+        if (!last_punch_ || t - last_punch_ >= 200) { for (const LinkInfo& l : links_) if (l.path != Path::Relay) t_.punch_link(l.user); last_punch_ = t; }   // direct ones too: the member must hear us
+        if (all && !inner_any_) {
+            if (!make_mesh_inner) return fail("re-psn: the " + std::to_string(c_.players) + "-player session layer is not available in this build");
+            inner_any_.reset(make_mesh_inner(mesh_));
+            if (!inner_any_) return fail("re-psn: the " + std::to_string(c_.players) + "-player session could not be set up");
+        }
+        if (inner_any_) {
+            const int r = inner_any_->poll();
+            if (r == 1) { plan_ = inner_any_->plan(); ch_ = inner_any_->peer_channel(); state_ = kDone; return 1; }
+            if (r < 0) return fail(inner_any_->error());
+        }
+        if (t - punch_start_ <= (uint64_t)c_.link_ms) return 0;
+        if (const int r = links_failed(0, std::string())) return r;
+        return fail("re-psn: the players did not finish the start handshake within " + window_words(c_.link_ms));
+    }
+    // The links still punching (but `gone`) as the failure, naming those players; 0 when none is down. left: the member that gave up first (its leave ends it here).
+    int links_failed(uint32_t gone, const std::string& left)
+    {
+        std::vector<std::string> down; for (const LinkInfo& l : links_) if (l.path == Path::Punch && l.user != gone) down.push_back(l.name);
+        if (down.empty()) return 0;
+        const std::string why = !c_.allow_relay ? "relay is not allowed in the settings" : !t_.relay_offered() ? "this server offers no relay" : "not even through the server";
+        fail("re-psn: could not connect to " + name_list(down) + (left.empty() ? " within " + window_words(c_.link_ms) : std::string()) + " (" + why + (left.empty() ? "" : "; " + left + " gave up") + ")");
+        n1_ = "Rollback could not start: could not connect to " + name_list(down) + ".";
+        n2_ = c_.allow_relay ? "That player's network blocks the connection." : "Allowing the connection through the server in the online settings may help.";
+        return -1;
+    }
+    void set_link_path(LinkInfo& l, Path p)
+    {
+        l.path = p;
+        if (p == Path::Relay) t_.set_link(l.user, l.ep, true);
+        bool any_relay = false, all_direct = true;
+        for (const LinkInfo& x : links_) { any_relay = any_relay || x.path == Path::Relay; all_direct = all_direct && x.path == Path::Direct; }
+        path_ = any_relay ? Path::Relay : all_direct ? Path::Direct : Path::Punch;
+        if (on_link) on_link(l);
+    }
+    std::string member_text(const PsnrMember& m) const
+    {
+        uint32_t b = 0; uint64_t k = 0;
+        if (!record_build(m.data, &b, &k)) return player_label(m.name) + " (another game or setting)";
+        return player_label(m.name) + (b != c_.build ? " (build " + build_hex(b) + ")" : " (another room)");
+    }
+    // mesh, room phase: who is not (yet) in the room with a matching record
+    std::string missing_text() const
+    {
+        size_t have = 0; std::set<std::string> in;
+        for (const PsnrMember& m : members_) if (m.user == t_.self_user() || (record_matches(m.data, c_.build, c_.pair, np_()) && m.ep.port)) { ++have; in.insert(m.name); }
+        std::vector<std::string> miss; for (const std::string& n : c_.expect_names) if (!in.count(n)) miss.push_back(player_label(n));
+        std::string s = std::to_string(have) + " of " + std::to_string(c_.players) + " players";
+        if (!miss.empty()) s += " (missing: " + name_list(miss) + ")";
+        if (!refused_.empty()) s += " (refused, another version: " + name_list(refused_) + ")";
+        return s;
+    }
     enum { kConnect = 0, kLookup, kRoom, kPunch, kDone, kFailed };
     int fail(const std::string& why) { err_ = why; n1_ = "Rollback could not start: " + why; n2_.clear(); state_ = kFailed; t_.leave_room(); return -1; }
     // A member of our native room (the same pair key) whose record carries another build word.
@@ -347,6 +496,7 @@ private:
         std::string what;
         if (state_ == kConnect) what = "the online server did not answer within " + window_words(c_.give_up_ms);
         else if (!c_.host && state_ == kLookup) what = "no host with this version found within " + window_words(c_.give_up_ms) + (other_builds_.empty() ? std::string() : " (" + other_builds_text() + ")");
+        else if (mesh() && state_ == kRoom) what = "only " + missing_text() + " in the room within " + window_words(c_.give_up_ms);
         // ENHANCEMENT (version mismatch message): a paired host knows the other player is in its native room; a joiner of a build before 0.7.0-test4 that
         // runs another version never joins (it only says so on its own screen), so that is the likely reason
         else if (c_.host && c_.pair) what = "the other player probably runs a different version (the main menu shows it), or their online connection failed";
@@ -378,6 +528,7 @@ private:
         const std::string b = "build " + build_hex(c_.build);
         std::string line, n1, n2;
         if (state_ == kConnect) { line = "re-psn: connecting to the server (" + w + ", " + b + ")"; n1 = "Rollback: connecting to the online server (" + w + ")."; }
+        else if (mesh() && state_ == kRoom) { line = "re-psn: room " + std::to_string((unsigned long long)room_) + ", " + missing_text() + " (" + w + ", " + b + ")"; n1 = "Rollback: waiting for the other players (" + w + ")."; }
         else if (c_.host) {
             line = "re-psn: room open, waiting for a player with " + b + " (" + w + (rejected_members ? ", " + std::to_string(rejected_members) + " with another version refused" : "") + ")";
             n1 = "Rollback: room open, waiting for the other player (" + w + ").";
@@ -403,6 +554,7 @@ private:
     uint32_t mm_build_ = 0; uint64_t mm_until_ = 0; bool mismatch_ = false;   // the joiner's one join of the other version's room; the failure was a version mismatch
     uint64_t room_ = 0; uint32_t owner_ = 0, peer_user_ = 0; int local_index_ = -1; bool relay_ = false;
     std::vector<PsnrMember> members_; PsnrMember peer_; std::set<uint32_t> rejected_;
+    std::vector<LinkInfo> links_; MeshStart mesh_; std::unique_ptr<IRendezvous> inner_any_; std::vector<std::string> refused_;   // mesh
     std::unique_ptr<DirectRendezvous> inner_; SessionPlan plan_; std::string err_; MessageChannel* ch_ = nullptr; Path path_ = Path::None;
 };
 

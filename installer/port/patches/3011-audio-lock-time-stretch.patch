@@ -1,0 +1,441 @@
+Patch 3011: the tick-locked audio's output changes speed without changing pitch (WSOLA time stretch in place of the linear resampler; AUDIO_LOCK_STRETCH=0 turns it off).
+
+Why: the output plays at a rate of 0.55 to 1.1 (3007 feedback, 3008 feed-forward, 3009/3010 slow pace and refill), and the linear resampler moved the
+pitch with it: a 3010 refill at +6.25 % was a semitone flat, the slow pace at 0.6 almost a fifth.
+
+Output only (blocks mixed, read index and notify events are exactly as in 3005; the 12 ms concealment, the gap line and every 3007-3010 counter are
+unchanged; with AUDIO_LOCK_STRETCH=0 the output is 3010's, byte for byte):
+- each block's input goes into a static ring (4096 frames); grains of 480 frames (10 ms, periodic Hann) are overlap-added every 240 output frames,
+  each one's input start moving by 240 x the rate from the last nominal start, then up to 200 frames (4.2 ms) either way to where it best continues
+  the grain before (normalised cross-correlation of the overlap on L+R: every 4th offset on every 2nd frame, then +-3 at every frame);
+- at rate 1 the output is the input sample for sample; the ring holds about 9 ms more delay than 3010 (the device level control is unchanged);
+- a block puts out 0, 1 or 2 grains (240 frames each); a concealment goes on until a block has real frames, then crossfades as before; a refill's
+  debt (3010) is paid by the feedback's share, as on the linear path;
+- the step is clamped at 0.533 (a block's input in two grains): with AUDIO_LOCK_SLOW_MIN 55 and the +8 % skew it could reach 0.509, the ring fell
+  behind and a guard skipped ~50 ms. The guard stays and logs once if it ever fires;
+- no allocation, no lock: every buffer is static, the work is on the mix thread: about 50-80 us per burst on the test PC;
+- the "[audio-lock]" line keeps every field and appends "time stretch: N grains, M blocks at the slowest step, pitch-preserving (WSOLA)|off,
+  linear resampler (...)";
+- tests: libs/audio/tests/test_audio_lock_race.c part 7 drives the real lk_submit_block on a fake device that records what it gets: a 440 Hz sine
+  stays at 440 Hz at rates 0.6, 1/1.0625 and 1.032 (the linear resampler gives 264, 414 and 454), its purity per 100 ms stays over 0.999, the largest
+  sample-to-sample step stays at the sine's own (no click at a grain or block join), a 0.2-4 kHz chirp likewise, the length is input / rate; rate 1
+  is the input exactly; the clamped step 0.509 -> 0.533 skips nothing; CPU per burst (fails only over 2 ms: wall clock on a shared machine); part 6's fights with it on (no more gaps than without). Parts 1-6 run with AUDIO_LOCK_STRETCH=0 (3010's
+  numbers). AUDIO_LOCK_WAV_DIR=dir writes a test signal (an arpeggio, a vibrato tone, clicks, a chirp) before and after 0.6 and 1.0625, linear and
+  WSOLA. audio_lock_measure.c prints the output's CPU per burst.
+
+diff --git a/libs/audio/cellAudio.c b/libs/audio/cellAudio.c
+index f8489f5..ac6165f 100644
+--- a/libs/audio/cellAudio.c
++++ b/libs/audio/cellAudio.c
+@@ -1055,6 +1055,90 @@ static void lk_slow_burst(double ff, int level, int cushion)
+     if (s_lk_slow_out < s_lk_slow_lo) s_lk_slow_lo = s_lk_slow_out;
+ }
+ /* The rate the resampler plays this block at: from where the last burst left it to s_lk_slow_out over the first 6 blocks of the burst. */
++/* J-Stars patch 3011 (AUDIO_LOCK_STRETCH=0 turns it off: 3010 as it was): a pitch-preserving time stretch (WSOLA) in place of the linear resampler.
++ * The rate the output plays at (3007 feedback, 3008 feed-forward, 3009/3010 slow pace and refill: 0.55 to 1.1) changed the pitch with the speed: a
++ * refill at +6.25 % was a semitone flat, the slow pace at 0.6 almost a fifth. Now each block's input goes into a ring; grains of LK_WS_W frames with a
++ * periodic Hann window are overlap-added every LK_WS_HS output frames (50 %, so the windows sum to exactly 1), and each grain's input start moves
++ * by LK_WS_HS x the rate (the analysis hop) from the last one's nominal start, then up to LK_WS_TOL frames either way to the place that best continues
++ * the grain before it (normalised cross-correlation of the overlap, mono: a coarse pass every 4th offset on every 2nd frame, then +-3 at every
++ * frame). At rate 1 the best place is the nominal one and the output is the input, delayed. Costs: about LK_WS_TOL + LK_WS_W - LK_WS_HS frames
++ * (9 ms) of delay held in the ring (the device level control is unchanged; the delay adds to it), and a few hundred us per burst. No allocation:
++ * every buffer is static. A block puts out 0, 1 or 2 grains (LK_WS_HS frames each), so the output comes in steps of LK_WS_HS frames. */
++#define LK_WS_W     480                  /* grain: 10 ms */
++#define LK_WS_HS    (LK_WS_W / 2)        /* synthesis hop */
++#define LK_WS_TOL   200                  /* the search, either way: 4.2 ms (half the period of a 120 Hz voice) */
++#define LK_WS_RING  4096                 /* input frames kept (a power of 2) */
++_Static_assert((LK_WS_RING & (LK_WS_RING - 1)) == 0 && LK_WS_RING > 2 * LK_WS_TOL + LK_WS_W + 4 * LK_N, "the WSOLA ring holds a search and a block");
++_Static_assert(LK_OUTMAX >= 2 * LK_WS_HS && LK_WS_HS >= LK_F, "two grains fit in a block's output, and a grain holds the concealment crossfade");
++/* The slowest step is LK_SLOW_FLOOR_PCT / (1 + LK_SKEW_MAX) = 0.509 (review), and two grains then consume less than a block: lk_ws_block clamps the
++ * step to LK_WS_STEP_MIN (a block's input in two grains), so the ring never falls behind; under it the slow pace is a little less slow. */
++#define LK_WS_STEP_MIN ((double)LK_N / (2.0 * LK_WS_HS))
++_Static_assert(2 * LK_WS_HS >= LK_N, "two grains can take a block of input");
++static int    s_lk_stretch = 1;
++static float  s_ws_in[LK_WS_RING * 2], s_ws_mono[LK_WS_RING], s_ws_ola[LK_WS_HS * 2], s_ws_win[LK_WS_W], s_ws_mono_t[LK_WS_HS];
++static long long s_ws_w = 0, s_ws_prev = -1;   /* input frames written; the input start of the last grain (-1: none yet) */
++static double s_ws_ana = 0.0;                  /* the nominal input start of the next grain */
++static unsigned long long s_ws_grains, s_ws_clamped, s_ws_skips;   /* blocks whose step was clamped; guard snaps (never expected) */
++static void lk_ws_reset(void)
++{
++    if (s_ws_win[LK_WS_HS] == 0.0f) for (int i = 0; i < LK_WS_W; i++) s_ws_win[i] = 0.5f - 0.5f * cosf(6.28318530718f * (float)i / (float)LK_WS_W);
++    memset(s_ws_in, 0, sizeof s_ws_in); memset(s_ws_mono, 0, sizeof s_ws_mono); memset(s_ws_ola, 0, sizeof s_ws_ola);
++    s_ws_w = 0; s_ws_prev = -1; s_ws_ana = 0.0; s_ws_grains = s_ws_clamped = s_ws_skips = 0;
++}
++static inline float lk_ws_x(long long i, int c) { return s_ws_in[(size_t)(i & (LK_WS_RING - 1)) * 2 + c]; }   /* before the first frame: the ring's zeros */
++static inline float lk_ws_mono(long long i) { return s_ws_mono[(size_t)(i & (LK_WS_RING - 1))]; }   /* L + R, kept for the search */
++/* The best input start in nom +- LK_WS_TOL to continue the last grain (whose natural continuation starts at want). */
++static long long lk_ws_search(long long nom, long long want)
++{
++    double t_en = 0.0;
++    for (int i = 0; i < LK_WS_HS; i++) { s_ws_mono_t[i] = lk_ws_mono(want + i); t_en += (double)s_ws_mono_t[i] * s_ws_mono_t[i]; }
++    if (t_en < 1e-9) return nom;   /* silence: nothing to align */
++    long long best = nom; double best_v = -1e30;
++    for (int pass = 0; pass < 2; pass++) {
++        const long long lo = pass ? best - 3 : nom - LK_WS_TOL, hi = pass ? best + 3 : nom + LK_WS_TOL;
++        const int step = pass ? 1 : 4, stride = pass ? 1 : 2;
++        const long long from = best;
++        for (long long st = lo; st <= hi; st += step) {
++            if (pass && (st < nom - LK_WS_TOL || st > nom + LK_WS_TOL)) continue;
++            float xy = 0.0f, yy = 0.0f;
++            const size_t k0 = (size_t)(st & (LK_WS_RING - 1));
++            if (k0 + LK_WS_HS <= LK_WS_RING) { const float* y = &s_ws_mono[k0];   /* no wrap: a straight loop the compiler vectorises */
++                for (int i = 0; i < LK_WS_HS; i += stride) { xy += s_ws_mono_t[i] * y[i]; yy += y[i] * y[i]; } }
++            else for (int i = 0; i < LK_WS_HS; i += stride) { const float y = lk_ws_mono(st + i); xy += s_ws_mono_t[i] * y; yy += y * y; }
++            const double v = yy > 1e-12f ? xy / sqrt((double)yy) : -1e30;
++            if (v > best_v || (pass && st == from && v >= best_v)) { best_v = v; best = st; }
++        }
++        if (!pass) best_v = -1e30;   /* the fine pass compares at full resolution only */
++    }
++    return best;
++}
++/* One block of input (LK_N frames) at the rate `step` (input frames per output frame): the finished output frames into out (at most cap), and in
++ * *extra the output frames made over the input consumed (what a refill pays back). */
++static u32 lk_ws_block(const float* in, double step, float* out, u32 cap, double* extra)
++{
++    for (u32 i = 0; i < LK_N; i++) { const size_t j = (size_t)((s_ws_w + i) & (LK_WS_RING - 1)), k = j * 2;
++        s_ws_in[k] = in[i * 2]; s_ws_in[k + 1] = in[i * 2 + 1]; s_ws_mono[j] = in[i * 2] + in[i * 2 + 1]; }
++    s_ws_w += LK_N;
++    if (step < LK_WS_STEP_MIN) { step = LK_WS_STEP_MIN; s_ws_clamped++; }   /* review: at 0.509 the ring fell behind and the guard skipped 50 ms */
++    const double ha = step * LK_WS_HS;
++    u32 m = 0;
++    while (m + LK_WS_HS <= cap) {
++        const long long nom = (long long)floor(s_ws_ana + 0.5);
++        if (nom + LK_WS_TOL + LK_WS_W > s_ws_w) break;   /* the search and the grain need input not here yet */
++        const long long st = s_ws_prev < 0 ? nom : lk_ws_search(nom, s_ws_prev + LK_WS_HS);
++        for (int i = 0; i < LK_WS_HS; i++)
++            for (int c = 0; c < 2; c++) {
++                out[(m + (u32)i) * 2 + c] = s_ws_ola[i * 2 + c] + s_ws_win[i] * lk_ws_x(st + i, c);
++                s_ws_ola[i * 2 + c] = s_ws_win[LK_WS_HS + i] * lk_ws_x(st + LK_WS_HS + i, c);
++            }
++        m += LK_WS_HS; s_ws_prev = st; s_ws_ana += ha; *extra += LK_WS_HS - ha; s_ws_grains++;
++    }
++    if (s_ws_w - (long long)s_ws_ana > LK_WS_RING - 2 * LK_WS_TOL - LK_WS_W) {   /* a guard, not expected with the clamp: skip ahead, say so once */
++        s_ws_ana = (double)(s_ws_w - LK_WS_TOL - LK_WS_W);
++        if (!s_ws_skips++) fprintf(stderr, "[audio-lock] time stretch fell behind its input: skipped ahead (step %.3f)\n", step);
++    }
++    return m;
++}
+ static double lk_slow_block(void)
+ {
+     const int i = ++s_lk_slow_i; if (i >= 6) return s_lk_slow_play = s_lk_slow_out;
+@@ -1090,6 +1174,7 @@ static void lk_begin(void)
+         if (s_lk_slow_min <= 0 || s_lk_slow_min >= 100) s_lk_slow_min = 0; else if (s_lk_slow_min < LK_SLOW_FLOOR_PCT) s_lk_slow_min = LK_SLOW_FLOOR_PCT;
+         s_lk_refill = lk_env(getenv("AUDIO_LOCK_REFILL"), 1) != 0;   /* patch 3010 */
+         s_lk_drc_boost = lk_env(getenv("AUDIO_LOCK_DRC_BOOST"), 16); if (s_lk_drc_boost < 0) s_lk_drc_boost = 0; if (s_lk_drc_boost > 20) s_lk_drc_boost = 20;
++        s_lk_stretch = lk_env(getenv("AUDIO_LOCK_STRETCH"), 1) != 0;   /* patch 3011 */
+     }
+     s_lk_active = 1; s_lk_burst = 1; s_lk_have_last = 0; s_lk_pos = 0.0; s_lk_ema = -1.0; s_lk_skew = 0.0; s_lk_ring_w = 0; s_lk_conc = 0;
+     s_lk_blocks = s_lk_dry = s_lk_conceals = s_lk_conc_frames = s_lk_long_gaps = s_lk_drops = s_lk_squeezed = s_lk_bursts = 0;
+@@ -1099,6 +1184,7 @@ static void lk_begin(void)
+     s_lk_sb_n = 0; s_lk_sr_w = 0; s_lk_sr_ffb = s_lk_sr_last_ff = 0.0; s_lk_sr_last_b = 0;
+     s_lk_debt = s_lk_debt_max = s_lk_paid = s_lk_fb_pay = 0.0; s_lk_sb_total = s_lk_q_from = 0; s_lk_eng_lo = 1.0; s_lk_q_n = 0; s_lk_q_eng = 0; s_lk_q_entries = 0; s_lk_q_longest = 0.0;   /* patch 3010 */
+     s_lk_burst_t = s_lk_gap_t = -1.0; s_lk_burst_lvl = s_lk_gap_since = s_lk_gap_lvl = 0.0;
++    lk_ws_reset();   /* patch 3011 */
+ }
+ static int lk_cushion_frames(void)
+ {
+@@ -1114,7 +1200,8 @@ static void lk_report(const char* why)
+                     "rate %+.2f..%+.2f %%, level before a burst min %.1f ms mean %.1f ms, cushion %.1f ms, device buffer %.1f ms, smoothing %s, "
+                     "stretch fed forward: %llu bursts, mean %.0f us, max %d us, total rate %+.2f..%+.2f %%, feed-forward %s, "
+                     "slow pace: %llu times, %.1f s, rate min %.3f, floor %d %%, %s, "
+-                    "refill: debt max %.0f ms, %.0f ms paid back, quick slow pace %llu times, boost %.2f %%, %s\n",
++                    "refill: debt max %.0f ms, %.0f ms paid back, quick slow pace %llu times, boost %.2f %%, %s, "
++                    "time stretch: %llu grains, %llu blocks at the slowest step, %s\n",
+             why, s_lk_blocks, s_lk_dry, s_lk_conceals, s_lk_conc_frames / fpms, s_lk_long_gaps, s_lk_conceal_ms, s_lk_squeezed, s_lk_drops,
+             s_lk_skew_min * 100.0, s_lk_skew_max * 100.0, s_lk_trough_min < 0 ? 0.0 : s_lk_trough_min / fpms, s_lk_bursts ? s_lk_trough_sum / s_lk_bursts / fpms : 0.0,
+             lk_cushion_frames() / fpms, lk_cap_frames() / fpms, s_lk_smooth ? "on" : "off (AUDIO_LOCK_SMOOTH=0)",
+@@ -1127,7 +1214,9 @@ static void lk_report(const char* why)
+             !s_lk_smooth ? "off (smoothing off)" : s_lk_slow_min ? "on" : "off (AUDIO_LOCK_SLOW_MIN=0)",
+             /* patch 3010, appended: the most concealed time owed at once, what the resampler paid back, the slow pace's quick entries, the cap while owing */
+             s_lk_debt_max / fpms, s_lk_paid / fpms, s_lk_q_entries, s_lk_drc_boost * 100.0 / LK_N,
+-            !s_lk_smooth ? "off (smoothing off)" : s_lk_refill ? "on" : "off (AUDIO_LOCK_REFILL=0)");
++            !s_lk_smooth ? "off (smoothing off)" : s_lk_refill ? "on" : "off (AUDIO_LOCK_REFILL=0)",
++            /* patch 3011, appended: the pitch-preserving stretch's grains */
++            s_ws_grains, s_ws_clamped, !s_lk_smooth ? "off (smoothing off)" : s_lk_stretch ? "pitch-preserving (WSOLA)" : "off, linear resampler (AUDIO_LOCK_STRETCH=0)");
+ }
+ static void lk_end(void) { if (!s_lk_active) return; s_lk_active = 0; lk_report("lock ended"); }
+ static void lk_send(const float* f, u32 n)   /* to the device, and into the history */
+@@ -1243,6 +1332,14 @@ static void lk_submit_block(void)
+     /* the continuous resampler: output frame at input position pos (prev = position -1), step 1 / (1 + skew); patch 3009: times the slow-pace rate */
+     const double step = lk_slow_block() / (1.0 + s_lk_skew);
+     u32 m = 0;
++    double ws_extra = 0.0;
++    if (s_lk_stretch) {   /* patch 3011: the pitch-preserving stretch */
++        m = lk_ws_block(s_mix_buffer, step, s_lk_out, LK_OUTMAX, &ws_extra);
++        if (s_lk_refill && s_lk_debt > 0.0 && s_lk_fb_pay > 0.0) {   /* patch 3010's debt: the feedback's share, as on the linear path */
++            const double x = LK_N * s_lk_fb_pay < s_lk_debt ? LK_N * s_lk_fb_pay : s_lk_debt; s_lk_debt -= x; s_lk_paid += x;
++        }
++        if (m == 0) return;   /* the grain is not complete yet (a concealment goes on until real frames come) */
++    } else {
+     while (s_lk_pos <= (double)(LK_N - 1) && m < LK_OUTMAX) {
+         const int i = (int)floor(s_lk_pos); const float fr = (float)(s_lk_pos - i);
+         for (int c = 0; c < 2; c++) {
+@@ -1257,6 +1354,7 @@ static void lk_submit_block(void)
+                                                                  * feed-forward's: those cover a slower tick, they repay nothing) */
+         const double x = LK_N * s_lk_fb_pay < s_lk_debt ? LK_N * s_lk_fb_pay : s_lk_debt; s_lk_debt -= x; s_lk_paid += x;
+     }
++    }   /* patch 3011: the linear resampler (AUDIO_LOCK_STRETCH=0) */
+     if (s_lk_conc) {   /* back from concealment: crossfade the loop out and the real block in */
+         for (u32 i = 0; i < LK_F && i < m; i++) { float f[2]; lk_conc_frame(f); const float w = (float)(i + 1) / LK_F;
+             s_lk_out[i * 2] = s_lk_out[i * 2] * w + f[0] * (1.0f - w); s_lk_out[i * 2 + 1] = s_lk_out[i * 2 + 1] * w + f[1] * (1.0f - w); }
+diff --git a/libs/audio/tests/audio_lock_measure.c b/libs/audio/tests/audio_lock_measure.c
+index 3c198f3..5771a1c 100644
+--- a/libs/audio/tests/audio_lock_measure.c
++++ b/libs/audio/tests/audio_lock_measure.c
+@@ -12,6 +12,7 @@
+  * concealed gaps from 15 s on (settled); AUDIO_LOCK_SLOW_MIN=0 runs them without the slow pace, for the A/B.
+  * Patch 3010: a "bundle hitches" scenario (50-100 ms every 1-3 s, as the friends' test10 fight logged them); each hitch line also gives the
+  * concealed time still owed, and the run ends with the gaps after the first 30 s; AUDIO_LOCK_REFILL=0 runs it as 3009, for the A/B.
++ * Patch 3011: each scenario also gives the output's CPU per burst; AUDIO_LOCK_STRETCH=0 runs it with 3010's linear resampler, for the A/B.
+  *   x86_64-w64-mingw32-clang -std=gnu11 -O2 -Wall -Wextra -I include libs/audio/tests/audio_lock_measure.c -lole32 -lwinmm -o audio_lock_measure.exe
+  *   audio_lock_measure.exe [seconds per scenario, default 10] [scenario names, comma-separated prefixes]     (the AUDIO_LOCK_* and PS3_AUDIO_BUF_MS settings apply as in the game) */
+ #include "../cellAudio.c"
+@@ -67,6 +68,7 @@ static void run(const scenario* sc, double seconds, IAudioClock* clk, UINT64 clk
+     const int paced = sc->tick_ms > 0 || sc->uneven_ms > 0;   /* patch 3009: a slow-pace scenario */
+     unsigned long long gaps15 = 0, gaps_sw = 0; int at15 = 0, at_sw = 0; double next_line = 2000.0, back_ms = -1.0;
+     unsigned long long gaps30 = 0; int at30 = 0;   /* patch 3010 */
++    double out_ms = 0.0, out_sum = 0.0, out_max = 0.0;   /* patch 3011: lk_submit_block's time per burst */
+     while (now_ms() - t_start < seconds * 1000.0) {
+         /* the tick boundary: 1/30 s, plus this scenario's lateness */
+         double due = next + rnd() * sc->jitter_ms;
+@@ -84,8 +86,9 @@ static void run(const scenario* sc, double seconds, IAudioClock* clk, UINT64 clk
+         const long long want = (long long)(tick + 1) * 25 / 4;   /* 6.25 blocks per tick */
+         for (; blocks < want; blocks++) {
+             for (int i = 0; i < CELL_AUDIO_BLOCK_SAMPLES; i++) s_mix_buffer[i * 2] = s_mix_buffer[i * 2 + 1] = 0.25f * sinf((float)(blocks * 256 + i) * 0.0576f);
+-            lk_submit_block();
++            const double c0 = now_ms(); lk_submit_block(); out_ms += now_ms() - c0;   /* patch 3011: the output's own CPU (with the device calls) */
+         }
++        if (out_ms > out_max) out_max = out_ms; out_sum += out_ms; out_ms = 0.0;
+         const int rm1 = audio_backend_room();
+         if (rm0 >= 0 && rm1 >= 0 && nd < 20000) { before[nd] = (cap - rm0) / 48.0; after[nd] = (cap - rm1) / 48.0; nd++; }
+         if (hitches != hid) {   /* the burst after a hitch: did the hitch conceal a gap? */
+@@ -116,6 +119,8 @@ static void run(const scenario* sc, double seconds, IAudioClock* clk, UINT64 clk
+     printf("%-24s output delay:", sc->name);
+     stats("oldest frame of a burst", before, nd); stats("newest", after, nd);
+     printf(" %d ticks; played-clock lag %.1f ms over %.1f s\n", nd, wall - played_ms, wall / 1000.0);
++    printf("  output CPU per burst (lk_submit_block, device calls included): mean %.0f us, max %.0f us; time stretch %s\n", nd ? out_sum * 1000.0 / nd : 0.0,
++           out_max * 1000.0, s_lk_stretch ? "WSOLA" : "off (AUDIO_LOCK_STRETCH=0)");   /* patch 3011 */
+     if (hitches) printf("  %d hitches; concealed gaps before the first (the start): %llu\n", hitches, gaps_before);
+     if (at30) printf("  concealed gaps from 30 s on: %llu in %.1f s (%.1f per minute); %.0f ms paid back, quick slow pace %llu times, refill %s\n",
+                      s_lk_conceals - gaps30, (wall - 30000.0) / 1000.0, (s_lk_conceals - gaps30) * 60000.0 / (wall - 30000.0), s_lk_paid / 48.0,
+diff --git a/libs/audio/tests/test_audio_lock_race.c b/libs/audio/tests/test_audio_lock_race.c
+index 9ab3cec..e6b2926 100644
+--- a/libs/audio/tests/test_audio_lock_race.c
++++ b/libs/audio/tests/test_audio_lock_race.c
+@@ -20,7 +20,12 @@
+  *    conceals nothing after the start; a 29 fps fight with a 50-100 ms tick every ~2 s and one with runs of 5-15 slow ticks (as room 71) conceal far
+  *    fewer gaps than 3009; single hitches (76 ms, 150-300 ms) never enter the quick slow pace; 20 ticks/s is still gap-free once settled.
+  *    Parts 1-4 run with it on (part 4: the absolute feedback still settles at the cushion, not pinned); part 5 runs with it off, so its numbers are
+- *    3009's. */
++ *    3009's.
++ * 7. patch 3011: the pitch-preserving stretch (WSOLA), through the real lk_submit_block on a fake device that records what it gets: a sine and a
++ *    chirp at rates 0.6 (slow pace), 1/1.0625 (refill) and 1.032 (over the cushion): the pitch stays (the linear resampler of 3010 shifts it), no
++ *    click (the largest sample-to-sample step stays near the signal's own), the sine stays pure (Goertzel), the length is the input / rate; the
++ *    CPU per burst; and parts 6's fights again with it on. Parts 1-6 run with it off (AUDIO_LOCK_STRETCH=0), so their numbers are 3010's.
++ *    AUDIO_LOCK_WAV_DIR=dir: also writes a test signal (an arpeggio, a chirp and clicks) before and after both rates, linear and WSOLA, as WAVs. */
+ #include "../cellAudio.c"
+ #include <assert.h>
+ 
+@@ -140,7 +145,8 @@ static void test_contention(double seconds)
+ 
+ /* ---- fake WASAPI device ---- */
+ typedef struct { IAudioClient c; IAudioRenderClient r; IAudioClientVtbl cv; IAudioRenderClientVtbl rv;
+-                 UINT32 cap, padding, pend; unsigned long long got; float buf[16384 * 2]; int released; } fake_dev;
++                 UINT32 cap, padding, pend; unsigned long long got; float buf[16384 * 2]; int released;
++                 float* rec; size_t rec_n, rec_max; } fake_dev;   /* patch 3011: rec != NULL records every frame submitted */
+ static fake_dev* dev_of_c(IAudioClient* c) { return (fake_dev*)c; }
+ static fake_dev* dev_of_r(IAudioRenderClient* r) { return (fake_dev*)((char*)r - offsetof(fake_dev, r)); }
+ static HRESULT STDMETHODCALLTYPE fc_padding(IAudioClient* c, UINT32* p) { *p = dev_of_c(c)->padding; return S_OK; }
+@@ -152,7 +158,12 @@ static HRESULT STDMETHODCALLTYPE fr_get(IAudioRenderClient* r, UINT32 n, BYTE**
+     if (d->padding + n > d->cap) return 0x88890006;   /* AUDCLNT_E_BUFFER_TOO_LARGE, as WASAPI */
+     d->pend = n; *b = (BYTE*)d->buf; return S_OK;
+ }
+-static HRESULT STDMETHODCALLTYPE fr_rel(IAudioRenderClient* r, UINT32 n, DWORD fl) { (void)fl; fake_dev* d = dev_of_r(r); d->padding += n; d->got += n; return S_OK; }
++static HRESULT STDMETHODCALLTYPE fr_rel(IAudioRenderClient* r, UINT32 n, DWORD fl)
++{
++    (void)fl; fake_dev* d = dev_of_r(r); d->padding += n; d->got += n;
++    if (d->rec) for (UINT32 i = 0; i < n && d->rec_n < d->rec_max; i++, d->rec_n++) { d->rec[d->rec_n * 2] = d->buf[i * 2]; d->rec[d->rec_n * 2 + 1] = d->buf[i * 2 + 1]; }
++    return S_OK;
++}
+ static ULONG STDMETHODCALLTYPE fr_release(IAudioRenderClient* r) { (void)r; return 0; }
+ static void fake_init(fake_dev* d, UINT32 cap)
+ {
+@@ -428,16 +439,178 @@ static void test_refill(void)
+            b.conceals_late, b0.conceals_late, r5.conceals_late, r50.conceals_late, r15.conceals_late, r150.conceals_late);
+ }
+ 
++/* ---- 7. patch 3011: the pitch-preserving stretch ---- */
++#define T7_RATE 48000.0
++typedef enum { SIG_SINE, SIG_CHIRP, SIG_MUSIC } sig_kind;
++static int cmp_dbl(const void* x, const void* y) { const double a = *(const double*)x, b = *(const double*)y; return a < b ? -1 : a > b; }
++static double sig_at(sig_kind k, double f, long long n)   /* sample n of the test signal (mono, amplitude <= 0.5) */
++{
++    const double t = n / T7_RATE;
++    if (k == SIG_SINE) return 0.5 * sin(2.0 * M_PI * f * t);
++    if (k == SIG_CHIRP) { const double f0 = 200.0, f1 = 4000.0, T = 4.0; const double tt = fmod(t, T);
++                          return 0.5 * sin(2.0 * M_PI * (f0 * tt + (f1 - f0) * tt * tt / (2.0 * T))); }
++    /* music: an arpeggio (A3 C#4 E4 A4, 0.4 s each, 3 harmonics, 5 ms attack, decaying), a 150 Hz voice-like tone with vibrato, a click every 0.8 s */
++    static const double notes[4] = { 220.0, 277.18, 329.63, 440.0 };
++    const int ni = (int)(t / 0.4); const double nt = t - ni * 0.4, nf = notes[ni % 4];
++    double v = 0.0;
++    for (int h = 1; h <= 3; h++) v += sin(2.0 * M_PI * nf * h * nt) / h;
++    v *= 0.22 * (nt < 0.005 ? nt / 0.005 : exp(-(nt - 0.005) * 3.0));
++    const double ph = 2.0 * M_PI * (150.0 * t - 3.0 / (2.0 * M_PI * 5.0) * cos(2.0 * M_PI * 5.0 * t));
++    for (int h = 1; h <= 6; h++) v += 0.06 * sin(h * ph) / h;
++    const double ct = fmod(t, 0.8); if (ct < 0.004) v += 0.3 * sin(2.0 * M_PI * 2000.0 * ct) * (1.0 - ct / 0.004);
++    return v;
++}
++static float s_rec[48000 * 30 * 2];
++/* `seconds` of the signal through lk_submit_block at a fixed playback rate (input frames per output frame, as lk_slow_block x the skew gives it),
++ * stretch on or off; returns the frames recorded into s_rec. */
++static size_t run_fixed(sig_kind k, double f, double rate, int stretch, double seconds)
++{
++    static fake_dev d;
++    fake_init(&d, 16000); wasapi_dev w = fake_wasapi(&d, 60); wasapi_adopt(&w);
++    ps3r_audio_dev_opened(&s_wasapi_st, GetTickCount64() + 3600 * 1000ull);
++    d.rec = s_rec; d.rec_n = 0; d.rec_max = sizeof s_rec / sizeof s_rec[0] / 2;
++    const int st = s_lk_stretch; s_lk_stretch = stretch;
++    lk_begin();
++    s_lk_burst = 0; s_lk_skew = 0.0; s_lk_slow_out = s_lk_slow_from = s_lk_slow_play = rate; s_lk_slow_i = 6;   /* no burst logic: the rate holds */
++    const long long blocks = (long long)(seconds * T7_RATE / LK_N);
++    for (long long b = 0; b < blocks; b++) {
++        for (int i = 0; i < CELL_AUDIO_BLOCK_SAMPLES; i++) { const float v = (float)sig_at(k, f, b * LK_N + i); s_mix_buffer[i * 2] = v; s_mix_buffer[i * 2 + 1] = v; }
++        lk_submit_block(); d.padding = 0;   /* the device plays everything at once */
++    }
++    lk_end(); s_lk_stretch = st; d.rec = NULL;
++    return d.rec_n;
++}
++static double zc_freq(const float* x, size_t a, size_t b)   /* frequency by zero crossings (left channel) */
++{
++    size_t z = 0, first = 0, last = 0;
++    for (size_t i = a + 1; i < b; i++) if ((x[(i - 1) * 2] < 0.0f) != (x[i * 2] < 0.0f)) { if (!z) first = i; last = i; z++; }
++    return z > 1 ? (z - 1) / 2.0 / ((last - first) / T7_RATE) : 0.0;
++}
++static double max_step(const float* x, size_t a, size_t b) { double m = 0; for (size_t i = a + 1; i < b; i++) { const double d = fabs(x[i * 2] - x[(i - 1) * 2]); if (d > m) m = d; } return m; }
++static double purity(const float* x, size_t a, size_t b, double f)   /* the share of the energy at f (Goertzel over the span), 1 = a pure sine */
++{
++    const double w = 2.0 * M_PI * f / T7_RATE, cw = 2.0 * cos(w); double s1 = 0, s2 = 0, e = 0;
++    for (size_t i = a; i < b; i++) { const double s0 = x[i * 2] + cw * s1 - s2; s2 = s1; s1 = s0; e += (double)x[i * 2] * x[i * 2]; }
++    const double p = s1 * s1 + s2 * s2 - cw * s1 * s2, n = (double)(b - a);
++    return e > 0 ? (2.0 * p / n) / e : 0.0;
++}
++static void wav_write(const char* dir, const char* name, const float* x, size_t n)
++{
++    char path[600]; snprintf(path, sizeof path, "%s\\%s", dir, name);
++    FILE* f = fopen(path, "wb"); if (!f) { fprintf(stderr, "cannot write %s\n", path); return; }
++    const uint32_t data = (uint32_t)(n * 4), rate = 48000, brate = 48000 * 4, riff = 36 + data; const uint16_t pcm = 1, ch = 2, align = 4, bits = 16; const uint32_t fmt = 16;
++    fwrite("RIFF", 1, 4, f); fwrite(&riff, 4, 1, f); fwrite("WAVEfmt ", 1, 8, f); fwrite(&fmt, 4, 1, f); fwrite(&pcm, 2, 1, f); fwrite(&ch, 2, 1, f);
++    fwrite(&rate, 4, 1, f); fwrite(&brate, 4, 1, f); fwrite(&align, 2, 1, f); fwrite(&bits, 2, 1, f); fwrite("data", 1, 4, f); fwrite(&data, 4, 1, f);
++    for (size_t i = 0; i < n * 2; i++) { double v = x[i] * 32767.0; if (v > 32767) v = 32767; if (v < -32768) v = -32768; const int16_t s16 = (int16_t)lrint(v); fwrite(&s16, 2, 1, f); }
++    fclose(f); printf("  wrote %s (%.1f s)\n", path, n / T7_RATE);
++}
++static void test_time_stretch(void)
++{
++    static const double rates[3] = { 0.6, 1.0 / 1.0625, 1.032 };
++    static const char* rname[3] = { "slow pace 0.6", "refill 1/1.0625", "over the cushion 1.032" };
++    for (int r = 0; r < 3; r++) {
++        /* a 440 Hz sine: the pitch, the purity, the largest step */
++        const size_t nw = run_fixed(SIG_SINE, 440.0, rates[r], 1, 3.0);
++        const size_t n = nw; static float ws[48000 * 8 * 2]; memcpy(ws, s_rec, n * 2 * sizeof(float));
++        const size_t nl = run_fixed(SIG_SINE, 440.0, rates[r], 0, 3.0);
++        const size_t a = 4800, b = n - 2400;
++        double pw = 1.0;   /* the worst 100 ms window (a whole-span Goertzel would also judge the slow phase drift, which is no click) */
++        for (size_t w0 = a; w0 + 4800 <= b; w0 += 4800) { const double q = purity(ws, w0, w0 + 4800, 440.0); if (q < pw) pw = q; }
++        const double fw = zc_freq(ws, a, b), fl = zc_freq(s_rec, a, nl - 2400);
++        const double ms = max_step(ws, a, b), ideal = 0.5 * 2.0 * M_PI * 440.0 / T7_RATE;
++        const double want = 3.0 * T7_RATE / rates[r];
++        printf("stretch %-24s sine 440 Hz: WSOLA %.1f Hz, purity %.4f, largest step %.2f x the sine's, %zu frames (input / rate %.0f); linear %.1f Hz\n",
++               rname[r], fw, pw, ms / ideal, nw, want, fl);
++        CHECK(fabs(fw - 440.0) < 2.0);                          /* the pitch stays */
++        CHECK(fabs(fl - 440.0 * rates[r]) < 3.0);               /* ... where the linear resampler moved it */
++        CHECK(pw > 0.995);                                      /* no click, no warble worth the name */
++        CHECK(ms < ideal * 1.15);                               /* no step bigger than the sine's own (a click would be one) */
++        CHECK(fabs((double)nw - want) < 3.0 * LK_WS_W);         /* the length: input / rate, less what the ring holds */
++        /* a 200 Hz - 4 kHz chirp: the largest step against the fastest part's own */
++        const size_t nc = run_fixed(SIG_CHIRP, 0.0, rates[r], 1, 4.0);
++        const double mc = max_step(s_rec, 4800, nc - 2400), idc = 0.5 * 2.0 * M_PI * 4000.0 / T7_RATE;
++        printf("stretch %-24s chirp 0.2-4 kHz: largest step %.2f x the top frequency's own\n", rname[r], mc / idc);
++        CHECK(mc < idc * 1.15);
++    }
++    /* review: the slowest step with the skew (0.55 / 1.08 = 0.509) is clamped: the length is input / 0.533, nothing skipped, and the sine is still whole */
++    { const size_t n = run_fixed(SIG_SINE, 440.0, 0.55 / 1.08, 1, 3.0); const double want = 3.0 * T7_RATE / LK_WS_STEP_MIN;
++      double pq = 1.0; for (size_t w0 = 4800; w0 + 4800 <= n - 2400; w0 += 4800) { const double q = purity(s_rec, w0, w0 + 4800, 440.0); if (q < pq) pq = q; }
++      printf("stretch at step 0.509 (floor 55 %% with +8 %%): clamped to %.3f, %zu frames (want %.0f), purity %.4f, skips %llu\n", LK_WS_STEP_MIN, n, want, pq, s_ws_skips);
++      CHECK(fabs((double)n - want) < 4.0 * LK_WS_W && pq > 0.995 && s_ws_skips == 0); }
++    /* rate 1: the output is the input, delayed */
++    { const size_t n = run_fixed(SIG_MUSIC, 0.0, 1.0, 1, 2.0); long long lag = -1;
++      for (long long L = 0; L < 2 * LK_WS_W && lag < 0; L++) { double e = 0; for (size_t i = 8000; i < 9000; i++) e += fabs(s_rec[i * 2] - sig_at(SIG_MUSIC, 0, (long long)i + L)); if (e < 1e-2) lag = L; }
++      double err = 0; for (size_t i = 4800; lag >= 0 && i < n - 2400; i++) { const double d = fabs(s_rec[i * 2] - sig_at(SIG_MUSIC, 0, (long long)i + lag)); if (d > err) err = d; }
++      printf("stretch at rate 1: the output is the input sample for sample (offset %lld frames; the ring holds it about 9 ms), largest difference %.2g\n", lag, err);
++      CHECK(lag >= 0 && err < 1e-4); }
++    /* CPU: the stretch alone (the signal made beforehand), per burst (6.25 blocks) of the music signal at the slow and the refill rate */
++    for (int r = 0; r < 2; r++) {
++        enum { NB = 4000 };
++        static float sig[NB * LK_N * 2], out[LK_OUTMAX * 2]; static double us[NB]; double extra = 0;
++        for (long long i = 0; i < (long long)NB * LK_N; i++) sig[i * 2] = sig[i * 2 + 1] = (float)sig_at(SIG_MUSIC, 0, i);
++        lk_ws_reset();
++        const int prio = GetThreadPriority(GetCurrentThread()); SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);   /* as the mix thread */
++        LARGE_INTEGER f; QueryPerformanceFrequency(&f); double total = 0;
++        for (int bk = 0; bk < NB; bk++) {
++            LARGE_INTEGER a0, a1; QueryPerformanceCounter(&a0);
++            lk_ws_block(&sig[(size_t)bk * LK_N * 2], rates[r], out, LK_OUTMAX, &extra);
++            QueryPerformanceCounter(&a1); us[bk] = (a1.QuadPart - a0.QuadPart) * 1e6 / f.QuadPart; total += us[bk];
++        }
++        SetThreadPriority(GetCurrentThread(), prio);
++        qsort(us, NB, sizeof us[0], cmp_dbl);
++        const double per_burst = total / NB * 6.25;
++        printf("stretch CPU at %s: %.0f us per burst (6.25 blocks), a block p50 %.0f us, p99 %.0f us\n", rname[r], per_burst, us[NB / 2], us[NB * 99 / 100]);
++        /* review: wall clock on a shared machine; only a gross regression fails (the budget is well under 1 ms per burst; measured ~50-80 us) */
++        CHECK(per_burst < 2000.0);
++    }
++    /* part 6's fights with the stretch on */
++    s_lk_stretch = 1;
++    static const pace steady = { "steady 30 ticks/s",          1000.0 / 30.0, 0, 0, 0.0, 0, 0, 0, 60, 0, 0, 0, 0, 0 };
++    static const pace bundle = { "29 fps, 50-100 ms hitches",  33.6, 0, 0, 0.0, 0, 2.0, 0, 180, 0, 0, 16.7, 66.7, 0 };
++    static const pace slow   = { "20 ticks/s",                 50.0, 0, 0, 0.0, 0, 0, 0, 60, 0, 0, 0, 0, 0 };
++    s_pace_dev = 14400;
++    pace_result a = run_refill(&steady, 1), b = run_refill(&bundle, 1), c = run_refill(&slow, 1);
++    s_lk_stretch = 0;
++    pace_result b0 = run_refill(&bundle, 1);
++    s_pace_dev = 9600;
++    CHECK(a.conceals_late == 0 && a.drops == 0 && c.conceals_late == 0 && c.drops == 0 && b.drops == 0);
++    CHECK(b.conceals_late <= b0.conceals_late + b0.conceals_late / 4 + 2);
++    printf("stretch on in part 6's fights: steady %llu, 29 fps %llu (linear %llu), 20 ticks/s %llu concealed gaps after 15 s\n",
++           a.conceals_late, b.conceals_late, b0.conceals_late, c.conceals_late);
++    /* AUDIO_LOCK_WAV_DIR: the test signal before and after, to listen to */
++    const char* dir = getenv("AUDIO_LOCK_WAV_DIR");
++    if (dir && *dir) {
++        static float tmp[48000 * 30 * 2];
++        const double secs = 8.0; const size_t n0 = (size_t)(secs * T7_RATE);
++        for (size_t i = 0; i < n0; i++) { const double t = i / T7_RATE; const float v = (float)(t < 4.0 ? sig_at(SIG_MUSIC, 0, (long long)i) : 0.6 * sig_at(SIG_CHIRP, 0, (long long)i - 192000)); tmp[i * 2] = tmp[i * 2 + 1] = v; }
++        wav_write(dir, "0_input.wav", tmp, n0);
++        static const char* nm[2][2] = { { "1_slow060_linear_3010.wav", "2_slow060_wsola_3011.wav" }, { "3_refill1062_linear_3010.wav", "4_refill1062_wsola_3011.wav" } };
++        for (int r = 0; r < 2; r++) for (int st = 0; st < 2; st++) {
++            /* the same 8 s signal (music then chirp) through the real output */
++            static fake_dev d; fake_init(&d, 16000); wasapi_dev w = fake_wasapi(&d, 60); wasapi_adopt(&w);
++            ps3r_audio_dev_opened(&s_wasapi_st, GetTickCount64() + 3600 * 1000ull);
++            d.rec = s_rec; d.rec_n = 0; d.rec_max = sizeof s_rec / sizeof s_rec[0] / 2;
++            const int keep = s_lk_stretch; s_lk_stretch = st; lk_begin();
++            s_lk_burst = 0; s_lk_skew = 0.0; s_lk_slow_out = s_lk_slow_from = s_lk_slow_play = rates[r]; s_lk_slow_i = 6;
++            for (size_t b0i = 0; b0i + LK_N <= n0; b0i += LK_N) { memcpy(s_mix_buffer, &tmp[b0i * 2], LK_N * 2 * sizeof(float)); lk_submit_block(); d.padding = 0; }
++            lk_end(); s_lk_stretch = keep; d.rec = NULL;
++            wav_write(dir, nm[r][st], s_rec, d.rec_n);
++        }
++    }
++}
++
+ int main(int argc, char** argv)
+ {
+     vm_base = (uint8_t*)VirtualAlloc(NULL, 0x100000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+     CHECK(vm_base);
++    _putenv("AUDIO_LOCK_STRETCH=0");   /* patch 3011: parts 1-6 are 3010's; part 7 turns it on */
+     test_contention(argc > 1 ? atof(argv[1]) : 2.0);
+     test_reopen_in_burst();
+     test_conceal_room();
+     test_stretch_feed_forward();
+     test_slow_pace();
+     test_refill();
++    test_time_stretch();
+     puts("audio lock: all passed");
+     return 0;
+ }

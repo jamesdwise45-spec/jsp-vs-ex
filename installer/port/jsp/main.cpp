@@ -768,8 +768,13 @@ int main(int argc, char** argv)
     if (!getenv("CRI_LEAD")) _putenv("CRI_LEAD=12");
     /* FIX (testers, test6 "choppy sound all fight"): the tick-locked fight audio (patches 3007/3008) hides the game's own ~76 ms hitches only with a
      * deeper reserve and a faster refill: a 200 ms device, a 90 ms cushion and up to 3.1% rate control (measured on a real device: 1 of 11 typical
-     * hitches concealed instead of 11 of 11, about 30 ms more audio delay in online fights; menus and offline keep PS3_AUDIO_BUF_MS). Set to override. */
-    if (!getenv("AUDIO_LOCK_BUF_MS") || !*getenv("AUDIO_LOCK_BUF_MS")) _putenv("AUDIO_LOCK_BUF_MS=200");
+     * hitches concealed instead of 11 of 11, about 30 ms more audio delay in online fights; menus and offline keep PS3_AUDIO_BUF_MS). Set to override.
+     * test11: the device opens with 300 ms for the lock (was 200). The delay is the cushion's (still 90 ms), not the device's: the bigger device
+     * leaves room for toolkit patch 3010's faster refill (up to 6.25 % while concealed time is owed) and lets AUDIO_LOCK_CUSHION_MS go up to 240
+     * in play_settings.txt (a burst must still fit on top: buffer - 9 blocks). With AUDIO_LOCK_REFILL=0 (3010 off) it stays 200, so that A/B is the
+     * 3009 sound as it was (review). */
+    { const char* rf = getenv("AUDIO_LOCK_REFILL"); const bool refill_off = rf && rf[0] == '0' && rf[1] == 0;
+      if (!getenv("AUDIO_LOCK_BUF_MS") || !*getenv("AUDIO_LOCK_BUF_MS")) _putenv(refill_off ? "AUDIO_LOCK_BUF_MS=200" : "AUDIO_LOCK_BUF_MS=300"); }
     if (!getenv("AUDIO_LOCK_CUSHION_MS") || !*getenv("AUDIO_LOCK_CUSHION_MS")) _putenv("AUDIO_LOCK_CUSHION_MS=90");
     if (!getenv("AUDIO_LOCK_DRC") || !*getenv("AUDIO_LOCK_DRC")) _putenv("AUDIO_LOCK_DRC=8");
     /* the opening movie: J-Stars asks the decoder for alpha 0 (cellVdec VDEC_ALPHA; =-1 keeps the game's 0) */
@@ -777,7 +782,7 @@ int main(int argc, char** argv)
 #else
     setenv("AUDIO_NBLOCK", "16", 0);
     setenv("CRI_LEAD", "12", 0);
-    setenv("AUDIO_LOCK_BUF_MS", "200", 0);
+    { const char* rf = getenv("AUDIO_LOCK_REFILL"); setenv("AUDIO_LOCK_BUF_MS", rf && rf[0] == '0' && rf[1] == 0 ? "200" : "300", 0); }
     setenv("AUDIO_LOCK_CUSHION_MS", "90", 0);
     setenv("AUDIO_LOCK_DRC", "8", 0);
     setenv("VDEC_ALPHA", "255", 0);

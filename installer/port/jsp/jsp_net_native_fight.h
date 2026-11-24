@@ -23,6 +23,14 @@ void jsp_native_fight_end_normal(void);
 // which writes share pad +0x6D8 / +0x6DC back while the same share pad object still exists (the .cpp says why).
 // The guard of the guarded instruction patches (jnf::kPatches, for lift_insn_patches.json): 1 while armed. The lifted code reads it.
 extern int g_jsp_native_fight_armed;
+// ENHANCEMENT (4-player online): the Friendly Match room's 4 fighter records (R = *(0x0095839C), R+0x68+0x24*i: +0x08 u16 member id, +0x1A COM flag)
+// and this PC's own room member id, read from guest memory only (no guest call): the chain of 0x00447C00 (my member) = manager M = *(*(TOC+0x59F8)),
+// X = *(M+0xA70), the node list at X+0xD00 (+0 next, +4 member object), the object whose NpId (+0xE, 36 bytes) equals M+0xA78 and whose +4 is set:
+// member id u16 at +0xC. 1 = R was read (*my_member 0 = mine not found yet), 0 = no room data. Any thread (racy reads; the caller re-reads until stable).
+int  jsp_native_room_read(uint16_t member[4], uint8_t com[4], uint16_t* my_member);
+// ENHANCEMENT (4-player online): the human records of the fight (bit i = record i = battle slot i = GekkoNet slot i), set before arm by the session start of
+// a 3-4 player match; the armed pad take then serves exactly those slots (jnf::take_human). 0 (the default, and every 2-player match) = the native rule.
+void jsp_native_fight_set_humans(unsigned mask);
 // FIX (swapped controls, testers on 0.7.0-test1): which pad drives which fighter. The battle builder 0x002EEE90 numbers the humans' net slots
 // (player +0x70) in PLACEMENT order, team-0 records first, then team-1, each in record order (0x002EF350 stw r20,0x70; r20++), while a PC's rollback slot
 // is its room RECORD index (share pad +0x6E0, 0x0F7880 by member id; checked == plan.local_first). They differ when a lower record is on team 1 (the
@@ -62,6 +70,18 @@ inline bool take_slot(int32_t slot, int32_t members, uint32_t* seen)
     if (slot < 0) return false;
     if (!(members + 1 > slot)) return false;
     if (slot >= (int32_t)kRecCount) return false;
+    if (*seen & (1u << slot)) return false;
+    *seen |= 1u << slot;
+    return true;
+}
+// ENHANCEMENT (4-player online): with the room's human records known (human_mask, bit i = record i), record r = GekkoNet slot r for every human
+// record, once per call. FIX (swapped controls): `slot` here is the PORT (the record jsp_native_fight_map found for the fighter's net slot), not the net
+// slot. The native rule above counts members (share pad +0x10) instead, so with 3 humans left in records 0, 1, 3 it drops slot 3; the glue
+// refuses such a room before the fight anyway (jsp4::room_claim), this keeps the take exact for the slots the plan has.
+inline bool take_human(int32_t slot, uint8_t human_mask, uint32_t* seen)
+{
+    if (slot < 0 || slot >= (int32_t)kRecCount) return false;
+    if (!(human_mask & (1u << slot))) return false;
     if (*seen & (1u << slot)) return false;
     *seen |= 1u << slot;
     return true;
