@@ -1,0 +1,52 @@
+The two-thread drawing's submit thread (2912: draw loop, Execute, Present) runs above normal priority and opts out of EcoQoS (HOST_PRIO=0 leaves both at the Windows default).
+
+On a hybrid CPU under Windows 10 (no Thread Director) every CPU part of a frame ran about 3x slower than on a desktop CPU of the same
+single-thread speed (test10: guest 48.6 vs 13.2 ms, FIFO drain 42 vs 14, present 19 vs 10). The title's high-priority PPU threads run
+above normal (sys_ppu_thread.c); the submit thread ran at normal priority and could be throttled, so it could lose its core to them or
+be left on an efficiency core. It now runs one step above normal, like the port's FIFO drain thread, and asks Windows not to
+throttle its execution speed (SetThreadInformation ThreadPowerThrottling, looked up at run time). One line at start:
+"[PIPE] thread: priority above normal ok, EcoQoS off ok". Host scheduling only: nothing the title reads changes.
+
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+index 4b83742..1525363 100644
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -487,6 +487,7 @@ typedef struct RfFrame {
+     int have_st; float vc[16];
+ } RfFrame;
+ static void render_frame_submit(const RfFrame* f);
++static void pipe_thread_tune(void);   /* 2921 */
+ static struct {
+     int on;                 /* -1 unknown, 0 off, 1 on */
+     HANDLE go, done, th;
+@@ -497,6 +498,7 @@ static struct {
+ static DWORD WINAPI pipe_thread(LPVOID arg)
+ {
+     (void)arg;
++    pipe_thread_tune();   /* 2921 */
+     for (;;) {
+         WaitForSingleObject(s_pipe.go, INFINITE);
+         render_frame_submit(&s_pipe.f);
+@@ -504,6 +506,22 @@ static DWORD WINAPI pipe_thread(LPVOID arg)
+     }
+     return 0;
+ }
++/* 2921: the submit thread (draw loop, Execute, Present) runs one step above normal, like the title's high-priority PPU threads and the
++ * port's FIFO drain thread, and opts out of EcoQoS (execution-speed power throttling). On a hybrid CPU under Windows 10 (no Thread
++ * Director) a normal-priority or throttled thread can be left on an efficiency core behind them. Host scheduling only: nothing the title
++ * reads changes. HOST_PRIO=0 leaves both at the Windows default. SetThreadInformation is looked up at run time (Windows 8+; values from
++ * processthreadsapi.h: ThreadPowerThrottling = 3, THREAD_POWER_THROTTLING_CURRENT_VERSION = 1, ..._EXECUTION_SPEED = 0x1). */
++static void pipe_thread_tune(void)
++{
++    const char* e = getenv("HOST_PRIO");
++    if (e && *e == '0') { fprintf(stderr, "[PIPE] thread: HOST_PRIO=0, Windows default priority and power throttling%c", 10); return; }
++    const int prio = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) ? 1 : 0;
++    struct { ULONG Version, ControlMask, StateMask; } ts = { 1u, 0x1u, 0u };   /* StateMask 0 = never throttle this thread */
++    typedef BOOL (WINAPI *set_ti_fn)(HANDLE, int, LPVOID, DWORD);
++    const set_ti_fn set = (set_ti_fn)(void*)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadInformation");
++    const int eco = (set && set(GetCurrentThread(), 3, &ts, (DWORD)sizeof ts)) ? 1 : 0;
++    fprintf(stderr, "[PIPE] thread: priority above normal %s, EcoQoS off %s%c", prio ? "ok" : "failed", eco ? "ok" : "failed", 10);
++}
+ static int pipe_on(void)
+ {
+     if (s_pipe.on < 0) {

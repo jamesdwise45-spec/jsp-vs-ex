@@ -465,7 +465,7 @@ static int lockstep_pass(int rsx_ok)
     const long long f = g_ls_qf.QuadPart;
     if (cellGcm_flip_ready()) {
         hz_ready(now.QuadPart, g_ls_next);   // DIAGNOSTIC (per-hitch line): how late the guest's flip became ready
-        if (g_ls_next && now.QuadPart < g_ls_next) {   // hold to the schedule: sleep in whole ms to ~1.5 ms before the deadline, then spin
+        if (g_ls_next && now.QuadPart < g_ls_next) {   // hold to the schedule: with over 2.5 ms left, sleep whole ms until 1.5-2.5 ms before the deadline (then come back); the last 1.5-2.5 ms spin
             const long long left_us = (g_ls_next - now.QuadPart) * 1000000 / f;
             if (left_us > 2500) { cellGcm_fifo_kick_wait((unsigned)((left_us - 1500) / 1000)); return 2; }   // a kick wakes it early: main.cpp drains, we come back
             while (now.QuadPart < g_ls_next) { YieldProcessor(); QueryPerformanceCounter(&now); }
