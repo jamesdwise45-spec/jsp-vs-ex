@@ -1,0 +1,143 @@
+Patch 7932 (experiment, present path): PRESENT_TEAR=1 and WAITABLE_SC=<1-3>, both off by default.
+
+PRESENT_TEAR=1: in the default present mode (no vblank wait) the swap chain is made with ALLOW_TEARING when DXGI supports it and
+Present passes DXGI_PRESENT_ALLOW_TEARING (Microsoft's advice for windowed and borderless flip-model games: a borderless window that
+owns the screen can use independent flip and VRR). A composed window looks as before; an independently flipped one can tear.
+D3D12_VSYNC=1 never passes it (sync interval 1). After creation the swap chain's real flags (GetDesc1) decide: no ALLOW_TEARING flag,
+no ALLOW_TEARING present (it would be DXGI_ERROR_INVALID_CALL). D3D12_VSYNC=0 keeps working as before.
+WAITABLE_SC=n: the swap chain gets FRAME_LATENCY_WAITABLE_OBJECT and SetMaximumFrameLatency(n); the thread that presents (the submit
+thread with PIPE=1) waits on the object before it records a batch that presents, bounded at 100 ms. It is the wait Present would do,
+earlier; the HITCH probe counts it under "Present", and a line every 1800 presents gives the total and the timeouts. Start lines:
+"[D3D12] present flags: ..." and "[D3D12] WAITABLE_SC=n: frame-latency object on". Nothing the guest reads changes.
+
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+index f37dd62..05376f2 100644
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -342,7 +342,8 @@ typedef struct {
+     ID3D12Device*              device;
+     ID3D12CommandQueue*        cmd_queue;
+     IDXGISwapChain3*           swap_chain;
+-    int                        tearing;     /* D3D12_VSYNC=0 and the swap chain allows tearing */
++    int                        tearing;     /* D3D12_VSYNC=0 (or PRESENT_TEAR=1, 7932) and the swap chain allows tearing */
++    HANDLE                     latency_wait; /* 7932 WAITABLE_SC: the swap chain's frame-latency object, or NULL */
+     ID3D12DescriptorHeap*      rtv_heap;
+     u32                        rtv_descriptor_size;
+     ID3D12Resource*            render_targets[FRAME_COUNT];
+@@ -1193,6 +1194,28 @@ static int d3d12_present_mode(void)
+     return mode;
+ }
+ static int d3d12_vsync_off(void) { return d3d12_present_mode() == 2; }   /* the swap chain asks for tearing only then */
++/* 7932 (present path, both off by default; read once at swap-chain creation):
++ * PRESENT_TEAR=1: in the default present mode (no vblank wait) also pass DXGI_PRESENT_ALLOW_TEARING when DXGI supports it
++ *   (Microsoft's advice for windowed and borderless flip-model games: it lets a borderless window that owns the screen use
++ *   independent flip / VRR and skip the compositor's extra frame). A composed window looks the same as before; a borderless
++ *   one that gets independent flip can tear, like D3D12_VSYNC=0. With D3D12_VSYNC=1 (sync interval 1) the flag is never
++ *   passed, as DXGI requires.
++ * WAITABLE_SC=<1-3>: a frame-latency waitable swap chain (SetMaximumFrameLatency(n)). The thread that presents waits on its
++ *   object before it records a batch that presents (bounded at 100 ms, then it carries on), so a GPU or compositor that is
++ *   behind holds the CPU at the start of a frame instead of letting presents queue up (lower input-to-screen latency). It is
++ *   the same wait Present would do, earlier; the HITCH probe counts it under "Present". Nothing the guest reads changes. */
++static int present_tear_on(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("PRESENT_TEAR"); v = (e && *e == '1') ? 1 : 0; }
++    return v;
++}
++static int waitable_sc_n(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("WAITABLE_SC"); v = e ? atoi(e) : 0; if (v < 0) v = 0; if (v > 3) v = 3; }
++    return v;
++}
+ 
+ /* 7930: the adapter the device runs on, for the video memory figures of the [RSXMEM] line (NULL: not available). */
+ static IDXGIAdapter3* s_vram_ad = NULL;
+@@ -1274,7 +1297,7 @@ static int init_d3d12(u32 width, u32 height)
+     /* D3D12_VSYNC=0 presents with a sync interval of 0, but a windowed
+      * flip-model swap chain still waits for the compositor, which runs at the
+      * display's rate, unless it allows tearing. So allow it where DXGI can. */
+-    if (d3d12_vsync_off()) {
++    if (d3d12_vsync_off() || (present_tear_on() && d3d12_present_mode() == 0)) {   /* 7932: PRESENT_TEAR=1 in the default mode */
+         IDXGIFactory5* factory5 = NULL;
+         BOOL tear = FALSE;
+         if (SUCCEEDED(factory->lpVtbl->QueryInterface(
+@@ -1285,9 +1308,10 @@ static int init_d3d12(u32 width, u32 height)
+             factory5->lpVtbl->Release(factory5);
+         }
+         s_d3d.tearing = tear ? 1 : 0;
+-        if (tear) sc_desc.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+-        printf("[D3D12] D3D12_VSYNC=0: tearing %s\n", tear ? "allowed" : "not supported");
++        if (tear) sc_desc.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
++        printf("[D3D12] %s: tearing %s\n", d3d12_vsync_off() ? "D3D12_VSYNC=0" : "PRESENT_TEAR=1", tear ? "allowed" : "not supported");
+     }
++    if (waitable_sc_n() > 0) sc_desc.Flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;   /* 7932 */
+ 
+     IDXGISwapChain1* swap_chain1 = NULL;
+     hr = factory->lpVtbl->CreateSwapChainForHwnd(
+@@ -1312,6 +1336,26 @@ static int init_d3d12(u32 width, u32 height)
+         return -1;
+     }
+ 
++    /* 7932: the flags the swap chain really has decide what Present may pass (ALLOW_TEARING on a chain made without it is
++     * DXGI_ERROR_INVALID_CALL), and the frame-latency object. */
++    {
++        DXGI_SWAP_CHAIN_DESC1 got; memset(&got, 0, sizeof got);
++        if (SUCCEEDED(s_d3d.swap_chain->lpVtbl->GetDesc1(s_d3d.swap_chain, &got))) {
++            if (s_d3d.tearing && !(got.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)) {
++                s_d3d.tearing = 0; printf("[D3D12] swap chain has no ALLOW_TEARING flag: presents without it\n"); }
++        } else got.Flags = sc_desc.Flags;
++        s_d3d.latency_wait = NULL;
++        if (waitable_sc_n() > 0 && (got.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT)) {
++            const HRESULT lr = s_d3d.swap_chain->lpVtbl->SetMaximumFrameLatency(s_d3d.swap_chain, (UINT)waitable_sc_n());
++            s_d3d.latency_wait = SUCCEEDED(lr) ? s_d3d.swap_chain->lpVtbl->GetFrameLatencyWaitableObject(s_d3d.swap_chain) : NULL;
++        }
++        if (waitable_sc_n() > 0)
++            fprintf(stderr, "[D3D12] WAITABLE_SC=%d: frame-latency object %s%c", waitable_sc_n(),
++                    s_d3d.latency_wait ? "on" : "not available (presents as before)", 10);
++        if (present_tear_on() || d3d12_vsync_off())
++            fprintf(stderr, "[D3D12] present flags: %s%c", s_d3d.tearing ? "ALLOW_TEARING" : "none (tearing not supported)", 10);
++    }
++
+     s_d3d.frame_index = s_d3d.swap_chain->lpVtbl->GetCurrentBackBufferIndex(s_d3d.swap_chain);
+ 
+     /* Create RTV descriptor heap */
+@@ -9181,6 +9225,19 @@ static void render_frame_submit(const RfFrame* f)
+ {
+     const double _rf0 = f->rf0;
+     u32 fi = f->fi;
++    if (f->present && s_d3d.latency_wait) {   /* 7932 WAITABLE_SC: the frame-latency wait, before this batch's commands */
++        const double t0 = hz_now();
++        const DWORD r = WaitForSingleObjectEx(s_d3d.latency_wait, 100, FALSE);
++        const double ms = hz_now() - t0;
++        if (hz_ms()) { s_hz_t[7] += ms; s_hz_n[7]++; }
++        static u32 s_lw_n = 0; static double s_lw_ms = 0; static u32 s_lw_to = 0;
++        s_lw_n++; s_lw_ms += ms; if (r == WAIT_TIMEOUT) s_lw_to++;
++        if (s_lw_n == 1800) {
++            fprintf(stderr, "[D3D12] WAITABLE_SC: %u presents waited %.1f ms in all (%.2f avg), %u timed out at 100 ms%c",
++                    s_lw_n, s_lw_ms, s_lw_ms / (double)s_lw_n, s_lw_to, 10);
++            s_lw_ms = 0; s_lw_to = 0; s_lw_n = 0;
++        }
++    }
+     D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle;
+     s_d3d.rtv_heap->lpVtbl->GetCPUDescriptorHandleForHeapStart(s_d3d.rtv_heap, &rtv_handle);
+     rtv_handle.ptr += fi * s_d3d.rtv_descriptor_size;
+@@ -10182,8 +10239,8 @@ skip_dump_consider: ;
+         if (pm == 1)
+             s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, 1, 0);
+         else
+-            s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, 0,
+-                                              (pm == 2 && s_d3d.tearing) ? DXGI_PRESENT_ALLOW_TEARING : 0);
++            s_d3d.swap_chain->lpVtbl->Present(s_d3d.swap_chain, 0,   /* 7932: mode 0 with PRESENT_TEAR=1 too (s_d3d.tearing) */
++                                              s_d3d.tearing ? DXGI_PRESENT_ALLOW_TEARING : 0);
+         if (hz_p0) { s_hz_t[7] += hz_now() - hz_p0; s_hz_n[7]++; }
+     }
+     rdoc_frame_end();
+@@ -13202,6 +13259,7 @@ void rsx_d3d12_backend_shutdown(void)
+     if (s_d3d.root_signature) s_d3d.root_signature->lpVtbl->Release(s_d3d.root_signature);
+     if (s_d3d.fence) s_d3d.fence->lpVtbl->Release(s_d3d.fence);
+     if (s_ovl.fence) { s_ovl.fence->lpVtbl->Release(s_ovl.fence); s_ovl.fence = NULL; }   /* 7931 */
++    if (s_d3d.latency_wait) { CloseHandle(s_d3d.latency_wait); s_d3d.latency_wait = NULL; }   /* 7932 */
+     if (s_d3d.fence_event) CloseHandle(s_d3d.fence_event);
+     if (s_d3d.cmd_list) s_d3d.cmd_list->lpVtbl->Release(s_d3d.cmd_list);
+     if (s_d3d.tex_ring) s_d3d.tex_ring->lpVtbl->Release(s_d3d.tex_ring);
