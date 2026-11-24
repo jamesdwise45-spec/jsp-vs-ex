@@ -77,7 +77,7 @@ jobs:
           ## New in test9
 
           - **Uninstall test8 first** (Start menu > Uninstall JSP Fan Revival), then run the new jsp-setup.exe. The main menu's lower right corner must say 0.7.0-test9 on both PCs.
-          - **A slower PC now raises its own input delay.** In online fights both PCs run at the pace of the slower one. When a PC can't keep 30 fps (for example a laptop), it now adds one or two frames of input delay to itself, so its moves reach the other PC in time. That should mean far fewer rollbacks and less stutter on the faster PC. It does not make the slow PC itself faster, and the fight sound still breaks up while a fight runs under 30 fps (a fix for that is in progress). JSP_INPUT_DELAY_AUTO_SLOW_TPS=0 in play_settings.txt turns it off.
+          - **The faster PC now waits for a slower one properly.** In online fights both PCs run at the pace of the slower one. Until now the faster PC could only slow itself down a little, so next to a PC that can't keep 30 fps (for example a laptop) it kept running ahead, guessing the other player's moves and rolling back over and over. It now slows down as much as needed to stay level, which should mean far fewer rollbacks and much less stutter on the faster PC. Two PCs that both keep up play exactly as before. It does not make the slow PC itself faster, and the fight sound still breaks up while a fight runs under 30 fps (a fix for that is in progress). JSP_TIMESYNC_GAIN_US=1000 and JSP_TIMESYNC_MAX_US=2000 in play_settings.txt bring back the old behaviour.
           - **Better support bundles.** The bundle now names the graphics card the game really used and notes a laptop whose screen runs through a second graphics chip.
 
           ## From test8
