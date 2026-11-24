@@ -50,6 +50,23 @@ static void rules()
     const uint64_t odd = preload_bytes(sound, 512, GB + 2 * (100 * MB + 12345));
     CHECK(odd < sound && odd % kAlign == 0 && odd <= 100 * MB + 12345 && odd + kAlign > 100 * MB + 12345);   // a partial preload ends on a block
     CHECK(preload_bytes(1000, 512, 8 * GB) == 1000);               // a small whole file keeps its odd length
+    // A PC under 12 GB: at most a quarter of its RAM; 12 GB and up: no such cap.
+    CHECK(preload_bytes(sound, 512, 6 * GB, 8 * GB) == sound);          // 8 GB: 2 GB cap, the file fits
+    CHECK(preload_bytes(sound, 512, 6 * GB, 1200 * MB) == 300 * MB);    // 1.2 GB PC: 300 MB
+    CHECK(preload_bytes(sound, 512, 6 * GB, 16 * GB) == sound);
+    CHECK(preload_bytes(sound, 512, GB + 300 * MB, 1200 * MB) == 150 * MB);   // the free-RAM cap is still the smaller one
+    CHECK(preload_bytes(sound, 512, 0, 0) == sound);                    // both unknown
+
+    // The copy: the first open, unless the hdd0 install copy comes after a disc copy.
+    CHECK(is_hdd0("/dev_hdd0/game/X/USRDIR/data/PS3/partition_op_sound_ps3.cpk"));
+    CHECK(!is_hdd0("/dev_bdvd/PS3_GAME/USRDIR/data/PS3/partition_op_sound_ps3.cpk"));
+    CHECK(!is_hdd0(nullptr));
+    CHECK(better_copy(false, false, "/dev_bdvd/a"));
+    CHECK(better_copy(false, false, "/dev_hdd0/a"));
+    CHECK(better_copy(true, false, "/dev_hdd0/a"));
+    CHECK(!better_copy(true, false, "/dev_bdvd/b"));
+    CHECK(!better_copy(true, true, "/dev_hdd0/b"));
+    CHECK(!better_copy(true, true, "/dev_bdvd/b"));
 }
 
 #ifdef SOUND_PRELOAD_GLUE
@@ -58,6 +75,7 @@ extern "C" { const ps3_fs_vfile_ops* volatile g_ps3_fs_vfile_ops = nullptr; }   
 extern "C" void jsp_sound_preload_install(void);
 extern "C" void jsp_sound_preload_fight_start(void);
 extern "C" int jsp_sound_preload_state(uint64_t* bytes);
+extern "C" int jsp_sound_preload_refreshing(void);
 
 // A stand-in for the mods folder's provider: claims "*.mod" paths only and counts the calls.
 static int f_opens = 0, f_sizes = 0, f_reads = 0, f_closes = 0;
@@ -69,7 +87,7 @@ static const ps3_fs_vfile_ops f_ops = { f_open, f_size, f_read, f_close };
 
 static int wait_state(uint64_t* bytes)
 {
-    for (int i = 0; i < 500; ++i) {
+    for (int i = 0; i < 1000; ++i) {   // the preload waits kPickMs (2 s) before it picks the copy
         const int s = jsp_sound_preload_state(bytes);
         if (s == 2 || s == -1) return s;
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -114,17 +132,22 @@ static void glue(const char* dir)
         ops->close(vf);
         CHECK(f_closes == 1);
     }
-    // The sound archive: not claimed (the game reads its own handle), the preload starts and holds the whole file.
+    // The sound archive: not claimed (the game reads its own handle). A disc copy first (a path that does not exist), then the hdd0 copy within
+    // the pick window: the hdd0 copy is the one preloaded; a later disc open changes nothing.
+    CHECK(ops->open("/dev_bdvd/PS3_GAME/USRDIR/data/PS3/partition_op_sound_ps3.cpk", "/nonexistent/partition_op_sound_ps3.cpk") == nullptr);
+    CHECK(jsp_sound_preload_state(nullptr) == 1);
     CHECK(ops->open("/dev_hdd0/game/X/USRDIR/data/PS3/partition_op_sound_ps3.cpk", path.c_str()) == nullptr);
-    CHECK(f_opens == 3);
+    CHECK(ops->open("/dev_bdvd/y/partition_op_sound_ps3.cpk", "/nonexistent") == nullptr);
+    CHECK(f_opens == 5);
     CHECK(wait_state(&bytes) == 2);
     CHECK(bytes == size);
-    // A second open (another path) starts nothing new.
-    CHECK(ops->open("/dev_bdvd/y/partition_op_sound_ps3.cpk", "/nonexistent") == nullptr);
-    CHECK(jsp_sound_preload_state(&bytes) == 2 && bytes == size);
     jsp_sound_preload_fight_start();
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));   // the refresh thread logs its line
+    for (int i = 0; i < 500 && jsp_sound_preload_refreshing(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    CHECK(!jsp_sound_preload_refreshing());
     CHECK(jsp_sound_preload_state(&bytes) == 2 && bytes == size);
+    jsp_sound_preload_fight_start();   // a second refresh also ends
+    for (int i = 0; i < 500 && jsp_sound_preload_refreshing(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    CHECK(!jsp_sound_preload_refreshing());
     std::remove(path.c_str());
 }
 #endif
