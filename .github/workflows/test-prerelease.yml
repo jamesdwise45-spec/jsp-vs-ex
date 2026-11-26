@@ -74,9 +74,15 @@ jobs:
           cat > notes.md <<EOF
           Online test build $VERSION of draft PR Tsamiuy/jsp-vs-ex#248 (rollback for Online Battle). Not an official release of the project.
 
-          ## New in test11
+          ## New in test12
 
-          - **Uninstall test10 first** (Start menu > Uninstall JSP Fan Revival), then run the new jsp-setup.exe. The main menu's lower right corner must say 0.7.0-test11 on every PC.
+          - **Uninstall test11 first** (Start menu > Uninstall JSP Fan Revival), then run the new jsp-setup.exe. The main menu's lower right corner must say 0.7.0-test12 on every PC. **Every player needs test12**: a test11 and a test12 PC in the same fight will desync.
+          - **Fight sound no longer stutters.** In online fights about two thirds of the fight's sound was silence, cutting in and out about 7 times a second (menus were fine). The game's sound engine was only allowed to run 30 times a second to keep both PCs in sync; it needs 60. It now runs 60 times a second, still in sync. In our local tests the silence in a fight went from 64% to under 8%, with no desyncs. JSP_NET_CRI_PER_TICK=1 in play_settings.txt brings back test11's sound (both players must use the same value).
+          - **Steadier sound when a PC slows down for a moment.** Instead of a quick burst of short dropouts, the sound now slows down slightly for that moment without changing pitch. AUDIO_LOCK_FAST=0 turns this off.
+          - Please send a support bundle after a session, and tell us how the fight sound and music feel now.
+
+          ## From test11
+
           - **Remove old audio lines.** If your play_settings.txt has PS3_AUDIO_BUF_MS, AUDIO_LOCK_BUF_MS, AUDIO_LOCK_CUSHION_MS or AUDIO_LOCK_DRC lines, delete them: the new defaults are better.
           - **Fight sound catches up after a stall.** When either PC stalls, the fight sound used to repay only a part of the lost time, so stalls turned into gaps. It now repays it properly, reacts to a slow stretch within about a second, and changes speed **without changing pitch** (no more chipmunk or slow-motion voices). AUDIO_LOCK_STRETCH=0 turns the pitch-keeping off; AUDIO_LOCK_REFILL=0 brings back test10's sound.
           - **Fewer stalls.** The game window now runs on its own thread, so dragging the window, pressing Alt or another program poking the window no longer freezes the fight on both PCs (WINDOW_THREAD=0 turns this off). Rollback saves no longer wait for the graphics driver's threads, which caused 30-160 ms freezes on NVIDIA laptops (JSP_SNAPSHOT_SKIP_DRIVER=0 turns this off).
