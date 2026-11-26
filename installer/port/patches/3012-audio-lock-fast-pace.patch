@@ -1,0 +1,212 @@
+Patch 3012: the tick-locked audio's output follows the level at once when it falls well under the cushion (fast pace; AUDIO_LOCK_FAST=0 turns it off).
+
+Why (test11 field bundles 2026-11-24 + a local two-copy run 2026-11-26): mid-fight choppy sound comes in clusters of 8-11 short concealed gaps
+(13-30 ms) in the first second of a run of slow ticks (50-80 ms). The 90 ms cushion is gone after ~3 such ticks, while the slow pace (3009/3010)
+needs two 333 ms buckets to engage and then moves at 0.5/s. That slowness was there to keep the pitch steady; with the pitch-preserving stretch
+(3011) a quick tempo change no longer moves the pitch.
+
+- lk_slow_burst: a low point under LK_FAST_FROM (0.60) x the cushion engages the fast pace; while engaged (until the low point is back at
+  LK_FAST_HOLD = 0.85 x the cushion) the rate is at most 1 - LK_FAST_GAIN (0.6) x (hold - level) / hold, never under AUDIO_LOCK_SLOW_MIN, ramped
+  down at LK_FAST_DOWN (3/s); back up at LK_FAST_UP (0.8/s) while the level is under the hold, then at 3/s (review: at 0.8/s the level overshot the
+  cushion by up to ~110 ms, extra delay and drops on a 200 ms device); 3009's own engagement keeps LK_SLOW_UP. Only with the stretch (3011) and the
+  slow pace on. Normal play never reaches LK_FAST_FROM; a single tick of ~69 ms or more does (a 76 ms hitch dips the rate for a few ticks).
+- the "[audio-lock]" line keeps every field and appends "fast pace: N bursts, S s, rate min R, on|off (...)"; the slow pace's time and rate min no
+  longer count the fast pace's (with AUDIO_LOCK_FAST=0 the line is 3011's plus the appended fields).
+- tests/test_audio_lock_race.c part 8 (virtual time, real output): steady 30 ticks/s unchanged; single 60-150 ms hitches never worse; lumpy slow
+  patches and runs of 45-55 ms ticks at least 3x fewer gaps and clusters (measured 84 -> 19 and 104 -> 3); 76 ms hitches every 2-3 s on a 300 ms
+  and a 200 ms device (4 -> 1, 29 -> 1 gaps); never more squeezed or dropped blocks, the low point never lastingly over the cushion (+15 ms mean,
+  +30 ms peak); the rate never past the ramps or under the floor. Reviewed: D:\jsp-audit\test12\REVIEW-3012.md (finding 1 fixed as tested there).
+Output only, like 3007-3011: the blocks mixed, the read index and the notify events are untouched (determinism unchanged).
+diff --git a/libs/audio/cellAudio.c b/libs/audio/cellAudio.c
+index ac6165f..abffaef 100644
+--- a/libs/audio/cellAudio.c
++++ b/libs/audio/cellAudio.c
+@@ -961,6 +961,15 @@ static double s_lk_q_r[LK_Q_WIN], s_lk_q_long[LK_Q_WIN];      /* the last comple
+ static double s_lk_q_longest = 0.0, s_lk_burst_t = -1.0, s_lk_burst_lvl = 0.0;
+ static double s_lk_gap_t = -1.0, s_lk_gap_since = 0.0, s_lk_gap_lvl = 0.0;   /* the gap being concealed: when, ms since the burst, level before it */
+ static lk_slow_mark s_lk_q[LK_Q_WIN + 1];                    /* patch 3010: the start of the quick bucket being filled [0] and of the ones before it */
++/* patch 3012: the fast pace (see lk_slow_burst) */
++#define LK_FAST_FROM  0.60               /* of the cushion: a low point under this engages the fast pace (54 ms of 90) */
++#define LK_FAST_HOLD  0.85               /* of the cushion: engaged, it acts until the low point is back here (76.5 ms): no on/off flutter */
++#define LK_FAST_GAIN  0.6                /* rate 1 - GAIN x (hold - level) / hold: 0.82 at 54 ms, the 0.6 floor under ~25 ms */
++#define LK_FAST_DOWN  3.0                /* rate per second, down (a 33 ms tick moves it by 0.1 at most) */
++#define LK_FAST_UP    0.8                /* rate per second, up, while the level is still under the hold (then LK_FAST_DOWN: review, no overshoot) */
++static int s_lk_fast_on = 0;
++static int s_lk_stretch;                 /* defined with patch 3011's code below */
++static int s_lk_fast = 1, s_lk_fast_drive = 0; static unsigned long long s_lk_fast_bursts; static double s_lk_fast_ms = 0.0, s_lk_fast_lo = 1.0;
+ static double lk_now_ms(void)
+ {
+     static LARGE_INTEGER f; LARGE_INTEGER t;
+@@ -983,7 +992,8 @@ static void lk_slow_burst(double ff, int level, int cushion)
+     const double dt_raw = s_lk_slow_t < 0 ? 0.0 : (now - s_lk_slow_t) / 1000.0;
+     const double dt = dt_raw > LK_SLOW_DT_MAX ? LK_SLOW_DT_MAX : dt_raw;   /* the ramps: a long stall must not snap the pitch in one step */
+     s_lk_slow_t = now;
+-    if (s_lk_slow_eng || s_lk_slow_out < 1.0) s_lk_slow_ms += dt_raw * 1000.0;
++    if (s_lk_fast_drive && !s_lk_slow_eng) s_lk_fast_ms += dt_raw * 1000.0;   /* patch 3012: its own time, not the slow pace's */
++    else if (s_lk_slow_eng || s_lk_slow_out < 1.0) s_lk_slow_ms += dt_raw * 1000.0;
+     const unsigned long long b = s_lk_blocks - 1;
+     s_lk_sr_ffb += s_lk_sr_last_ff * (double)(b - s_lk_sr_last_b);   /* the last burst's blocks, at the feed-forward they were played with */
+     s_lk_sr_last_ff = ff; s_lk_sr_last_b = b;
+@@ -1048,11 +1058,39 @@ static void lk_slow_burst(double ff, int level, int cushion)
+         const double lo = s_lk_slow_min / 100.0; if (out < lo) out = lo;
+         if (out > 1.0 + LK_SLOW_LVL) out = 1.0 + LK_SLOW_LVL;
+     }
++    /* J-Stars patch 3012 (AUDIO_LOCK_FAST=0 turns it off: 3011 as it was): the fast pace. With the pitch-preserving stretch (3011) a quick tempo
++     * change no longer changes the pitch, so the output follows the level itself as soon as it falls well under the cushion, instead of waiting
++     * for the slow pace's buckets (two of 333 ms) and its 0.5/s ramp. A low point under LK_FAST_FROM x the cushion engages it; engaged, until the
++     * low point is back at LK_FAST_HOLD x the cushion, the rate is at most 1 - LK_FAST_GAIN x (hold - level) / hold, never under AUDIO_LOCK_SLOW_MIN,
++     * ramped down at LK_FAST_DOWN per second; back up at LK_FAST_UP while the level is under the hold, then at LK_FAST_DOWN (review of 3012: at
++     * 0.8/s the level overshot the cushion by up to ~110 ms after a dip, extra delay and drops on a 200 ms device). 3009's own engagement keeps
++     * LK_SLOW_UP. Normal play never reaches LK_FAST_FROM; a single tick of ~69 ms or more does (a 76 ms hitch dips the rate for a few ticks).
++     * Why (test11 field + a local two-copy run): mid-fight chops come in clusters, 8-11 short concealed gaps (13-30 ms) in the first second of a
++     * run of slow ticks, because the 90 ms cushion is gone after ~3 ticks at 60 ms while the slow pace needs 0.67 s to engage. Replayed in virtual
++     * time (tests/test_audio_lock_race.c, scenario 3012): ~10 gaps per such run before, ~1-2 after. */
++    int fast = 0;
++    if (s_lk_fast && s_lk_stretch && s_lk_slow_min && cushion > 0) {
++        const double from = cushion * LK_FAST_FROM, hold = cushion * LK_FAST_HOLD;
++        if (level < from) s_lk_fast_on = 1; else if (level >= hold) s_lk_fast_on = 0;
++        if (s_lk_fast_on && level < hold) {
++            double r = 1.0 - LK_FAST_GAIN * (hold - level) / hold;
++            const double lo = s_lk_slow_min / 100.0; if (r < lo) r = lo;
++            if (r < out) { out = r; fast = 1; s_lk_fast_bursts++; }
++        }
++    }
++    const double dn = fast ? LK_FAST_DOWN : down;
+     /* what the resampler plays: no faster a change than the ramps (the trim does not jump in at engaging) */
+-    if (out < s_lk_slow_out - down * dt) out = s_lk_slow_out - down * dt;
+-    if (out > s_lk_slow_out + LK_SLOW_UP * dt) out = s_lk_slow_out + LK_SLOW_UP * dt;
++    if (out < s_lk_slow_out - dn * dt) out = s_lk_slow_out - dn * dt;
++    {   /* patch 3012: the up-ramp while the fast pace is on and 3009 is not engaged: slow while the level is still low, quick once it is back */
++        const int fp = s_lk_fast && s_lk_stretch && s_lk_slow_min && !s_lk_slow_eng;
++        const double up = !fp ? LK_SLOW_UP : level >= cushion * LK_FAST_HOLD ? LK_FAST_DOWN : LK_FAST_UP;
++        if (out > s_lk_slow_out + up * dt) out = s_lk_slow_out + up * dt;
++    }
+     s_lk_slow_out = out; s_lk_slow_from = s_lk_slow_play; s_lk_slow_i = 0;
+-    if (s_lk_slow_out < s_lk_slow_lo) s_lk_slow_lo = s_lk_slow_out;
++    /* patch 3012: a rate the fast pace set (until it is back at 1, or 3009 engages) is the fast pace's, in the report */
++    s_lk_fast_drive = fast || (s_lk_fast_drive && s_lk_slow_out < 1.0 && !s_lk_slow_eng);
++    if (s_lk_fast_drive && !s_lk_slow_eng) { if (s_lk_slow_out < s_lk_fast_lo) s_lk_fast_lo = s_lk_slow_out; }
++    else if (s_lk_slow_out < s_lk_slow_lo) s_lk_slow_lo = s_lk_slow_out;
+ }
+ /* The rate the resampler plays this block at: from where the last burst left it to s_lk_slow_out over the first 6 blocks of the burst. */
+ /* J-Stars patch 3011 (AUDIO_LOCK_STRETCH=0 turns it off: 3010 as it was): a pitch-preserving time stretch (WSOLA) in place of the linear resampler.
+@@ -1175,6 +1213,7 @@ static void lk_begin(void)
+         s_lk_refill = lk_env(getenv("AUDIO_LOCK_REFILL"), 1) != 0;   /* patch 3010 */
+         s_lk_drc_boost = lk_env(getenv("AUDIO_LOCK_DRC_BOOST"), 16); if (s_lk_drc_boost < 0) s_lk_drc_boost = 0; if (s_lk_drc_boost > 20) s_lk_drc_boost = 20;
+         s_lk_stretch = lk_env(getenv("AUDIO_LOCK_STRETCH"), 1) != 0;   /* patch 3011 */
++        s_lk_fast = lk_env(getenv("AUDIO_LOCK_FAST"), 1) != 0;         /* patch 3012 */
+     }
+     s_lk_active = 1; s_lk_burst = 1; s_lk_have_last = 0; s_lk_pos = 0.0; s_lk_ema = -1.0; s_lk_skew = 0.0; s_lk_ring_w = 0; s_lk_conc = 0;
+     s_lk_blocks = s_lk_dry = s_lk_conceals = s_lk_conc_frames = s_lk_long_gaps = s_lk_drops = s_lk_squeezed = s_lk_bursts = 0;
+@@ -1185,6 +1224,7 @@ static void lk_begin(void)
+     s_lk_debt = s_lk_debt_max = s_lk_paid = s_lk_fb_pay = 0.0; s_lk_sb_total = s_lk_q_from = 0; s_lk_eng_lo = 1.0; s_lk_q_n = 0; s_lk_q_eng = 0; s_lk_q_entries = 0; s_lk_q_longest = 0.0;   /* patch 3010 */
+     s_lk_burst_t = s_lk_gap_t = -1.0; s_lk_burst_lvl = s_lk_gap_since = s_lk_gap_lvl = 0.0;
+     lk_ws_reset();   /* patch 3011 */
++    s_lk_fast_bursts = 0; s_lk_fast_on = 0; s_lk_fast_drive = 0; s_lk_fast_ms = 0.0; s_lk_fast_lo = 1.0;   /* patch 3012 */
+ }
+ static int lk_cushion_frames(void)
+ {
+@@ -1201,7 +1241,8 @@ static void lk_report(const char* why)
+                     "stretch fed forward: %llu bursts, mean %.0f us, max %d us, total rate %+.2f..%+.2f %%, feed-forward %s, "
+                     "slow pace: %llu times, %.1f s, rate min %.3f, floor %d %%, %s, "
+                     "refill: debt max %.0f ms, %.0f ms paid back, quick slow pace %llu times, boost %.2f %%, %s, "
+-                    "time stretch: %llu grains, %llu blocks at the slowest step, %s\n",
++                    "time stretch: %llu grains, %llu blocks at the slowest step, %s, "
++                    "fast pace: %llu bursts, %.1f s, rate min %.3f, %s\n",
+             why, s_lk_blocks, s_lk_dry, s_lk_conceals, s_lk_conc_frames / fpms, s_lk_long_gaps, s_lk_conceal_ms, s_lk_squeezed, s_lk_drops,
+             s_lk_skew_min * 100.0, s_lk_skew_max * 100.0, s_lk_trough_min < 0 ? 0.0 : s_lk_trough_min / fpms, s_lk_bursts ? s_lk_trough_sum / s_lk_bursts / fpms : 0.0,
+             lk_cushion_frames() / fpms, lk_cap_frames() / fpms, s_lk_smooth ? "on" : "off (AUDIO_LOCK_SMOOTH=0)",
+@@ -1216,7 +1257,10 @@ static void lk_report(const char* why)
+             s_lk_debt_max / fpms, s_lk_paid / fpms, s_lk_q_entries, s_lk_drc_boost * 100.0 / LK_N,
+             !s_lk_smooth ? "off (smoothing off)" : s_lk_refill ? "on" : "off (AUDIO_LOCK_REFILL=0)",
+             /* patch 3011, appended: the pitch-preserving stretch's grains */
+-            s_ws_grains, s_ws_clamped, !s_lk_smooth ? "off (smoothing off)" : s_lk_stretch ? "pitch-preserving (WSOLA)" : "off, linear resampler (AUDIO_LOCK_STRETCH=0)");
++            s_ws_grains, s_ws_clamped, !s_lk_smooth ? "off (smoothing off)" : s_lk_stretch ? "pitch-preserving (WSOLA)" : "off, linear resampler (AUDIO_LOCK_STRETCH=0)",
++            /* patch 3012, appended: the bursts the fast pace set the rate of */
++            s_lk_fast_bursts, s_lk_fast_ms / 1000.0, s_lk_fast_lo, !s_lk_smooth ? "off (smoothing off)" : !s_lk_stretch ? "off (needs the stretch)" : !s_lk_slow_min ? "off (AUDIO_LOCK_SLOW_MIN=0)"
++                                                : s_lk_fast ? "on" : "off (AUDIO_LOCK_FAST=0)");
+ }
+ static void lk_end(void) { if (!s_lk_active) return; s_lk_active = 0; lk_report("lock ended"); }
+ static void lk_send(const float* f, u32 n)   /* to the device, and into the history */
+diff --git a/libs/audio/tests/test_audio_lock_race.c b/libs/audio/tests/test_audio_lock_race.c
+index e6b2926..89fc772 100644
+--- a/libs/audio/tests/test_audio_lock_race.c
++++ b/libs/audio/tests/test_audio_lock_race.c
+@@ -599,6 +599,69 @@ static void test_time_stretch(void)
+     }
+ }
+ 
++/* Patch 3012 (part 8): the fast pace, in virtual time. Ticks of given lengths through the real output (stretch on, 300 ms device, cushion 90):
++ * the gaps, the gaps within 1.5 s of another (a "chop cluster"), the lowest rate and the largest step of the rate per tick. */
++typedef struct { unsigned long long gaps, clustered, fast, squeezed, drops; double rmin, max_step, lvl_mean, lvl_max; } fast_result;
++static double s_fp[6000]; static int s_fn;
++static void fp_add(double ms, int n) { for (int i = 0; i < n && s_fn < 6000; i++) s_fp[s_fn++] = ms + (prnd() - 0.5) * 4.0; }   /* +-2 ms jitter */
++static fast_result run_fast(int fast, UINT32 dev)
++{
++    static fake_dev d; fake_init(&d, dev);
++    wasapi_dev w = fake_wasapi(&d, 60); wasapi_adopt(&w);
++    ps3r_audio_dev_opened(&s_wasapi_st, GetTickCount64() + 3600 * 1000ull);
++    lk_begin();
++    const int cu = s_lk_cushion_ms, drc = s_lk_drc, sm = s_lk_slow_min, rf = s_lk_refill, st = s_lk_stretch, fa = s_lk_fast;
++    s_lk_cushion_ms = 90; s_lk_drc = 4; s_lk_ff = 1; s_lk_slow_min = 60; s_lk_refill = 1; s_lk_stretch = 1; s_lk_fast = fast;
++    s_lk_test_ms = 0.0;
++    fast_result r; memset(&r, 0, sizeof r); r.rmin = 1.0;
++    double owed = 0.0, last_gap = -1e9, prev = 1.0, lsum = 0.0; long long blocks = 0; unsigned long long g = s_lk_conceals; int nl = 0;
++    for (int t = 0; t < s_fn; t++) {
++        s_lk_burst = 1; g_ps3_audio_lock_stretch_us = 0;
++        if (t >= 150) { lsum += d.padding / 48.0; nl++; if (d.padding / 48.0 > r.lvl_max) r.lvl_max = d.padding / 48.0; }   /* the low point before the burst, from 5 s */
++        for (; blocks < (long long)(t + 1) * 25 / 4; blocks++) { tone((int)blocks); lk_submit_block(); }
++        if (s_lk_slow_out < r.rmin) r.rmin = s_lk_slow_out;
++        if (fabs(s_lk_slow_out - prev) > r.max_step) r.max_step = fabs(s_lk_slow_out - prev); prev = s_lk_slow_out;
++        owed += s_fp[t] * 48.0;
++        for (int k = 0; owed >= 48.0; k++) { play(&d, 48); owed -= 48.0; s_lk_test_ms += 1.0; if (k & 1) lk_idle_tail(); }
++        if (s_lk_conceals != g) { if (s_lk_test_ms - last_gap < 1500.0) r.clustered += s_lk_conceals - g; last_gap = s_lk_test_ms; g = s_lk_conceals; }
++    }
++    CHECK(s_lk_blocks == (unsigned long long)blocks);
++    r.gaps = s_lk_conceals; r.fast = s_lk_fast_bursts; r.squeezed = s_lk_squeezed; r.drops = s_lk_drops; r.lvl_mean = nl ? lsum / nl : 0.0;
++    lk_end();
++    s_lk_cushion_ms = cu; s_lk_drc = drc; s_lk_slow_min = sm; s_lk_refill = rf; s_lk_stretch = st; s_lk_fast = fa; s_lk_test_ms = -1.0;
++    return r;
++}
++static void test_fast_pace(void)
++{
++    static const char* nm[6] = { "steady 30 ticks/s", "single 60-150 ms hitches", "lumpy slow patches", "runs of 45-55 ms ticks",
++                                 "76 ms hitches ~3 s, 300 ms", "76 ms hitches ~2 s, 200 ms" };
++    for (int sc = 0; sc < 6; sc++) {
++        fast_result r[2];
++        for (int f = 0; f < 2; f++) {
++            s_prng = 4242 + sc; s_fn = 0;
++            if (sc == 0) fp_add(1000.0 / 30.0, 1800);
++            if (sc == 1) for (int k = 0; k < 15; k++) { fp_add(1000.0 / 30.0, 90); s_fp[s_fn++] = k % 3 == 0 ? 60.0 : k % 3 == 1 ? 90.0 : 150.0; }
++            if (sc == 2) for (int k = 0; k < 8; k++) { fp_add(1000.0 / 30.0, 200); for (int j = 0; j < 35; j++) s_fp[s_fn++] = prnd() < 0.45 ? 50.0 + prnd() * 30.0 : 1000.0 / 30.0; }
++            if (sc == 3) for (int k = 0; k < 8; k++) { fp_add(1000.0 / 30.0, 150); fp_add(k & 1 ? 55.0 : 45.0, 20); }
++            if (sc == 4) for (int k = 0; k < 40; k++) { fp_add(1000.0 / 30.0, 90); s_fp[s_fn++] = 76.0; }   /* review of 3012: absorbed hitches */
++            if (sc == 5) for (int k = 0; k < 60; k++) { fp_add(1000.0 / 30.0, 60); s_fp[s_fn++] = 76.0; }
++            r[f] = run_fast(f, sc == 5 ? 9600 : 14400);
++        }
++        printf("fast pace %-27s: off %3llu gaps (%3llu clustered), on %3llu gaps (%3llu clustered), %4llu fast bursts, rate min %.2f, largest step %.3f; "
++               "low point mean / max off %.0f / %.0f ms, on %.0f / %.0f ms; squeezed+dropped off %llu, on %llu\n",
++               nm[sc], r[0].gaps, r[0].clustered, r[1].gaps, r[1].clustered, r[1].fast, r[1].rmin, r[1].max_step,
++               r[0].lvl_mean, r[0].lvl_max, r[1].lvl_mean, r[1].lvl_max, r[0].squeezed + r[0].drops, r[1].squeezed + r[1].drops);
++        CHECK(r[1].squeezed + r[1].drops <= r[0].squeezed + r[0].drops);         /* review: no more squeezed or dropped blocks than without it */
++        /* review: no lasting overshoot (extra delay) past the cushion (90 ms) or past what it was without (off often sits under the cushion) */
++        CHECK(r[1].lvl_mean <= fmax(r[0].lvl_mean, 90.0) + 15.0 && r[1].lvl_max <= fmax(r[0].lvl_max, 110.0) + 30.0);
++        CHECK(r[1].max_step <= LK_FAST_DOWN * LK_SLOW_DT_MAX + 1e-9);            /* never a jump: the ramps hold */
++        CHECK(r[1].rmin >= 0.60 - 1e-9);                                          /* never under AUDIO_LOCK_SLOW_MIN */
++        if (sc == 0) CHECK(r[1].gaps == r[0].gaps && r[1].fast <= 15);            /* steady: only the start's first ticks (its first gap) */
++        if (sc == 1 || sc >= 4) CHECK(r[1].gaps <= r[0].gaps);                   /* single hitches: never worse */
++        if (sc == 2 || sc == 3) CHECK(r[1].gaps * 3 <= r[0].gaps && r[1].clustered * 3 <= r[0].clustered);   /* slow patches: at least 3x fewer chops */
++    }
++}
++
+ int main(int argc, char** argv)
+ {
+     vm_base = (uint8_t*)VirtualAlloc(NULL, 0x100000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+@@ -611,6 +674,7 @@ int main(int argc, char** argv)
+     test_slow_pace();
+     test_refill();
+     test_time_stretch();
++    test_fast_pace();   /* patch 3012 */
+     puts("audio lock: all passed");
+     return 0;
+ }

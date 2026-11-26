@@ -1,0 +1,316 @@
+Patch 7931 (experiment, rollback netcode / GPU time): GPU_OVERLAP=1 (patch 2907) waits on per-batch fences and works with PIPE=1.
+
+Why. test11 research placed the desktop's 66-83 ms frames inside render_frame_prepare's full wait_for_gpu (the GPU takes 50-70 ms at
+3200-4000 draws). GPU_OVERLAP=1 removes that drain, but it could not be tested online: it switched PIPE off (it was on PIPE's list of
+debug switches), and PIPE is a StartupMustMatch session setting, so a PC with GPU_OVERLAP=1 reported PIPE=0 and did not match its peer.
+It also relied on move_to_next_frame, which only waits when a batch presents: after a mid-frame flush or an offscreen-only batch (same
+frame index) the next prepare reset a command allocator, a texture-ring part and the GPU_TIME readback the GPU could still be using,
+and the grave released objects two batch counts later whatever the GPU was doing.
+
+What (all only with GPU_OVERLAP=1; off, the code paths are the old ones, plus a lock around the grave):
+- Each batch signals its own value on a fence of its own right after ExecuteCommandLists. Prepare waits only for the last batch that
+  used its frame index (allocator, ring part, GPU_TIME readback); after the upload halves flip (vp_parity) the FIFO thread waits for
+  the last batch that read the half it is about to record into. With PIPE=1 that wait comes after the hand-off, so the submit thread
+  builds batch N while the GPU finishes N-1 and the FIFO thread records N+1.
+- Grave entries wait for a fence value (every executed batch, the one in the submit thread and the one recording), not a count.
+- Rare in-place rewrites wait for every executed batch (font atlas, GCM_GUEST_FB, a texture slot's own upload buffer); the CPU
+  scanout buffer is kept per frame index; the copy-rects target goes through the grave.
+- GPU_OVERLAP is no longer on PIPE's debug list. The fence is made at backend init; if it cannot be made, GPU_OVERLAP is off.
+- [OVERLAP] every 600 batches: allocator, upload-half and full waits (count, ms). The HITCH probe counts them as "gpu wait".
+- Shutdown clears the fence state (seq, alloc, par), so a later init cannot wait for a value its new fence never reaches.
+- The grave gets an SRW lock: tintrects_draw graves on the submit thread with PIPE=1 while the FIFO thread adds and sweeps.
+Guest memory: the backend gives nothing back to the RSX command processor (its callbacks return void); the only GPU-to-guest copy is
+RT_READBACK=1 (off by default), which still drains the GPU itself. So the overlap changes timing only, never what the guest reads.
+
+diff --git a/libs/video/rsx_d3d12_backend.c b/libs/video/rsx_d3d12_backend.c
+index 0f69826..ea37cc1 100644
+--- a/libs/video/rsx_d3d12_backend.c
++++ b/libs/video/rsx_d3d12_backend.c
+@@ -577,7 +577,7 @@ static int pipe_on(void)
+         int on = (e && *e == '0') ? 0 : 1;   /* 7907: on unless PIPE=0 (was: off unless PIPE=1) */
+         /* Debug switches that read or edit records, guest memory or readbacks from the submit half keep the old path. */
+         static const char* const dbg[] = { "RSX_DRAWLOG", "RSX_CAP", "RTT_SAVERT", "D3D12_IQ", "VP_TESTTRI", "RT_CLEARLOG",
+-            "DRAWARGS", "VP_SUBMIT", "CELLMARK_DUMP_MINDRAWS", "GPU_OVERLAP", NULL };
++            "DRAWARGS", "VP_SUBMIT", "CELLMARK_DUMP_MINDRAWS", NULL };   /* 7931: GPU_OVERLAP works with PIPE=1 */
+         for (int i = 0; on && dbg[i]; i++)
+             if (getenv(dbg[i])) { on = 0; fprintf(stderr, "[PIPE] off: %s is set%c", dbg[i], 10); }
+         if (on) {
+@@ -1941,9 +1941,19 @@ static int init_d3d12(u32 width, u32 height)
+ typedef struct { IUnknown* obj; u64 frame; } D3DGrave;
+ static D3DGrave* s_grave = NULL;
+ static int s_grave_n = 0, s_grave_cap = 0;
++/* 7931: the grave is shared by the FIFO thread (prepare, recording) and the submit thread (tintrects_draw with PIPE=1, a
++ * realloc in grave_add): one lock. Never held across a GPU wait. */
++static SRWLOCK s_grave_lock = SRWLOCK_INIT;
++static int gpu_overlap_on(void);
++static u64 ovl_grave_target(void);
++static u64 ovl_completed(void);
+ static void grave_add(IUnknown* o, u64 frame)
+ {
+     if (!o) return;
++    /* 7931: with GPU_OVERLAP=1 an entry waits for a fence value (ovl_grave_target), not a batch count: a batch count says
++     * nothing about the GPU once render_frame stops draining it. */
++    if (gpu_overlap_on()) frame = ovl_grave_target();
++    AcquireSRWLockExclusive(&s_grave_lock);
+     if (s_grave_n == s_grave_cap) {
+         /* Patch 2066: grow, never release early. The old fixed table freed its oldest entry at once when full ("has
+          * surely finished"), which is false after a mid-frame flush (patch 2003 leaves that batch running on the GPU)
+@@ -1951,18 +1961,23 @@ static void grave_add(IUnknown* o, u64 frame)
+          * never a free under the GPU). */
+         int ncap = s_grave_cap ? s_grave_cap * 2 : 512;
+         D3DGrave* ng = (D3DGrave*)realloc(s_grave, sizeof(D3DGrave) * (size_t)ncap);
+-        if (!ng) return;
++        if (!ng) { ReleaseSRWLockExclusive(&s_grave_lock); return; }
+         s_grave = ng; s_grave_cap = ncap;
+     }
+     s_grave[s_grave_n].obj = o; s_grave[s_grave_n].frame = frame; s_grave_n++;
++    ReleaseSRWLockExclusive(&s_grave_lock);
+ }
+-/* Patch 2907: GPU_OVERLAP=1, the CPU builds the next frame while the GPU draws this one. */
++/* Patch 2907: GPU_OVERLAP=1, the CPU builds the next frame while the GPU draws this one. 7931: decided at backend init
++ * (ovl_init), before the first frame; no fence there = off. */
++static int s_ovl_no_fence = 0;
+ static int gpu_overlap_on(void)
+ {
+-    static int on = -1;
+-    if (on < 0) { const char* e = getenv("GPU_OVERLAP"); on = (e && *e == '1') ? 1 : 0;
+-                  if (on) fprintf(stderr, "[OVERLAP] on: render_frame does not wait for the GPU first%c", 10); }
+-    return on;
++    static volatile LONG on = -1;
++    if (s_ovl_no_fence) return 0;
++    if (on < 0) { const char* e = getenv("GPU_OVERLAP"); const LONG v = (e && *e == '1') ? 1 : 0;
++                  if (InterlockedCompareExchange(&on, v, -1) == -1 && v)
++                      fprintf(stderr, "[OVERLAP] on: render_frame does not wait for the GPU first; per-batch fences (7931)%c", 10); }
++    return (int)on;
+ }
+ /* The draw's SRV window: the frame parity's half when overlapping. */
+ static u32 draw_srv_win_p(int parity, u32 d)
+@@ -1971,15 +1986,18 @@ static u32 draw_srv_win_p(int parity, u32 d)
+          + d * DRAW_SRV_STRIDE;
+ }
+ static u32 draw_srv_win(u32 d) { return draw_srv_win_p(s_d3d.vp_parity, d); }
+-static void grave_add(IUnknown* o, u64 frame);
+ static void grave_sweep(u64 frame_now)
+ {
++    const int ovl = gpu_overlap_on();
++    const u64 done = ovl ? ovl_completed() : 0;   /* 7931: read once, outside the lock */
++    AcquireSRWLockExclusive(&s_grave_lock);
+     int k = 0;
+     for (int i = 0; i < s_grave_n; i++) {
+-        if (s_grave[i].frame + 2 <= frame_now) s_grave[i].obj->lpVtbl->Release(s_grave[i].obj);
++        if (ovl ? s_grave[i].frame <= done : s_grave[i].frame + 2 <= frame_now) s_grave[i].obj->lpVtbl->Release(s_grave[i].obj);
+         else s_grave[k++] = s_grave[i];
+     }
+     s_grave_n = k;
++    ReleaseSRWLockExclusive(&s_grave_lock);
+ }
+ /* Last cache index per program hash, tried before the scan (the scan stays as the fallback). */
+ static int s_fp_hint[4096];
+@@ -2059,6 +2077,92 @@ static void move_to_next_frame_hz_impl(void)
+ static void move_to_next_frame(void)
+ { const double t0 = hz_ms() ? hz_now() : 0; move_to_next_frame_hz_impl(); if (t0) { s_hz_t[4] += hz_now() - t0; s_hz_n[4]++; } }
+ 
++/* 7931: GPU_OVERLAP=1 per-batch fences. Patch 2907 dropped render_frame's full GPU drain and leaned on
++ * move_to_next_frame, which waits only on presents: a batch that does not present (a mid-frame flush, an offscreen-only
++ * batch) keeps the same frame index, so the next prepare reset a command allocator, a texture-ring part and the GPU_TIME
++ * readback the GPU could still be using, and the grave freed objects two batch counts later, whatever the GPU was doing.
++ * Here every batch signals its own value on a fence of its own right after its ExecuteCommandLists, and the CPU waits
++ * for exactly what it is about to reuse:
++ *   - before prepare resets frame index fi's allocator / ring part / readback: the last batch that used fi;
++ *   - after the upload halves flip (vp_parity), before the FIFO thread records into a half: the last batch that used it;
++ *   - a graved object: every batch that may name it (all executed ones, the one in the submit thread, the one recording);
++ *   - rare in-place rewrites (font atlas, CPU scanout buffer): all executed batches.
++ * With PIPE=1 (two-thread drawing) the FIFO thread records batch N+1 while the submit thread builds N and the GPU may
++ * still run N-1; the halves alternate, so the parity wait after the hand-off is what keeps N+1 off N-1's half.
++ * Values are written by the thread that executes (the submit thread with PIPE=1) and read by the FIFO thread only after
++ * pipe_wait (event order), except the counter itself (interlocked). Nothing here touches guest memory. */
++static struct {
++    ID3D12Fence* fence;
++    volatile LONG64 seq;            /* last value signalled (one per executed batch) */
++    u64 alloc[FRAME_COUNT];         /* last value of a batch on frame index i's allocator */
++    u64 par[2];                     /* last value of a batch that read upload half p */
++    u64 n_wait_alloc, n_wait_par, n_wait_all, n_batches;
++    double ms_alloc, ms_par, ms_all;
++} s_ovl;
++static void ovl_init(void)   /* backend init, after the device: before any frame, so the switch never changes mid-run */
++{
++    if (s_ovl.fence || !gpu_overlap_on()) return;
++    if (FAILED(s_d3d.device->lpVtbl->CreateFence(s_d3d.device, 0, D3D12_FENCE_FLAG_NONE, &IID_ID3D12Fence, (void**)&s_ovl.fence))) {
++        s_ovl.fence = NULL; s_ovl_no_fence = 1;
++        fprintf(stderr, "[OVERLAP] fence not created: GPU_OVERLAP off, render_frame drains the GPU as before%c", 10);
++    }
++}
++static u64 ovl_seq(void) { return (u64)InterlockedCompareExchange64(&s_ovl.seq, 0, 0); }
++static u64 ovl_completed(void)
++{
++    return s_ovl.fence ? s_ovl.fence->lpVtbl->GetCompletedValue(s_ovl.fence) : ~(u64)0;
++}
++/* A graved object may be named by every executed batch, by the batch the submit thread holds and by the batch being
++ * recorded: at most two batches beyond the counter (a stale read of the counter is at most one behind, and then the
++ * submit thread's batch is the one that just executed). */
++static u64 ovl_grave_target(void) { return ovl_seq() + 2; }
++/* Signal after a batch's ExecuteCommandLists (the thread that executed it). */
++static void ovl_after_execute(u32 fi, int parity)
++{
++    if (!gpu_overlap_on() || !s_ovl.fence) return;
++    const u64 v = (u64)InterlockedIncrement64(&s_ovl.seq);
++    s_d3d.cmd_queue->lpVtbl->Signal(s_d3d.cmd_queue, s_ovl.fence, v);
++    s_ovl.alloc[fi % FRAME_COUNT] = v;
++    s_ovl.par[parity & 1] = v;
++    s_ovl.n_batches++;
++}
++/* Wait until the GPU passed v (kind: 0 allocator, 1 upload half, 2 everything); a no-op unless GPU_OVERLAP=1 (no fence).
++ * As long as the device lives, like wait_for_gpu (patch 2066). The HITCH probe counts it as GPU wait. */
++static void ovl_wait(u64 v, int kind)
++{
++    if (!v || !s_ovl.fence) return;
++    if (s_ovl.fence->lpVtbl->GetCompletedValue(s_ovl.fence) >= v) return;
++    static _Thread_local HANDLE ev = NULL;
++    if (!ev) ev = CreateEventA(NULL, FALSE, FALSE, NULL);
++    const double t0 = hz_now();
++    if (!ev) { s_ovl.fence->lpVtbl->SetEventOnCompletion(s_ovl.fence, v, NULL); }   /* NULL: blocks until done */
++    else {
++        s_ovl.fence->lpVtbl->SetEventOnCompletion(s_ovl.fence, v, ev);
++        for (int tries = 0;; tries++) {
++            if (WaitForSingleObject(ev, 2000) != WAIT_TIMEOUT) break;
++            const HRESULT rr = s_d3d.device->lpVtbl->GetDeviceRemovedReason(s_d3d.device);
++            fprintf(stderr, "[OVERLAP] fence wait STUCK %ds: want %llu got %llu removed=0x%08lX%c", 2 * (tries + 1),
++                    (unsigned long long)v, (unsigned long long)ovl_completed(), (long)rr, 10);
++            if (rr != 0) break;
++        }
++    }
++    const double ms = hz_now() - t0;
++    if (hz_ms()) { s_hz_t[3] += ms; s_hz_n[3]++; }
++    if (kind == 0) { s_ovl.n_wait_alloc++; s_ovl.ms_alloc += ms; }
++    else if (kind == 1) { s_ovl.n_wait_par++; s_ovl.ms_par += ms; }
++    else { s_ovl.n_wait_all++; s_ovl.ms_all += ms; }
++}
++static void ovl_wait_all(void) { if (gpu_overlap_on()) ovl_wait(ovl_seq(), 2); }
++/* [OVERLAP] every 600 batches: how often and how long the CPU still waited for the GPU, by reason (counters written by two
++ * threads with PIPE=1: approximate, diagnostic only). */
++static void ovl_report(void)
++{
++    if (!gpu_overlap_on() || !s_ovl.n_batches || (s_ovl.n_batches % 600) != 0) return;
++    fprintf(stderr, "[OVERLAP] %llu batches: allocator waits %llu (%.1f ms), upload-half waits %llu (%.1f ms), full waits %llu (%.1f ms)%c",
++            (unsigned long long)s_ovl.n_batches, (unsigned long long)s_ovl.n_wait_alloc, s_ovl.ms_alloc,
++            (unsigned long long)s_ovl.n_wait_par, s_ovl.ms_par, (unsigned long long)s_ovl.n_wait_all, s_ovl.ms_all, 10);
++}
++
+ 
+ /* ---------------------------------------------------------------------------
+  * Render a frame (clear + present)
+@@ -5111,7 +5215,7 @@ static int vp_upload_tex_slot_impl(u32 off, u32 w, u32 h, u32 fmt, int cube, u32
+     void* mapped = NULL; D3D12_RANGE nr = {0,0};
+     if (up_res == s_d3d.tex_ring) mapped = s_d3d.tex_ring_ptr + up_base;
+     else {
+-        if (gpu_overlap_on()) wait_for_gpu();   /* patch 2907: the slot's own buffer may feed the previous frame's copy */
++        ovl_wait_all();   /* patch 2907: the slot's own buffer may feed an earlier batch's copy (7931: counted as a full wait in [OVERLAP]) */
+         if (FAILED(t->up->lpVtbl->Map(t->up, 0, &nr, &mapped)) || !mapped) return -1;
+     }
+     { static int _tp=0; if (env_str("RTT_DUMP", &s_env_rtt_dump) && PS3_LOG_FIRST(_tp, 6)) {
+@@ -7297,6 +7401,7 @@ static void guest_fb_present(u32 fi)
+     { extern u8* vm_base;
+       if (!vm_base) return;
+       /* RSX local memory is mapped at guest 0xC0000000. */
++      ovl_wait_all();   /* 7931: GPU_OVERLAP=1, the previous batch may still copy from this one buffer */
+       const u8* srow = vm_base + 0xC0000000u + off;
+       void* m = NULL; D3D12_RANGE nr = {0, 0};
+       if (FAILED(up->lpVtbl->Map(up, 0, &nr, &m)) || !m) return;
+@@ -7373,10 +7478,14 @@ static void scanout_auto_present(u32 fi)
+     extern u8* vm_base;
+     if (!vm_base) return;
+     const u32 up_pitch = (gw * 4u + 255u) & ~255u;   /* 256-byte rows */
+-    static ID3D12Resource* up = NULL;
+-    static u32 up_w = 0, up_h = 0;
+-    if (!up || up_w != gw || up_h != gh) {
+-        if (up) { up->lpVtbl->Release(up); up = NULL; }
++    /* 7931: with GPU_OVERLAP=1 one buffer per frame index: prepare already waited for the last batch on fi, so this
++     * frame index's buffer is free to rewrite (or release) without waiting for the whole GPU. */
++    static ID3D12Resource* up_a[FRAME_COUNT];
++    static u32 up_wa[FRAME_COUNT], up_ha[FRAME_COUNT];
++    const u32 uk = gpu_overlap_on() ? fi % FRAME_COUNT : 0;
++    ID3D12Resource* up = up_a[uk];
++    if (!up || up_wa[uk] != gw || up_ha[uk] != gh) {
++        if (up) { up->lpVtbl->Release(up); up = NULL; up_a[uk] = NULL; }
+         D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+         D3D12_RESOURCE_DESC bd = {0};
+         bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+@@ -7389,7 +7498,7 @@ static void scanout_auto_present(u32 fi)
+                 D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
+                 &IID_ID3D12Resource, (void**)&up)))
+             return;
+-        up_w = gw; up_h = gh;
++        up_a[uk] = up; up_wa[uk] = gw; up_ha[uk] = gh;
+     }
+     /* RSX local memory is mapped at guest 0xC0000000. The guest is a
+      * big-endian PPC title: its 32-bit pixels land as A,R,G,B bytes, so
+@@ -7882,7 +7991,9 @@ static void copyrects_draw(u32 fi)
+     const u32 W = s_d3d.bb_w, H = s_d3d.bb_h;
+     const float sx = (float)W / (float)s_d3d.width, sy = (float)H / (float)s_d3d.height;
+     if (!s_cr_tmp || s_cr_w < W || s_cr_h < H / 4) {
+-        if (s_cr_tmp) { s_cr_tmp->lpVtbl->Release(s_cr_tmp); s_cr_tmp = NULL; }
++        if (s_cr_tmp) { if (gpu_overlap_on()) grave_add((IUnknown*)s_cr_tmp, s_d3d.frame_count);   /* 7931 */
++                        else s_cr_tmp->lpVtbl->Release(s_cr_tmp);
++                        s_cr_tmp = NULL; }
+         D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+         D3D12_RESOURCE_DESC td = {0};
+         td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+@@ -8369,6 +8480,7 @@ static void render_frame_prepare(RfFrame* f)
+      * polygons). These workloads are a few draws/frame, so full serialisation
+      * costs little. */
+     if (!gpu_overlap_on()) wait_for_gpu();   /* patch 2907: GPU_OVERLAP=1 builds while the GPU works */
++    else ovl_wait(s_ovl.alloc[fi], 0);   /* 7931: only the last batch on this frame index (its allocator, ring part, GPU_TIME readback) */
+     grave_sweep(s_d3d.frame_count);
+     rdoc_frame_begin(s_d3d.draw_count);
+     /* RES_SCALE: the upload buffers that filled new targets are done with
+@@ -8432,6 +8544,7 @@ static void render_frame_prepare(RfFrame* f)
+         u32 w = s_d3d.tex_w, h = s_d3d.tex_h;
+         u32 pitch = (w + 255) & ~255u;   /* D3D12 requires 256-byte row pitch */
+ 
++        if (s_d3d.tex_resource || s_d3d.tex_upload) ovl_wait_all();   /* 7931: GPU_OVERLAP=1, an earlier batch may still sample it */
+         if (s_d3d.tex_resource) { s_d3d.tex_resource->lpVtbl->Release(s_d3d.tex_resource); s_d3d.tex_resource = NULL; }
+         if (s_d3d.tex_upload)   { s_d3d.tex_upload->lpVtbl->Release(s_d3d.tex_upload);     s_d3d.tex_upload = NULL; }
+ 
+@@ -9908,6 +10021,7 @@ skip_dump_consider: ;
+     s_d3d.cmd_list->lpVtbl->Close(s_d3d.cmd_list);
+     ID3D12CommandList* cmd_lists[] = {(ID3D12CommandList*)s_d3d.cmd_list};
+     s_d3d.cmd_queue->lpVtbl->ExecuteCommandLists(s_d3d.cmd_queue, 1, cmd_lists);
++    ovl_after_execute(fi, f->parity);   /* 7931: this batch's fence value (GPU_OVERLAP=1) */
+     rtread_finish();
+ 
+     /* D3D12_IQ=1: drain the debug layer's message queue after submitting the
+@@ -10145,6 +10259,7 @@ static void render_frame_run(void)
+         render_frame_prepare(&f);
+         rf_detach(&f, 0);
+         render_frame_submit(&f);
++        if (gpu_overlap_on()) { ovl_wait(s_ovl.par[s_d3d.vp_parity & 1], 1); ovl_report(); }   /* 7931: the half the next batch records into */
+         return;
+     }
+     pipe_wait();               /* batch N-1's submit is done (and with it its Present) */
+@@ -10158,6 +10273,9 @@ static void render_frame_run(void)
+                 (unsigned long long)s_pipe.n_sub, (unsigned long long)s_pipe.n_wait, s_pipe.wait_ms,
+                 s_pipe.n_wait ? s_pipe.wait_ms / (double)s_pipe.n_wait : 0.0, 10);
+     SetEvent(s_pipe.go);
++    /* 7931 (GPU_OVERLAP=1): rf_detach handed this thread the other upload half, last read by batch N-1. Without the drain
++     * in prepare the GPU may still be on it; wait for exactly that batch (the submit thread meanwhile builds batch N). */
++    if (gpu_overlap_on()) { ovl_wait(s_ovl.par[s_d3d.vp_parity & 1], 1); ovl_report(); }
+ }
+ static void render_frame(void)
+ { const double t0 = hz_ms() ? hz_now() : 0; render_frame_run(); if (t0) { s_hz_t[5] += hz_now() - t0; s_hz_n[5]++; } }
+@@ -13033,6 +13151,7 @@ int rsx_d3d12_backend_init(u32 width, u32 height, const char* title)
+         }
+         return -1;
+     }
++    ovl_init();   /* 7931: GPU_OVERLAP's own fence, before the first frame */
+ 
+     /* Set up backend callbacks */
+     s_d3d12_backend.userdata          = &s_d3d;
+@@ -13082,6 +13201,8 @@ void rsx_d3d12_backend_shutdown(void)
+     if (s_d3d.dsv_heap)     s_d3d.dsv_heap->lpVtbl->Release(s_d3d.dsv_heap);
+     if (s_d3d.root_signature) s_d3d.root_signature->lpVtbl->Release(s_d3d.root_signature);
+     if (s_d3d.fence) s_d3d.fence->lpVtbl->Release(s_d3d.fence);
++    if (s_ovl.fence) s_ovl.fence->lpVtbl->Release(s_ovl.fence);   /* 7931 */
++    memset(&s_ovl, 0, sizeof s_ovl);   /* 7931: a later init starts a new fence at 0, so no old value may be waited for */
+     if (s_d3d.fence_event) CloseHandle(s_d3d.fence_event);
+     if (s_d3d.cmd_list) s_d3d.cmd_list->lpVtbl->Release(s_d3d.cmd_list);
+     if (s_d3d.tex_ring) s_d3d.tex_ring->lpVtbl->Release(s_d3d.tex_ring);

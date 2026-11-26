@@ -1,0 +1,24 @@
+Patch 3013 (diagnostic, off by default): AUDIO_REC=<file> records exactly what the audio device takes (AUDIO_REC unset: nothing changes).
+
+- audio_backend_submit (WASAPI): after the copy into the device buffer, the same frames are appended to <file> as raw f32le stereo at the device
+  rate (ffmpeg -f f32le -ar 48000 -ac 2 -i <file> out.wav), muted (PS3_MUTE=1) or not, the lock's concealment included: what a player hears.
+- Why: test12's audio lane needs real fight sound to judge the fast pace (3012) by ear; AUDIO_WAV records only the mix, before the output stage,
+  and only outside the tick lock.
+
+diff --git a/libs/audio/cellAudio.c b/libs/audio/cellAudio.c
+index abffaef..5900feb 100644
+--- a/libs/audio/cellAudio.c
++++ b/libs/audio/cellAudio.c
+@@ -524,6 +524,12 @@ static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
+         static int mute = -1;
+         if (mute < 0) mute = getenv("PS3_MUTE") ? 1 : 0;
+         memcpy(buf, stereo_samples, num_samples * 2 * sizeof(float));
++        /* J-Stars patch 3013 (diagnostic, off by default): AUDIO_REC=<file> appends exactly what the device takes (raw f32le, stereo, the device
++         * rate: ffmpeg -f f32le -ar 48000 -ac 2 -i <file> out.wav), muted or not, the lock's concealment included -- what a player hears.
++         * AUDIO_WAV records the mix before the output stage, and only outside the lock. */
++        { static FILE* rf = (FILE*)-1;
++          if (rf == (FILE*)-1) { const char* e = getenv("AUDIO_REC"); rf = e && *e ? fopen(e, "wb") : NULL; }
++          if (rf) fwrite(stereo_samples, sizeof(float) * 2, num_samples, rf); }
+         hr = s_wasapi_render->lpVtbl->ReleaseBuffer(s_wasapi_render, num_samples,
+                                                mute ? AUDCLNT_BUFFERFLAGS_SILENT : 0);
+         if (ps3r_wasapi_hr_is_device_gone((uint32_t)hr)) wasapi_mark_lost(hr, "ReleaseBuffer");

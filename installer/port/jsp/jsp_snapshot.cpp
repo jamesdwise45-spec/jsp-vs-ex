@@ -345,6 +345,37 @@ struct CostWindow {
         if (commit) { put(save, real); put(own, real - waits); copy_save += copy; freezes_save += freezes; if (rr_on) rr_saves += real; }
         else { put(restore, real); copy_rb += copy; freezes_rb += freezes; }
     }
+    // DIAGNOSTIC (test12, rollback cost): where a save / restore goes, summed per window, in three groups: live saves, re-run saves (a commit inside a
+    // recovery: rollback .. the save of the tick it came from) and restores. quick = the unfrozen wait for the SPU job words (JSP_SNAPSHOT_QUICK); samples = the
+    // unfrozen precheck samples; wait = the precheck's spin steps plus any gate-sequence wait (both unfrozen); freeze = SuspendThread + GetThreadContext of every
+    // thread; frozen = last freeze .. resume (the frozen census, collect, the copy, the reset); copy = the page copy (inside frozen); layout = the flow's discover();
+    // other = real minus all of those (prep, close, audit, census of refused freezes). by-reason: the precheck wait time split over the reasons that made it wait
+    // (jsy::GateResult::pre_wait_by, in proportion to the waits each reason was present for; a gate redone after a frozen layout change counts its last gate's reasons).
+    struct Split {
+        uint32_t n = 0; double real = 0, quick = 0, samples = 0, wait = 0, freeze = 0, frozen = 0, copy = 0, layout = 0;
+        double by_ms[18] = {0}; uint32_t by_n[18] = {0};
+        void add(double r, double q, double sm, double w, double fc, double fz, double cp, double ly, const jsy::GateResult& g) {
+            n++; real += r; quick += q; samples += sm; wait += w; freeze += fc; frozen += fz; copy += cp; layout += ly;
+            unsigned tot = 0; for (int b = 0; b < 18; b++) tot += g.pre_wait_by[b];
+            if (tot) for (int b = 0; b < 18; b++) if (g.pre_wait_by[b]) { by_ms[b] += w * (double)g.pre_wait_by[b] / (double)tot; by_n[b]++; }
+        }
+        int print(char* b, size_t cap, const char* what) const {
+            static const char* const kName[18] = {"lwm", "mutex", "rwlock", "evq", "sem", "transit", "running", "pause", "lwm_unowned", "role_away", "role_absent",
+                                                  "role_queue", "rsx", "jobs", "fiber", "flip", "jobserver", "site"};
+            if (!n) return std::snprintf(b, cap, " | %s n=0", what);
+            const double k = 1.0 / (double)n;
+            int o = std::snprintf(b, cap, " | %s n=%u ms mean: real=%.2f quick=%.2f samples=%.2f wait=%.2f freeze=%.2f frozen=%.2f (copy %.2f) layout=%.2f other=%.2f; wait by reason:",
+                                  what, n, real * k, quick * k, samples * k, wait * k, freeze * k, frozen * k, copy * k, layout * k, (real - quick - samples - wait - freeze - frozen - layout) * k);
+            bool any = false;
+            for (int i = 0; i < 18 && o > 0 && (size_t)o < cap; i++)
+                if (by_n[i]) { o += std::snprintf(b + o, cap - o, " %s=%.2f(%u)", kName[i], by_ms[i] * k, by_n[i]); any = true; }
+            if (!any && o > 0 && (size_t)o < cap) o += std::snprintf(b + o, cap - o, " none");
+            return o;
+        }
+    } sp_live, sp_rerun, sp_rb;
+    void note_split(bool commit, double real, double quick, double samples, double wait, double freeze, double frozen, double copy, double layout, const jsy::GateResult& g) {
+        (commit ? (rr_on ? sp_rerun : sp_live) : sp_rb).add(real, quick, samples, wait, freeze, frozen, copy, layout, g);
+    }
     void rollback_begin(uint32_t from, uint32_t to) { rr_on = true; rr_from = from; rr_ticks = from - to; rr_t0 = Clock::now(); rr_restore = 0; rr_saves = 0; }
     void rollback_done(double real) { if (rr_on) rr_restore = real; }
     void rollback_failed() { rr_on = false; }
@@ -371,6 +402,13 @@ struct CostWindow {
                      el, force ? " (end)" : "", ns, a, b, ns ? copy_save / (double)ns : 0.0, ns ? freezes_save / (double)ns : 0.0, nr, c, nr ? copy_rb / (double)nr : 0.0, nr ? freezes_rb / (double)nr : 0.0,
                      nrr, nrr ? (double)rerun_ticks / (double)nrr : 0.0, rerun_ticks_max, d, e, pcopy::g_workers, (unsigned long long)pcopy::g_batches, (unsigned long long)pcopy::g_serial,
                      pcopy::g_ops_total ? 100.0 * (double)ow / (double)pcopy::g_ops_total : 0.0, g_cfg.precheck_us, g_audit_exempt ? 1 : 0);
+        {   // DIAGNOSTIC (test12, rollback cost): the split line, right after its window's cost line
+            char sb[1600]; int o = std::snprintf(sb, sizeof sb, "[snap] cost split secs=%.1f%s", el, force ? " (end)" : "");
+            for (const auto& x : {std::make_pair(&sp_live, "live saves"), std::make_pair(&sp_rerun, "re-run saves"), std::make_pair(&sp_rb, "restores")})
+                if (o > 0 && (size_t)o < sizeof sb) o += x.first->print(sb + o, sizeof sb - o, x.second);
+            std::fprintf(stderr, "%s\n", sb);
+            sp_live = Split(); sp_rerun = Split(); sp_rb = Split();
+        }
         for (auto* v : {&save, &own, &restore, &rerun, &sim}) v->clear();
         copy_save = copy_rb = freezes_save = freezes_rb = 0; rerun_ticks = rerun_ticks_max = 0; t0 = Clock::now();
     }
@@ -1009,13 +1047,14 @@ struct GateOps {
     double sample_ms = 0;   // census cost, summed over the tries of one capture (logged)
     double presample_ms = 0, wait_ms = 0;   // gate_ev: unfrozen prechecks; time blocked in WaitOnAddress (gate_wait, "W")
     double spin_ms = 0, freeze_call_ms = 0;   // DIAGNOSTIC (per-hitch line): the precheck's poll steps (spin) and the freeze calls themselves (SuspendThread + GetThreadContext of every thread)
+    double quick_ms = 0;                      // DIAGNOSTIC (test12, rollback cost): of presample_ms, the QUICK unfrozen wait for the job words (the rest is precheck samples)
     Clock::time_point t_frozen{};           // the last successful freeze (frozen_ms = resume - this)
     bool suspend() {
         if (!g_suspend) { t_frozen = Clock::now(); return true; }
         if (quick_gate_on()) {   // unfrozen: let the jobs drain before the freeze (bounded)
             const auto t = Clock::now(); jsy::View qv;
             while (quick_jobs_view(&qv) && ms_since(t) * 1000.0 < (double)quick_wait_us()) { if (quick_wait_sleep()) Sleep(0); else { const auto s0 = Clock::now(); while (ms_since(s0) < 0.05) YieldProcessor(); } }
-            presample_ms += ms_since(t);
+            const double q = ms_since(t); presample_ms += q; quick_ms += q;
         }
         for (;;) {   // a thread set that changed under the freeze (a thread listed, then gone or refusing) is retried with a fresh listing, bounded; the cause is logged either way
             const auto tf = Clock::now();
@@ -1430,6 +1469,7 @@ struct WwOps {
     jsy::GateResult gr = {};   // sync census taken with the freeze (a commit records it by tick, a rollback compares with the target tick's)
     double presample_ms = 0, gate_wait_ms = 0, frozen_ms = 0;   // unfrozen prechecks, time blocked on the gate sequence, threads frozen (last freeze .. resume)
     double spin_ms = 0, freeze_call_ms = 0;                      // DIAGNOSTIC (per-hitch line): GateOps' precheck poll steps and freeze calls, appended to the ww lines
+    double quick_ms = 0;                                         // DIAGNOSTIC (test12, rollback cost): GateOps::quick_ms (part of presample_ms)
     Clock::time_point t_frozen{}; bool frozen = false;
     bool pause() {
         const auto t = Clock::now();
@@ -1455,7 +1495,7 @@ struct WwOps {
         }
         g_last_gate_reasons = gr.reasons;
         if (g_ext && gr.suspended) rsx_write_guard(k, restore_to, saved, gr.view);   // threads frozen: the ring of RSX-side writes is stable
-        census_ms = gop.sample_ms; presample_ms = gop.presample_ms; gate_wait_ms = gop.wait_ms; spin_ms = gop.spin_ms; freeze_call_ms = gop.freeze_call_ms;
+        census_ms = gop.sample_ms; presample_ms = gop.presample_ms; gate_wait_ms = gop.wait_ms; spin_ms = gop.spin_ms; freeze_call_ms = gop.freeze_call_ms; quick_ms = gop.quick_ms;
         t_frozen = gop.t_frozen; frozen = gr.suspended;
         no_saved = restore_to != kNoTick && !saved;
         if (restore_to == kNoTick && g_gate_jobserver && !gr.view.js_valid) g_js_unlearned++;
@@ -1795,7 +1835,9 @@ bool ww_transaction(uint32_t k, ppu_context* c, uint32_t restore_to)
     g_hz_real_ms += real_ms; g_hz_gate_ms += op.suspend_ms; g_hz_ops++;   // DIAGNOSTIC (per-hitch line): jsp_snapshot_ext_cost_sum
     if (real_ms > 30.0 && sp.slow_tid) slow_freeze_line(restore_to == kNoTick ? "commit" : "rollback", k, real_ms, op.freeze_call_ms, nthr, sp);   // DIAGNOSTIC (test10, freeze tail)
     if (g_ext && result.ok()) {   // ENHANCEMENT (measurement): the `[snap] cost window` percentiles (threads running)
-        g_cw.note_op(restore_to == kNoTick, real_ms, op.presample_ms + op.gate_wait_ms, op.apply_ms, op.gr.freezes);
+        // FIX (test12, rollback cost): the precheck's unfrozen wait is its spin steps (spin_ms), not only its samples (in presample_ms): `save own` left it in
+        g_cw.note_op(restore_to == kNoTick, real_ms, op.presample_ms + op.gate_wait_ms + op.spin_ms, op.apply_ms, op.gr.freezes);
+        g_cw.note_split(restore_to == kNoTick, real_ms, op.quick_ms, op.presample_ms - op.quick_ms, op.spin_ms + op.gate_wait_ms, op.freeze_call_ms, op.frozen_ms, op.apply_ms, layout_ms, op.gr);
         if (restore_to != kNoTick) g_cw.rollback_done(real_ms);
     }
     if (g_sync != jsy::Mode::Off && (restore_to != kNoTick || op.gr.reasons || !op.gr.ok || ((!g_ext || snap_tick_log()) && (op.gr.verdict.notes != g_last_commit_notes || k % 300 == 0)))) {

@@ -68,12 +68,17 @@ public:
                     if (save_frames_.front() < ff && !(save_frames_.front() < ff_before)) poll_skips_++;
                 }
                 const int sf = save_frames_.front();
+                cur_sf_ = sf; cur_ff_ = ff;   // DIAGNOSTIC (test12): readable by the game's commit / hash_only (the host test's load-target check)
                 const bool skip = skip_final_ && sf < ff && g_.hash_only(op.tick, &h);
                 if (skip) { st_.forget(op.tick); skipped_++; }
                 else if (!g_.commit(op.tick, &h, &tok)) { s_.abort("commit failed"); return none(); }
                 if (skip_final_) note_arrival(sf, ff, !skip);
+                // DIAGNOSTIC (test12, rollback cost): re-run saves (a frame saved again after a Load) apart, and the snapshots of a frame that was exactly
+                // the final frame (the lowest frame a later Load can still target: "at the confirmed frame" must keep its snapshot)
+                if (save_rerun_.front()) { rerun_commits_++; if (skip) rerun_skipped_++; }
+                if (skip_final_ && !skip && sf == ff) at_final_++;
                 if (!s_.complete_save(save_ids_.front(), h, tok)) { s_.abort("commit failed"); return none(); }
-                save_ids_.erase(save_ids_.begin()); save_frames_.erase(save_frames_.begin()); commits_++;
+                save_ids_.erase(save_ids_.begin()); save_frames_.erase(save_frames_.begin()); save_rerun_.erase(save_rerun_.begin()); commits_++;
                 break;
             }
             case jsx::OpKind::Rollback:
@@ -95,6 +100,14 @@ public:
     uint64_t skipped() const { return skipped_; }   // commits that took no snapshot (final frame)
     uint64_t poll_skips() const { return poll_skips_; }   // of them: skipped only because of the poll before the test (the final frame of the last update was too low)
     void set_skip_final(bool on) { skip_final_ = on; }
+    // DIAGNOSTIC (test12, rollback cost): saves of a frame GekkoNet had already saved (a rollback's re-run ticks) and how many of them took no snapshot;
+    // snapshots taken of exactly the final frame (they stay: a Load can target the final frame itself).
+    uint64_t rerun_commits() const { return rerun_commits_; }
+    uint64_t rerun_skipped() const { return rerun_skipped_; }
+    uint64_t at_final() const { return at_final_; }
+    // During IGlueGame::commit / hash_only: the GekkoNet frame of the save being taken, and the final frame the skip test used (-1 with skip_final off).
+    int current_save_frame() const { return cur_sf_; }
+    int current_final_frame() const { return cur_ff_; }
     // DIAGNOSTIC (test10, snap-poll): of the saves that took a snapshot (the frame was still predicted), how many ticks passed until GekkoNet's final frame
     // passed that frame (its remote input confirmed it). Ticks = GekkoNet frames, counted on the newest saved frame, so a rollback's re-run saves do not
     // count as time. Checked at each commit (after its poll), so 1 = confirmed by the next tick's save. One line, for the match end.
@@ -144,7 +157,10 @@ private:
         for (const NetEvent& e : evs_) {
             jsx::Event je; je.frame = e.frame; je.rolling_back = e.rolling_back;
             switch (e.kind) {
-            case EvKind::Save: je.kind = jsx::Kind::Save; save_ids_.push_back(e.token); save_frames_.push_back(e.frame); break;
+            case EvKind::Save:
+                je.kind = jsx::Kind::Save; save_ids_.push_back(e.token); save_frames_.push_back(e.frame);
+                save_rerun_.push_back(e.frame <= newest_save_ ? 1 : 0); if (e.frame > newest_save_) newest_save_ = e.frame;
+                break;
             case EvKind::Load: je.kind = jsx::Kind::Load; break;
             case EvKind::Advance: {
                 je.kind = jsx::Kind::Advance;
@@ -166,8 +182,11 @@ private:
     std::vector<NetEvent> evs_;
     std::vector<uint32_t> save_ids_;
     std::vector<int> save_frames_;   // GekkoNet frame of each pending save, parallel to save_ids_
+    std::vector<uint8_t> save_rerun_;   // 1 = a re-run save (its frame was saved before), parallel to save_ids_
+    int newest_save_ = -1;              // the newest frame any Save event named
+    int cur_sf_ = -1, cur_ff_ = -1;     // see current_save_frame()
     bool skip_final_ = false;
-    uint64_t updates_ = 0, runs_ = 0, commits_ = 0, skipped_ = 0, poll_skips_ = 0;
+    uint64_t updates_ = 0, runs_ = 0, commits_ = 0, skipped_ = 0, poll_skips_ = 0, rerun_commits_ = 0, rerun_skipped_ = 0, at_final_ = 0;
     static constexpr int kArrBins = 64;                 // 0..62 ticks, 63 = 63 or more
     static constexpr size_t kArrOpenMax = 1024;         // open predicted frames kept (a stuck final frame cannot grow this without bound)
     std::map<int, int> arr_open_;                       // predicted frame -> newest saved frame when it was first snapshotted
