@@ -704,6 +704,7 @@ extern "C" volatile int g_ps3_audio_lock_mute;
 // side of the lock plays the tick's blocks over the stretched period (AUDIO_LOCK_FF=0 turns that off); written before ps3_audio_lock_set_target, whose
 // release store publishes it. Output only: the blocks mixed, the read index and the notify events do not depend on it.
 extern "C" volatile int g_ps3_audio_lock_stretch_us;
+extern "C" volatile long long g_ps3_audio_lock_tick_end;   // toolkit patch 3014: where this boundary's tick ends (-1 = every idle ends a tick); output side only
 extern "C" int ps3_audio_lock_idle(void);
 extern "C" void ps3_audio_lock_rewind(long long blocks);
 extern "C" void ps3_audio_lock_set_target(long long blocks);   // sets the target and wakes the mix thread
@@ -723,7 +724,7 @@ void audio_lock_start()
 {
     g_ps3_audio_lock_stretch_us = 0;   // FIX (review of test7): no stretch carried over from the last match
     if (!audio_lock_on() || g.bench) return;
-    g_ps3_audio_lock_mute = 0; g_ps3_audio_lock_done = 0; ps3_audio_lock_set_target(0);
+    g_ps3_audio_lock_mute = 0; g_ps3_audio_lock_done = 0; g_ps3_audio_lock_tick_end = -1; ps3_audio_lock_set_target(0);
     audio_lock_wait();
     std::fprintf(stderr, "[net] audio locked to the game tick (6.25 blocks per tick from base %u)\n", g.base);
 }
@@ -731,7 +732,7 @@ void audio_lock_end()
 {
     g_ps3_audio_lock_stretch_us = 0;   // FIX (review of test7): no stretch carried over from the last match
     if (g_ps3_audio_lock_target < 0) return;
-    ps3_audio_lock_set_target(-1); g_ps3_audio_lock_mute = 0;
+    ps3_audio_lock_set_target(-1); g_ps3_audio_lock_mute = 0; g_ps3_audio_lock_tick_end = -1;
     std::fprintf(stderr, "[net] audio lock ended: %llu waits, mean %.2f ms, %llu timeouts\n", (unsigned long long)g_audio_waits, g_audio_waits ? g_audio_wait_ms / g_audio_waits : 0.0, (unsigned long long)g_audio_timeouts);
 }
 // FIX (rollback determinism, JSP_NET_GUEST_CLOCK=0 turns it off): the game's main thread reads a clock that advances with the game tick (patch 3006).
@@ -781,9 +782,14 @@ uint64_t g_regs_saved = 0, g_regs_restored = 0, g_regs_skipped = 0, g_regs_allow
 double g_hold_ms = 0; uint64_t g_holds = 0, g_hold_renders = 0;   // FIX (hold at the boundary while no tick may run): totals for the end line   // helper thread registers (regs_save / regs_restore below)
 std::atomic<bool> g_cri_on{false}; std::atomic<uint32_t> g_cri_go{0}, g_cri_ack{0}; std::atomic<int> g_cri_parked{0}; std::atomic<DWORD> g_cri_tid{0};
 HANDLE g_cri_ev = nullptr; uint64_t g_cri_cycles = 0, g_cri_timeouts = 0; double g_cri_wait_ms = 0;
-int cri_usleep_hook(ppu_context* c, uint64_t)
+int cri_per_tick();   // below
+int cri_parts() { return audio_lock_on() ? cri_per_tick() : 1; }   // the cycles per tick that really run (the parts need the audio tick lock)
+int cri_usleep_hook(ppu_context* c, uint64_t usec)
 {
     if ((uint32_t)c->lr != 0x004D4F30u || !g_cri_on.load()) return 0;
+    { static std::atomic<int> logged{0}; if (!logged.exchange(1))   // DIAGNOSTIC (once per process): the server's own sleep, what CRI's server_frequency asks for
+        std::fprintf(stderr, "[net] sound server sleeps %llu us at its first wait in a match (%.1f Hz); the lock runs it %d times per tick (%d Hz)\n", (unsigned long long)usec,
+                     usec ? 1e6 / (double)usec : 0.0, cri_parts(), 30 * cri_parts()); }
     g_cri_tid.store(GetCurrentThreadId());
     const uint32_t my = g_cri_go.load();
     g_cri_ack.store(my); g_cri_parked.store(1);
@@ -840,11 +846,18 @@ void fs_wait()
     }
     const double ms = qpc_ms(t0, qpc_now()); g_fs_waits++; g_fs_wait_ms += ms; if (ms > g_fs_wait_max) g_fs_wait_max = ms;
 }
-void cri_cycle()   // boundary, before a tick runs (live or re-run): one server cycle at this tick's time
+// FIX (choppy fight audio, JSP_NET_CRI_PER_TICK, default 2): CRI's manual says its server must run at least server_frequency times a second (60 by
+// default) or playing sound cuts out, and buffers are sized from that rate. Once per 30 Hz tick, 64% of the blocks the game handed over in a fight were
+// exact silence (per 4 ticks: 9 blocks with sound, then 16 empty), menus 0-3%. Now the boundary mixes the tick's blocks in N parts with a server cycle
+// after each part, at the tick's time minus the part of the tick still to come: the same steps on every PC and in a re-run (a function of the tick).
+std::atomic<int64_t> g_cri_sub_tb{0};   // the server's clock offset within the tick (0 or negative), read by guest_tb_shift
+int cri_per_tick() { static const int v = [] { char b[8] = {}; int n = 2; if (jsp_setting_get("JSP_NET_CRI_PER_TICK", b, sizeof b) && b[0]) n = std::atoi(b); return n < 1 ? 1 : n > 4 ? 4 : n; }(); return v; }
+void cri_cycle(int64_t sub_tb = 0)   // boundary, before a tick runs (live or re-run): one server cycle at this tick's time (+ sub_tb, 0 or negative)
 {
     if (!g_cri_on.load()) return;
     fs_wait();   // reads started in the tick before are done
     const uint32_t want = g_cri_go.load() + 1;
+    g_cri_sub_tb.store(sub_tb);   // the cycle's time within the tick (the go store below publishes it)
     g_cri_go.store(want); SetEvent(g_cri_ev);
     cri_wait(want, 250.0);
     g_cri_cycles++;
@@ -854,12 +867,12 @@ void cri_lock_start()
 {
     if (!cri_lock_on() || g.bench) return;
     if (!g_cri_ev) g_cri_ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    g_cri_go.store(0); g_cri_ack.store(0xFFFFFFFFu); g_cri_parked.store(0); g_cri_cycles = g_cri_timeouts = 0; g_cri_wait_ms = 0;
+    g_cri_sub_tb.store(0); g_cri_go.store(0); g_cri_ack.store(0xFFFFFFFFu); g_cri_parked.store(0); g_cri_cycles = g_cri_timeouts = 0; g_cri_wait_ms = 0;
     g_ps3_usleep_hook = cri_usleep_hook;
     fs_find_threads(); g_fs_waits = g_fs_timeouts = 0; g_fs_wait_ms = g_fs_wait_max = 0;
     g_cri_on.store(true);
     cri_wait(0, 1500.0);   // its current sleep (at most 1 s) ends, and the next one is ours
-    std::fprintf(stderr, "[net] sound server runs one cycle per game tick%s\n", g_cri_parked.load() ? "" : " (NOT parked yet: it was not seen sleeping within 1.5 s)");
+    std::fprintf(stderr, "[net] sound server runs %d cycle%s per game tick%s\n", cri_parts(), cri_parts() > 1 ? "s" : "", g_cri_parked.load() ? "" : " (NOT parked yet: it was not seen sleeping within 1.5 s)");
 }
 void cri_lock_end()
 {
@@ -874,7 +887,7 @@ int64_t guest_tb_shift(uint64_t real)
 {
     if (clock_diag()) note_clock_reader(GetCurrentThreadId());
     if (g_cri_on.load(std::memory_order_relaxed) && GetCurrentThreadId() == g_cri_tid.load(std::memory_order_relaxed))   // the sound server: the tick's time, exactly
-        return (int64_t)(g_vc_t0 + (uint64_t)(g.done_now - g.base) * kTbPerTick - real);
+        return (int64_t)(g_vc_t0 + (uint64_t)(g.done_now - g.base) * kTbPerTick - real) + g_cri_sub_tb.load(std::memory_order_relaxed);
     if (GetCurrentThreadId() != g_vc_tid.load(std::memory_order_relaxed)) return 0;
     const uint64_t vt = g_vc_t0 + (uint64_t)(g.done_now - g.base) * kTbPerTick + (uint64_t)(++g_vc_reads) * 80;
     g_vc_total_reads++;
@@ -2086,7 +2099,18 @@ void boundary(ppu_context* c)
     }
     if (op.kind == jsx::OpKind::Run && !op.regrant && g_ps3_audio_lock_target >= 0) {   // FIX (tick-locked audio): the audio of every tick before this one, taken
         g_ps3_audio_lock_mute = op.replay ? 1 : 0;
-        ps3_audio_lock_set_target(audio_blocks_at(g.done_now));
+        // FIX (choppy fight audio, see cri_cycle): with the server lock on, the tick's blocks in N parts, a server cycle after each but the last (that
+        // one is below). prev is where the last boundary (or a rollback's rewind) left the audio: blocks_at(done_now - 1) on every path.
+        const long long cur = audio_blocks_at(g.done_now), prev = g.done_now > g.base ? audio_blocks_at(g.done_now - 1) : cur;
+        const int parts = g_cri_on.load() && cur > prev ? cri_per_tick() : 1;   // the first tick (no blocks) keeps one cycle at its time
+        g_ps3_audio_lock_tick_end = cur;   // patch 3014: the idles between the parts are not a tick's end for the output side
+        for (int k = 1; k < parts; k++) {
+            ps3_audio_lock_set_target(prev + (cur - prev) * k / parts);
+            g_jsp_main_stage = 3;   // DIAGNOSTIC
+            audio_lock_wait();
+            g_jsp_main_stage = 4; cri_cycle(-(int64_t)(kTbPerTick * (uint64_t)(parts - k) / (uint64_t)parts));
+        }
+        ps3_audio_lock_set_target(cur);
         g_jsp_main_stage = 3;   // DIAGNOSTIC
         audio_lock_wait();
     }

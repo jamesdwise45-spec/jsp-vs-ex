@@ -1,0 +1,37 @@
+Patch 3014 (J-Stars, output only): the output side of the tick lock starts a new burst only at a tick's end.
+
+- g_ps3_audio_lock_tick_end (new, -1 = unknown: every idle ends a tick, as before): the block count at which the tick that starts at this boundary
+  ends, written by the game before ps3_audio_lock_set_target. The mix thread marks the next block as a burst's first only when it went idle with
+  every block up to that count mixed.
+- Why: test12's sound server fix (JSP_NET_CRI_PER_TICK) raises the target in parts within one boundary, with a sound server cycle between them.
+  Every idle used to start a burst, so each tick counted as two: the slow pace (3009) flapped on and off, the fast pace (3012) left early, the
+  refill debt (3010) cleared early, and the per-tick counters (bursts, gap lines) counted half-ticks (review REVIEW-CRI2.md, finding 1).
+- Guest-visible behaviour (blocks mixed, read index, notify events) does not change.
+
+diff --git a/libs/audio/cellAudio.c b/libs/audio/cellAudio.c
+index 5900feb..3a08a2a 100644
+--- a/libs/audio/cellAudio.c
++++ b/libs/audio/cellAudio.c
+@@ -757,6 +757,10 @@ volatile int g_ps3_audio_lock_mute = 0;
+  * before ps3_audio_lock_set_target (whose release store publishes it with the target). Read by the output side only (lk_submit_block), never by the
+  * guest-visible part of the lock. */
+ volatile int g_ps3_audio_lock_stretch_us = 0;
++/* J-Stars patch 3014: the block count at which the tick that starts at this boundary ends (-1 = unknown: every idle ends a tick). The game may raise
++ * the target in parts within one boundary (a sound server cycle between them); only the idle at the tick's end starts a new burst for the output
++ * side (pace, fast pace, refill, the per-tick counters). Written by the game thread before ps3_audio_lock_set_target. Output only. */
++volatile long long g_ps3_audio_lock_tick_end = -1;
+ #ifdef _WIN32
+ static HANDLE s_lock_wake = NULL;   /* the mix thread sleeps on it while it has mixed every block it may (never a spin: it runs at TIME_CRITICAL) */
+ /* Held for one whole locked block (mix, output, notify, publish) and by ps3_audio_lock_rewind: a rewind never lands inside a block. Statically
+@@ -1458,7 +1462,10 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
+         if (__atomic_load_n(&g_ps3_audio_lock_target, __ATOMIC_ACQUIRE) >= 0) {   /* patch 3005: tick-locked (see ps3_audio_lock_idle) */
+             if (!s_lk_active) lk_begin();   /* patch 3007 */
+             /* patch 3007: the output side (cushion, rate control, concealment, counters) */
+-            if (!audio_lock_step(lk_submit_block)) { s_lk_burst = 1; lk_idle_tail(); WaitForSingleObject(s_lock_wake, 2); continue; }
++            if (!audio_lock_step(lk_submit_block)) {   /* patch 3014: a burst starts only after the idle at a tick's end, not between a tick's parts */
++                const long long te = __atomic_load_n(&g_ps3_audio_lock_tick_end, __ATOMIC_ACQUIRE);
++                if (te < 0 || __atomic_load_n(&g_ps3_audio_lock_done, __ATOMIC_ACQUIRE) >= te) s_lk_burst = 1;
++                lk_idle_tail(); WaitForSingleObject(s_lock_wake, 2); continue; }
+             QueryPerformanceCounter(&q0); blocks = 0;   /* back on the clock from here when the lock ends */
+             continue;
+         }
