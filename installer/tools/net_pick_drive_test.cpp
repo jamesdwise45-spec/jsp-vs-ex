@@ -404,9 +404,15 @@ static void test_ownership_mapper()
         h.fight_running(); j.fight_running();
         CHECK(h.match_end(2, t) && j.match_end(2, t) && h.choose(jspg::REMATCH, t) && j.choose(jspg::REMATCH, t));
         for (int k = 0; k < 30 && !(h.round().state() == jspk::READY && j.round().state() == jspk::READY); k++) step();
-        jspf::PairOut again; CHECK(h.pair(&again) && again.pick[0] == pa[0].pick[0] && again.pick[1] == pa[0].pick[1]);
+        jspf::PairOut again; CHECK(h.pair(&again));
+        for (int k = 0; k < 2; k++) CHECK(again.pick[k].fighter == pa[0].pick[k].fighter && again.pick[k].support == pa[0].pick[k].support);
+        // FIX (test13 review L3): the team choice is not kept: a Fight again plays the room's teams (Versus without room teams)
+        CHECK(again.mode() == (room ? jspk::ROOM : jspk::VERSUS));
         uint8_t re[jspk::kRoomSize]; std::memcpy(re, img, sizeof img);
-        CHECK(jspf::apply_pair(re, again) == jspk::Result::Ok && !std::memcmp(re + jspk::kOffRecords, pc[0] + jspk::kOffRecords, 4 * jspk::kRecSize));
+        CHECK(jspf::apply_pair(re, again) == jspk::Result::Ok);
+        if (again.mode() == mode) CHECK(!std::memcmp(re + jspk::kOffRecords, pc[0] + jspk::kOffRecords, 4 * jspk::kRecSize));
+        const jspo::Map ma = jspo::predict_map(re, jspo::plan_seats(2));
+        CHECK(jspo::own_ok(ma, 0) && jspo::own_ok(ma, 1));
         rooms++;
     }
     CHECK(rooms == 500 && together > 50 && swapped > 50 && kept > 30);

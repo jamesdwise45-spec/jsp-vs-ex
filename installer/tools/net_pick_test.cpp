@@ -389,6 +389,17 @@ static void test_mode_rule()
     CHECK(room_teams_from(nullptr, nullptr) && room_teams_from("", nullptr) && room_teams_from("junk", "0"));
     CHECK(!room_teams_from("0", nullptr) && !room_teams_from("0", "0") && room_teams_from("1", "1"));
     CHECK(!room_teams_from(nullptr, "1") && room_teams_from(nullptr, "0"));
+    // FIX (test13 review L3): the host's Teams row
+    for (TeamChoice c : { CHOICE_ROOM, CHOICE_VERSUS, CHOICE_TOGETHER }) {
+        Pick q; q.mode = TOGETHER; q.room = false; set_choice(q, c); CHECK(choice_of(q) == c);
+        Pick hb[kMaxPlayers]; hb[0] = q; CHECK(agreed_mode(hb) == (c == CHOICE_ROOM ? ROOM : c == CHOICE_VERSUS ? VERSUS : TOGETHER));
+    }
+    CHECK(choice_of(Pick()) == CHOICE_ROOM);
+    CHECK(next_choice(CHOICE_ROOM, 1, true) == CHOICE_VERSUS && next_choice(CHOICE_VERSUS, 1, true) == CHOICE_TOGETHER && next_choice(CHOICE_TOGETHER, 1, true) == CHOICE_ROOM);
+    CHECK(next_choice(CHOICE_ROOM, -1, true) == CHOICE_TOGETHER && next_choice(CHOICE_TOGETHER, -1, true) == CHOICE_VERSUS && next_choice(CHOICE_VERSUS, -1, true) == CHOICE_ROOM);
+    CHECK(next_choice(CHOICE_VERSUS, 1, false) == CHOICE_TOGETHER && next_choice(CHOICE_TOGETHER, -1, false) == CHOICE_VERSUS && next_choice(CHOICE_ROOM, 1, false) == CHOICE_TOGETHER);
+    CHECK(!std::strcmp(choice_text(CHOICE_ROOM, 4), "As chosen in the room") && !std::strcmp(choice_text(CHOICE_TOGETHER, 2), "P1 + P2 vs 2 COMs") &&
+          !std::strcmp(choice_text(CHOICE_VERSUS, 4), "P1 + P3 vs P2 + P4"));
 }
 
 // ---- FIX (test13): ROOM keeps the teams the players chose in the room ----

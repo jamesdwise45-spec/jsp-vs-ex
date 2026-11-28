@@ -7,8 +7,10 @@
 //      [0] kMagic 0xC5  [1] kVersion 1  [2..5] session tag (u32 LE, session_tag() of the link's plan session id, never 0)
 //      [6..7] seq (u16 LE, the post-game seq = the match number that ended)  [8..9] rev (u16 LE)  [10..11] fighter id (u16 LE)
 //      [12..13] support id (u16 LE)  [14] flags: bit 0 locked, bit 1 in room, bit 2 team mode Together (0 = Versus), bit 3 room teams
-//      (test13: the sender keeps the room's own teams, JSP_PICK_ROOM_TEAMS; an older build refuses the bit, so a mixed-build round is LOST,
-//      never applied two ways), bits 4-7 zero
+//      (test13: the sender keeps the room's own teams, JSP_PICK_ROOM_TEAMS), bits 4-7 zero. An older build never sees bit 3: the pick
+//      message travels only on a rollback link, and the settings handshake refuses a peer of another build before that link exists
+//      (the build id, jsp_session_handshake.h); only the test override JSP_NET_BUILD could pair them, and then the older side's decode
+//      refuses the bit and its round ends LOST
 //      [15] sender's player index 0..3 (0 = the room owner / host), bits 2-7 zero  [16] saw: bit i = I hold player i's locked pick
 //      (bits 4-7 zero)  [17] check: XOR of bytes 0..16 with 0x3C.
 //    decode() refuses a wrong length, magic, version, reserved bit, check byte or a zero session tag. A message of another link
@@ -30,6 +32,9 @@
 //    ("Host chose Together"). Rule picked because it is one source, needs no extra round, and is the same on every PC.
 //    FIX (test13, testers: "doesn't let us be in teams ... 2 players vs cpu"): ROOM is the default (Pick::room = true; the host's
 //    JSP_PICK_ROOM_TEAMS=0 turns it off for the link): the teams the players chose in the room stand after Select character / Fight again.
+//    FIX (test13 review L3): Versus and Together count only when the host chooses them IN THAT ROUND (the port picker's Teams row,
+//    TeamChoice below): every round starts from the room's teams (jspf::Flow resets the start pick's choice), so neither a Together from
+//    an earlier round nor a Fight again's re-locked pick carries it on.
 //
 // 3. roster_apply(): the roster write at the battle builder's entry (0x002EEE90), the same code on every PC. Input: the room's 4 fighter
 //    records and team fields as the host's broadcast left them (equal on all PCs), the N human picks with their room member ids, and the
@@ -93,6 +98,25 @@ struct Pick {
     bool room = true;         // FIX (test13): keep the room's teams unless Together (jspf::Flow stamps its JSP_PICK_ROOM_TEAMS); only the host's counts
     bool operator==(const Pick&) const = default;
 };
+// FIX (test13 review L3): the host's Teams row: the room's teams (the default every round), or an explicit Versus / Together for this round.
+enum TeamChoice : uint8_t { CHOICE_ROOM = 0, CHOICE_VERSUS = 1, CHOICE_TOGETHER = 2 };
+inline void set_choice(Pick& p, TeamChoice c) { p.mode = c == CHOICE_TOGETHER ? TOGETHER : VERSUS; p.room = c == CHOICE_ROOM; }
+inline TeamChoice choice_of(const Pick& p) { return p.mode == TOGETHER ? CHOICE_TOGETHER : p.room ? CHOICE_ROOM : CHOICE_VERSUS; }
+// Left / Right on the row (dir +1 / -1): Room -> Versus -> Together -> Room; without room teams (JSP_PICK_ROOM_TEAMS=0) only Versus <-> Together.
+inline TeamChoice next_choice(TeamChoice c, int dir, bool room_on)
+{
+    if (!room_on) return c == CHOICE_TOGETHER ? CHOICE_VERSUS : CHOICE_TOGETHER;
+    return (TeamChoice)(((int)c + (dir >= 0 ? 1 : 2)) % 3);
+}
+// The row's value text (P numbers = the pick lines' players, P1 = the first to join).
+inline const char* choice_text(TeamChoice c, int nplayers)
+{
+    if (c == CHOICE_ROOM) return "As chosen in the room";
+    const bool t = c == CHOICE_TOGETHER;
+    return nplayers == 2 ? (t ? "P1 + P2 vs 2 COMs" : "P1 + COM vs P2 + COM")
+         : nplayers == 3 ? (t ? "P1 + P2 vs P3 + COM" : "P1 + P3 vs P2 + COM")
+                         : (t ? "P1 + P2 vs P3 + P4" : "P1 + P3 vs P2 + P4");
+}
 struct Msg {
     uint32_t session = 0; uint16_t seq = 0, rev = 0; Pick pick;
     bool locked = false, in_room = false;

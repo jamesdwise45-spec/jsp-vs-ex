@@ -369,7 +369,7 @@ public:
     int me() const { return me_; }
     bool host() const { return is_open() && me_ == 0; }
     void set_config(const jspg::Config& pc, const jspk::Config& kc) { pcfg_ = pc; kcfg_ = kc; }
-    // FIX (test13): this PC's room-teams bit for its picks (open() reads JSP_PICK_ROOM_TEAMS; only the host's counts, jspk::agreed_mode). Before a round.
+    // FIX (test13): this PC's room-teams switch (open() reads JSP_PICK_ROOM_TEAMS; only the host's counts, jspk::agreed_mode). Before a round.
     void set_room_teams(bool on) { room_teams_ = on; }
     bool room_teams() const { return room_teams_; }
 
@@ -493,7 +493,9 @@ public:
             rematch_ = o == jspg::O_REMATCH;
             round_pair_ = !rematch_ || pair_.n > 0;   // Fight again without an earlier pick: the native roster stands
             jspk::Pick prev = pair_.n ? pair_.pick[me_] : jspk::Pick();
-            prev.room = room_teams_;   // FIX (test13): this PC's room-teams bit on every pick it sends
+            // FIX (test13 review L3): every round starts from the room's teams (Versus without room teams): an earlier round's explicit Versus /
+            // Together never carries on, and a Fight again (prev locked at once) always plays the room's teams
+            jspk::set_choice(prev, room_teams_ ? jspk::CHOICE_ROOM : jspk::CHOICE_VERSUS);
             pick_.start(tag_, pg_.seq(), me_, n_, prev, now, kcfg_);
             pick_on_ = true;
             if (rematch_) pick_.lock();
@@ -522,7 +524,9 @@ public:
 
     // UI
     bool choose(jspg::Choice c, uint64_t now) { return is_open() && pg_.pick(c, now); }
-    bool submit(jspk::Pick p, bool lock) { p.room = room_teams_; if (!pick_on_ || !pick_.set_pick(p)) return false; return !lock || pick_.lock(); }
+    // FIX (test13): the caller's team choice stands (jspk::set_choice: the room's teams by default, an explicit Versus / Together this round);
+    // without room teams (JSP_PICK_ROOM_TEAMS=0) the room bit is always off.
+    bool submit(jspk::Pick p, bool lock) { if (!room_teams_) p.room = false; if (!pick_on_ || !pick_.set_pick(p)) return false; return !lock || pick_.lock(); }
     // This PC reached its room page. The flag goes out only once this PC's round is READY (see the top: the host's start then proves that
     // every PC committed the same picks).
     void in_room(bool v) { want_room_ = v; on_round_change(); }

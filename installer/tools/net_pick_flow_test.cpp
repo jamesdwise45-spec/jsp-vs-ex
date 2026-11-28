@@ -8,6 +8,7 @@
 #include "../port/jsp/jsp_stall_rule.h"   // jsr::kFailMs: the frame clock's deadline the menu's freeze owner uses too
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <random>
@@ -292,7 +293,9 @@ static bool flow_random(uint32_t seed, int n)
     PairOut before; pc[0].f.pair(&before);
     for (uint16_t s = 6; s < 8; s++) if (!flow_round(r, net, pc, n, s, jspg::REMATCH, slots, members, &t, &had_pair, false)) return false;
     PairOut after; pc[0].f.pair(&after);
-    for (int i = 0; i < n; i++) if (!(before.pick[i] == after.pick[i])) { std::printf("FAIL: Fight again changed a pick\n"); return false; }
+    for (int i = 0; i < n; i++) if (before.pick[i].fighter != after.pick[i].fighter || before.pick[i].support != after.pick[i].support) { std::printf("FAIL: Fight again changed a pick\n"); return false; }
+    // FIX (test13 review L3): a Fight again never carries an explicit Versus / Together on: the room's teams (Versus without room teams)
+    if (after.mode() != (pc[0].f.room_teams() ? jspk::ROOM : jspk::VERSUS)) { std::printf("FAIL: Fight again kept a team choice\n"); return false; }
     return true;
 }
 
@@ -580,6 +583,93 @@ static bool select_round(int n, const uint8_t* slots, const jspk::Pick* picks, c
     for (int i = 0; i < n; i++) if (f[i].round().state() != jspk::READY || !f[i].pair(&pairs[i])) return false;
     return true;
 }
+// FIX (test13 review L3): the team choice is per round. Every round starts from the room's teams; the host's explicit Versus / Together
+// counts for that round only; a Fight again plays the room's teams; with room teams off the start is Versus and the room bit never goes out.
+struct Two {
+    Flow f[2]; uint64_t t = 0; uint16_t seq = 0;
+    bool open(bool host_room, bool join_room)
+    {
+        const uint8_t slots[2] = { 0, 1 };
+        if (!f[0].open(0x8800u, 0, 2, slots) || !f[1].open(0x8800u, 1, 2, slots)) return false;
+        f[0].set_room_teams(host_room); f[1].set_room_teams(join_room);
+        for (int k = 0; k < 30; k++) step();
+        return f[0].agreed() && f[1].agreed();
+    }
+    void step()
+    {
+        for (int i = 0; i < 2; i++) f[i].pump(t, [&](const uint8_t* d, size_t len) { f[i ^ 1].route(i, d, len, t); });
+        for (int i = 0; i < 2; i++) f[i].poll(t);
+        t += 100;
+    }
+    // one post-game: choice for both; host_choice = the host's Teams row for a Select character (the joiner keeps its start pick); the pair
+    bool round(jspg::Choice c, int host_choice, jspk::TeamChoice* start, PairOut* out)
+    {
+        for (int i = 0; i < 2; i++) f[i].fight_running();
+        seq++;
+        for (int i = 0; i < 2; i++) if (!f[i].match_end(seq, t) || !f[i].choose(c, t)) return false;
+        for (int k = 0; k < 10; k++) step();
+        *start = jspk::choice_of(f[0].round().mine());   // what the picker shows when the round opens (jsp_net_game.cpp u.team)
+        if (c == jspg::CHARSELECT) {
+            for (int i = 0; i < 2; i++) {
+                jspk::Pick p = f[i].round().mine(); p.fighter = (uint16_t)(0x30 + i);
+                if (i == 0 && host_choice >= 0) jspk::set_choice(p, (jspk::TeamChoice)host_choice);
+                if (!f[i].submit(p, true)) return false;
+            }
+        }
+        for (int k = 0; k < 30 && !(f[0].round().state() == jspk::READY && f[1].round().state() == jspk::READY); k++) step();
+        PairOut q;
+        if (!f[0].pair(out) || !f[1].pair(&q) || out->mode() != q.mode()) return false;
+        return true;
+    }
+};
+static void test_team_choice_per_round()
+{
+    using jspk::CHOICE_ROOM; using jspk::CHOICE_VERSUS; using jspk::CHOICE_TOGETHER;
+    {
+        Two w; CHECK(w.open(true, false));
+        jspk::TeamChoice st; PairOut p;
+        CHECK(w.round(jspg::CHARSELECT, CHOICE_TOGETHER, &st, &p) && st == CHOICE_ROOM && p.mode() == jspk::TOGETHER);   // explicit Together: this round
+        CHECK(w.round(jspg::CHARSELECT, -1, &st, &p) && st == CHOICE_ROOM && p.mode() == jspk::ROOM);                   // next round: back to the room's
+        CHECK(w.round(jspg::CHARSELECT, CHOICE_VERSUS, &st, &p) && st == CHOICE_ROOM && p.mode() == jspk::VERSUS);      // explicit Versus: this round
+        CHECK(w.round(jspg::REMATCH, -1, &st, &p) && st == CHOICE_ROOM && p.mode() == jspk::ROOM && p.pick[0].fighter == 0x30);   // Fight again: room teams
+        CHECK(w.round(jspg::CHARSELECT, CHOICE_TOGETHER, &st, &p) && p.mode() == jspk::TOGETHER);
+        CHECK(w.round(jspg::REMATCH, -1, &st, &p) && st == CHOICE_ROOM && p.mode() == jspk::ROOM);                     // not Together again
+        CHECK(w.round(jspg::CHARSELECT, CHOICE_ROOM, &st, &p) && p.mode() == jspk::ROOM);
+    }
+    {   // the host has room teams off: Versus is the start, the room bit never goes out (even if a caller sets it); the joiner's on-switch never counts
+        Two w; CHECK(w.open(false, true));
+        jspk::TeamChoice st; PairOut p;
+        CHECK(w.round(jspg::CHARSELECT, CHOICE_ROOM, &st, &p) && st == CHOICE_VERSUS && p.mode() == jspk::VERSUS && !p.pick[0].room);
+        CHECK(w.round(jspg::CHARSELECT, CHOICE_TOGETHER, &st, &p) && p.mode() == jspk::TOGETHER);
+        CHECK(w.round(jspg::REMATCH, -1, &st, &p) && st == CHOICE_VERSUS && p.mode() == jspk::VERSUS);
+    }
+}
+
+// FIX (test13 review): Flow::open reads JSP_PICK_ROOM_TEAMS (and JSP_ONLINE_VERSUS_DEFAULT) from the environment
+static void set_env(const char* k, const char* v)
+{
+#ifdef _WIN32
+    _putenv_s(k, v ? v : "");
+#else
+    if (v) setenv(k, v, 1); else unsetenv(k);
+#endif
+}
+static void test_open_env()
+{
+    const uint8_t slots[2] = { 0, 1 };
+    struct Case { const char* room; const char* versus; bool want; };
+    const Case cases[] = {
+        { nullptr, nullptr, true }, { "0", nullptr, false }, { "1", nullptr, true }, { nullptr, "1", false }, { "1", "1", true },
+        { nullptr, "0", true }, { "junk", nullptr, true }, { "0", "1", false },
+    };
+    for (const Case& c : cases) {
+        set_env(jspk::kRoomTeamsKey, c.room); set_env(jspk::kVersusKey, c.versus);
+        Flow f; CHECK(f.open(0x9900u, 0, 2, slots) && f.room_teams() == c.want);
+        f.set_room_teams(!c.want); CHECK(f.open(0x9901u, 0, 2, slots) && f.room_teams() == c.want);   // open() reads it again (a new link)
+    }
+    set_env(jspk::kRoomTeamsKey, nullptr); set_env(jspk::kVersusKey, nullptr);
+}
+
 static void test_room_teams()
 {
     static const uint8_t kSplits[6][4] = { { 0, 0, 1, 1 }, { 0, 1, 0, 1 }, { 0, 1, 1, 0 }, { 1, 0, 0, 1 }, { 1, 0, 1, 0 }, { 1, 1, 0, 0 } };
@@ -806,10 +896,12 @@ int main()
     test_spoofed();
     test_apply_teams();
     test_room_teams();
+    test_team_choice_per_round();
+    test_open_env();
     test_flow_leave();
     int fbad = 0, runs = 0;
     for (int n = 2; n <= 4; n++) for (uint32_t s = 1; s <= 60; s++, runs++) if (!flow_random(s * 7919u + (uint32_t)n * 13u, n)) { if (fbad++ < 3) std::printf("FAIL flow run n=%d seed %u\n", n, s); fails++; }
     if (fails) { std::printf("net pick flow: %d failure(s)\n", fails); return 1; }
-    std::printf("net pick flow: switch handshake (one PC on, a lost last hello, an early decline, old link, forged sender), freeze owner (prompt, chosen, picking, READY; no false trip), group choice (900 random runs), 2-player path, routing, spoofed senders, late lock vs the host's start, member map, team bytes, room teams (2..4 players, every 2 + 2, after Select character, own pad -> own fighter), picker texts, leave / silence / idle / lost, %d flow runs of 8 post-games (n = 2..4) ok\n", runs);
+    std::printf("net pick flow: switch handshake (one PC on, a lost last hello, an early decline, old link, forged sender), freeze owner (prompt, chosen, picking, READY; no false trip), group choice (900 random runs), 2-player path, routing, spoofed senders, late lock vs the host's start, member map, team bytes, room teams (2..4 players, every 2 + 2, after Select character, own pad -> own fighter; team choice per round, not sticky; Flow::open reads the switch), picker texts, leave / silence / idle / lost, %d flow runs of 8 post-games (n = 2..4) ok\n", runs);
     return 0;
 }

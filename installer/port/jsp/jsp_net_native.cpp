@@ -219,7 +219,8 @@ uint32_t share_pad_obj();
  * friends could never team up against the COMs. Off by default now: the room's own teams stand (the builder places from them and the
  * rollback fighter map pairs pads and fighters by member id, jnf::net_ports, so any layout keeps each pad on its own fighter). After a
  * Select character / Fight again the roster write keeps them too (jspk::ROOM, JSP_PICK_ROOM_TEAMS). JSP_ONLINE_VERSUS_DEFAULT=1 brings the
- * swap back; it is this PC's own setting, so it must be the same on both PCs (a PC that swaps while the other does not builds another fight).
+ * swap back; it is this PC's own setting (a PC that swaps while the other does not builds another fight), so it is a debug switch for the
+ * rollback handshake (jsp_session_registry.h kDebugSwitches, test13 review M1): a rollback session refuses to start while it is set.
  * The original note:
  * The Friendly Match battle settings (Square in the room) hold only character, stage and BGM; there is no team, COM-count or
  * 1v1 option: a fight is always 2v2 (4 fighter slots, empty ones COM). The room data R = *(0x0095839C) (0x14C bytes, ctor
@@ -686,11 +687,13 @@ void auto_pad(uint16_t* b, uint16_t* lx, uint16_t* ly)
         const int c = s == "pg:again" ? 1 : s == "pg:select" ? 2 : s == "pg:leave" ? 3 : 0;
         if (!c) { NLOG("[auto-online] unknown step '%s', skipped\n", s.c_str()); next_step(now); }
         else if (jsp_pick_choose(c)) { NLOG("[auto-online] post-game choice %s taken\n", s.c_str() + 3); next_step(now); }
-    } else if (s.compare(0, 5, "pick:") == 0) {   /* pick:FIGHTER,SUPPORT[,together] (hex ids; 133 = Random), locked once the pick round runs */
+    } else if (s.compare(0, 5, "pick:") == 0) {   /* pick:FIGHTER,SUPPORT[,together|versus] (hex ids; 133 = Random; none = the room's teams), locked once the pick round runs */
         unsigned f = 0, sp = 0; char mode[16] = {};
         const int n = std::sscanf(s.c_str() + 5, "%x,%x,%15s", &f, &sp, mode);
         if (n < 2) { NLOG("[auto-online] bad step '%s', skipped\n", s.c_str()); next_step(now); }
-        else if (jsp_pick_submit(f, sp, !std::strcmp(mode, "together"), 1)) { NLOG("[auto-online] pick %03X / %03X%s locked\n", f, sp, mode[0] ? " together" : ""); next_step(now); }
+        else if (jsp_pick_submit(f, sp, !std::strcmp(mode, "together") ? 1 : !std::strcmp(mode, "versus") ? 2 : 0, 1)) {
+            NLOG("[auto-online] pick %03X / %03X (%s) locked\n", f, sp, mode[0] ? mode : "room teams"); next_step(now);
+        }
     } else if (s == "room") {   /* log the Friendly Match room data (0x14C bytes at *(0x0095839C)) */
         const uint32_t R = vm_read32(0x0095839Cu);
         NLOG("[auto-online] room data %08X:\n", R);
@@ -818,7 +821,7 @@ extern "C" void jsp_register_native_online(void)
          * which picks no colour; players who pick colours in the room were overruled by it (test13 report). */
         const bool online = std::getenv("PS3_NET_ONLINE") != nullptr;
         g_versus = jspk::versus_on(std::getenv(jspk::kVersusKey)) && online;
-        if (g_versus) NLOG("[online] versus safeguard on (JSP_ONLINE_VERSUS_DEFAULT=1): 2 humans in a Friendly Match fight each other, each with a COM partner; set it the same on both PCs\n");
+        if (g_versus) NLOG("[online] versus safeguard on (JSP_ONLINE_VERSUS_DEFAULT=1): 2 humans in a Friendly Match fight each other, each with a COM partner; a debug-only switch for rollback (the rollback handshake refuses while it is set)\n");
         else if (online) NLOG("[online] room teams: the teams chosen in the room stand (versus safeguard off; JSP_ONLINE_VERSUS_DEFAULT=1 turns it on)\n");
     }
     {   /* ENHANCEMENT (post-game / pick, JSP_ROLLBACK_PICK=1, default 0): only with the game's own online on (a native room) */
