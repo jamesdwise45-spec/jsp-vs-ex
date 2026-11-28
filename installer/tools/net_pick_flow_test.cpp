@@ -5,11 +5,13 @@
 // JSP_ROLLBACK_PICK=1; with one PC on, no prompt and no stall on either). No game, no GPU.
 #include "../port/jsp/jsp_net_pick_flow.h"
 #include "../port/jsp/jsp_stall_rule.h"   // jsr::kFailMs: the frame clock's deadline the menu's freeze owner uses too
+#include "../port/jsp/jsp_net_menu4.h"    // ENHANCEMENT (test13): the 3-4 player glue (menu_seats, the leave rule)
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <deque>
 #include <random>
+#include <string>
 #include <vector>
 
 static int fails = 0;
@@ -659,11 +661,379 @@ static void test_freeze()
     }
 }
 
+// ---- ENHANCEMENT (test13, JSP_ROLLBACK_PICK_MULTI=1): the 3-4 player glue (jsp_net_menu4.h) on N PCs ----
+// Each PC builds its menu from ITS OWN plan, as jsp_net_game.cpp does (jspm4::menu_seats: player index = peer id, slots[peer] = that peer's
+// first slot), and sends every menu message to the peers menu_seats names (menu_send), each one queued on its own with a small delay. The
+// battle slots are NOT the peer ids (the field's "slot 2 peer 1"). Nothing here knows the other PCs' plans: if the glue mapped a player to
+// the wrong slot or left a peer out of the send, the checks below see it.
+struct TRemote { uint8_t peer = 0, first_slot = 0, count = 1; };
+struct TPlan { bool host = false; uint8_t total_players = 0, local_peer = 0, local_first = 0, local_count = 1; std::vector<TRemote> remotes; };
+static TPlan plan_of(int n, int me, const uint8_t* slot_of)
+{
+    TPlan p; p.host = me == 0; p.total_players = (uint8_t)n; p.local_peer = (uint8_t)me; p.local_first = slot_of[me];
+    for (int j = 0; j < n; j++) if (j != me) { TRemote r; r.peer = (uint8_t)j; r.first_slot = slot_of[j]; p.remotes.push_back(r); }
+    return p;
+}
+struct MPc {
+    Flow f; jspm4::Seats s; bool alive = true; uint64_t dead_at = ~0ull, choose_at = ~0ull, room_at = 0, pick_at = 0;
+    jspg::Choice want = jspg::NONE; jspk::Pick pick; Act act = Act::None; jspg::Reason why = jspg::R_NONE; uint64_t act_at = 0; bool ready = false;
+    bool submit = true;   // false: this PC never locks (the pick round's idle lock does it)
+    uint64_t freeze_from = ~0ull, freeze_to = 0;   // this PC's game makes no flip in [from, to) (its pump thread runs on)
+};
+struct MNet {
+    struct Pkt { uint64_t t; int to, from; std::vector<uint8_t> d; };
+    std::deque<Pkt> q; std::mt19937 r; uint64_t sent_to[4] = {}; bool cut[4][4] = {};   // cut[a][b]: nothing from a reaches b
+    explicit MNet(uint32_t s) : r(s) {}
+    void send(MPc* pc, int from, const uint8_t* b, size_t len, uint64_t t)
+    {
+        for (int k = 0; k < pc[from].s.nto; k++) {
+            const int to = pc[from].s.to[k]; sent_to[to]++;
+            if (!cut[from][to]) q.push_back({ t + 5 + r() % 60, to, from, std::vector<uint8_t>(b, b + len) });
+        }
+    }
+    void deliver(MPc* pc, uint64_t t)
+    {
+        std::deque<Pkt> rest;
+        for (Pkt& p : q) {
+            if (p.t > t) { rest.push_back(std::move(p)); continue; }
+            if (pc[p.to].alive) pc[p.to].f.route(p.from, p.d.data(), p.d.size(), t);
+        }
+        q.swap(rest);
+    }
+};
+struct MRun {
+    int n = 3; uint8_t slot_of[4] = { 0xFF, 0xFF, 0xFF, 0xFF };   // unset: open() puts peer 0 on record 2, peer 1 on record 0, ... (peer != slot)
+    MPc pc[4]; MNet net{ 77 }; uint64_t t = 0; jspg::Config pcf; jspk::Config kcf;
+    bool open(uint64_t sid)
+    {
+        if (slot_of[0] == 0xFF) {
+            static const uint8_t d2[4] = { 0, 1 }, d3[4] = { 2, 0, 1 }, d4[4] = { 2, 0, 3, 1 };
+            std::memcpy(slot_of, n == 2 ? d2 : n == 3 ? d3 : d4, sizeof slot_of);
+        }
+        for (int i = 0; i < n; i++) {
+            const TPlan p = plan_of(n, i, slot_of);
+            pc[i].s = jspm4::menu_seats(p, true);
+            if (!pc[i].s.ok || pc[i].s.me != i || pc[i].s.n != n || pc[i].s.nto != n - 1) return false;
+            if (!pc[i].f.open(sid, pc[i].s.me, pc[i].s.n, pc[i].s.slots)) return false;
+            pc[i].f.set_config(pcf, kcf);
+        }
+        for (; t < 10000; t += 10) step();
+        for (int i = 0; i < n; i++) if (!pc[i].f.agreed()) return false;
+        return true;
+    }
+    void step()
+    {
+        net.deliver(pc, t);
+        for (int i = 0; i < n; i++) {
+            MPc& p = pc[i];
+            if (t >= p.dead_at) p.alive = false;
+            if (!p.alive) continue;
+            if (t < p.freeze_from || t >= p.freeze_to) p.f.game_alive(t);
+            if (t % 100 == 0) p.f.pump(t, [&](const uint8_t* b, size_t len) { net.send(pc, i, b, len, t); });   // pump_tick: every 100 ms
+            if (t >= p.choose_at) { p.choose_at = ~0ull; p.f.choose(p.want, t); }
+            const Act a = p.f.poll(t);   // the game thread: every frame
+            if (a == Act::Rematch || a == Act::CharSelect) { if (p.act == Act::None) { p.act = a; p.act_at = t; } p.room_at = t + 300 + 200 * (uint64_t)i; if (a == Act::CharSelect && p.submit) p.pick_at = t + 500 + 300 * (uint64_t)i; }
+            else if (a == Act::Ready) p.ready = true;
+            else if (a != Act::None && (p.act == Act::None || p.act == Act::Rematch || p.act == Act::CharSelect)) { p.act = a; p.why = p.f.postgame().reason(); p.act_at = t; }
+            if (p.room_at && t >= p.room_at) { p.f.in_room(true); p.room_at = 0; }
+            if (p.pick_at && t >= p.pick_at) { p.f.submit(p.pick, true); p.pick_at = 0; }
+        }
+    }
+    void match_end(uint16_t seq) { for (int i = 0; i < n; i++) { pc[i].act = Act::None; pc[i].ready = false; pc[i].why = jspg::R_NONE; if (pc[i].alive) CHECK(pc[i].f.match_end(seq, t)); } }
+    void run_for(uint64_t ms) { const uint64_t e = t + ms; for (; t < e; t += 10) step(); }
+};
+
+static void test_multi_seats()
+{
+    // 2 players: test12's mapping, whatever the switch and the peer fields say (they were never read for 2 players)
+    for (int host = 0; host < 2; host++)
+        for (int a = 0; a < 4; a++) for (int b = 0; b < 4; b++) for (int pr = 0; pr < 4; pr++) {
+            TPlan p; p.host = host != 0; p.total_players = 2; p.local_first = (uint8_t)a; p.local_peer = (uint8_t)pr; p.local_count = (uint8_t)(1 + pr % 2);
+            TRemote r; r.first_slot = (uint8_t)b; r.peer = (uint8_t)(3 - pr); r.count = (uint8_t)(1 + pr / 2); p.remotes.push_back(r);
+            const int me = host ? 0 : 1;   // the old code, line for line
+            uint8_t slots[jspk::kMaxPlayers] = {}; slots[me] = (uint8_t)a; slots[me ^ 1] = (uint8_t)b;
+            const bool ok = jspo::seats_ok(slots, 2, 2);
+            for (int multi = 0; multi < 2; multi++) {
+                const jspm4::Seats s = jspm4::menu_seats(p, multi != 0);
+                CHECK(s.ok == ok && s.me == me && s.n == 2 && !std::memcmp(s.slots, slots, sizeof slots) && s.nto == 1 && s.to[0] == (host ? 1 : 0));
+                CHECK(s.why == (ok ? jspm4::Why::Ok : jspm4::Why::NotTwo));
+            }
+        }
+    {   // a 2-player plan that is not one remote: as before, no menu
+        TPlan p; p.total_players = 2; p.host = true;
+        CHECK(!jspm4::menu_seats(p, true).ok && jspm4::menu_seats(p, true).why == jspm4::Why::NotTwo);
+    }
+    // 3-4 players: off without the switch; with it, me = local_peer and slots[peer] = first_slot on every PC alike
+    const uint8_t perm[4][4] = { { 0, 1, 2, 3 }, { 2, 0, 3, 1 }, { 3, 2, 1, 0 }, { 1, 3, 0, 2 } };
+    for (int n = 3; n <= 4; n++)
+        for (const auto& pm : perm) {
+            uint8_t slot_of[4]; int k = 0;
+            for (int i = 0; i < 4 && k < n; i++) if (pm[i] < n) slot_of[k++] = pm[i];   // a permutation of 0..n-1: exactly the planned seats
+            for (int me = 0; me < n; me++) {
+                const TPlan p = plan_of(n, me, slot_of);
+                CHECK(!jspm4::menu_seats(p, false).ok && jspm4::menu_seats(p, false).why == jspm4::Why::MultiOff);
+                const jspm4::Seats s = jspm4::menu_seats(p, true);
+                CHECK(s.ok && s.why == jspm4::Why::Ok && s.me == me && s.n == n && s.nto == n - 1);
+                for (int i = 0; i < n; i++) CHECK(s.slots[i] == slot_of[i]);
+                uint32_t to = 0; for (int i = 0; i < s.nto; i++) to |= 1u << s.to[i];
+                CHECK(to == (((1u << n) - 1u) & ~(1u << me)));   // every other peer, never this one
+            }
+        }
+    {   // refusals: a peer id twice / out of range, host not peer 0, two players on one PC, a missing remote, a slot off the planned seats
+        const uint8_t so[4] = { 2, 0, 3, 1 };
+        TPlan p = plan_of(4, 1, so);
+        TPlan q = p; q.remotes[1].peer = 0; CHECK(jspm4::menu_seats(q, true).why == jspm4::Why::PeerIds);
+        q = p; q.remotes[2].peer = 4; CHECK(jspm4::menu_seats(q, true).why == jspm4::Why::PeerIds);
+        q = p; q.host = true; CHECK(jspm4::menu_seats(q, true).why == jspm4::Why::PeerIds);
+        q = p; q.local_count = 2; CHECK(jspm4::menu_seats(q, true).why == jspm4::Why::Shape);
+        q = p; q.remotes[0].count = 2; CHECK(jspm4::menu_seats(q, true).why == jspm4::Why::Shape);
+        q = p; q.remotes.pop_back(); CHECK(jspm4::menu_seats(q, true).why == jspm4::Why::Shape);
+        q = p; q.remotes[0].first_slot = 0; CHECK(jspm4::menu_seats(q, true).why == jspm4::Why::Seats);   // two players on record 0
+        const uint8_t s3[3] = { 0, 1, 3 };
+        CHECK(jspm4::menu_seats(plan_of(3, 0, s3), true).why == jspm4::Why::Seats);                    // record 3 is not a seat of 3 players
+        q = p; q.total_players = 5; CHECK(!jspm4::menu_seats(q, true).ok);
+    }
+    CHECK(jspm4::key_on("1") && !jspm4::key_on("0") && !jspm4::key_on("") && !jspm4::key_on(nullptr) && !jspm4::key_on("11") && !jspm4::key_on("yes"));
+}
+
+static void test_multi_flow()
+{
+    for (int n = 3; n <= 4; n++) {
+        {   // everyone chooses Fight again: Fight again on every PC, no pair (the native roster stands), the host's start waits for every "in the room"
+            MRun m; m.n = n; CHECK(m.open(5000u + (uint64_t)n));
+            m.match_end(1);
+            for (int i = 0; i < n; i++) { m.pc[i].want = jspg::REMATCH; m.pc[i].choose_at = m.t + 100 + 400 * (uint64_t)i; }
+            bool early_start = false;
+            for (uint64_t e = m.t + 6000; m.t < e; m.t += 10) {
+                m.step();
+                bool all_in = true; for (int i = 1; i < n; i++) all_in = all_in && m.pc[i].room_at == 0 && m.pc[i].act == Act::Rematch;
+                if (m.pc[0].f.start_ok() && !all_in) early_start = true;
+            }
+            CHECK(!early_start);
+            for (int i = 0; i < n; i++) { CHECK(m.pc[i].act == Act::Rematch && m.pc[i].ready); jspf::PairOut po; CHECK(!m.pc[i].f.pair(&po)); }
+            CHECK(m.pc[0].f.start_ok() && m.pc[0].f.host() && !m.pc[1].f.host());
+            for (int i = 0; i < n; i++) CHECK(m.net.sent_to[i] > 0);   // every peer got the menu's messages
+        }
+        for (int cs = 0; cs < n; cs++) {   // one player chooses Select character (the others Fight again): Select character everywhere, one pair
+            MRun m; m.n = n; CHECK(m.open(6000u + (uint64_t)(n * 10 + cs)));
+            m.match_end(1);
+            for (int i = 0; i < n; i++) { m.pc[i].want = i == cs ? jspg::CHARSELECT : jspg::REMATCH; m.pc[i].choose_at = m.t + 200 + 300 * (uint64_t)((i + cs) % n); m.pc[i].pick.fighter = (uint16_t)(0x20 + i); }
+            m.run_for(10000);
+            jspf::PairOut p0; CHECK(m.pc[0].f.pair(&p0));
+            for (int i = 0; i < n; i++) {
+                CHECK(m.pc[i].act == Act::CharSelect && m.pc[i].ready);
+                jspf::PairOut po; CHECK(m.pc[i].f.pair(&po));
+                CHECK(po.n == n && po.self_slot == m.slot_of[i]);   // this PC's own battle slot, not its peer id
+                for (int j = 0; j < n; j++) CHECK(po.slot[j] == m.slot_of[j] && po.pick[j] == p0.pick[j] && po.pick[j].fighter == 0x20 + j);
+            }
+            CHECK(m.pc[0].f.start_ok());
+            // the fight runs; the next Fight again (everyone) keeps that pair
+            for (int i = 0; i < n; i++) m.pc[i].f.fight_running();
+            m.run_for(1000); m.match_end(2);
+            for (int i = 0; i < n; i++) { m.pc[i].want = jspg::REMATCH; m.pc[i].choose_at = m.t + 100; }
+            m.run_for(6000);
+            for (int i = 0; i < n; i++) { CHECK(m.pc[i].act == Act::Rematch && m.pc[i].ready); jspf::PairOut po; CHECK(m.pc[i].f.pair(&po) && po.pick[i] == p0.pick[i]); }
+        }
+        for (int lv = 0; lv < n; lv++) {   // one player leaves (the host too): it gives the room up; every other PC closes the link and waits for it to go
+            MRun m; m.n = n; CHECK(m.open(7000u + (uint64_t)(n * 10 + lv)));
+            m.match_end(1);
+            for (int i = 0; i < n; i++) if (i != lv) { m.pc[i].want = jspg::REMATCH; m.pc[i].choose_at = m.t + 100; }   // the others chose first: Leave still wins
+            m.pc[lv].want = jspg::LEAVE; m.pc[lv].choose_at = m.t + 1500;
+            const uint64_t at = m.t + 1500;
+            m.run_for(5000);
+            CHECK(m.pc[lv].act == Act::LeaveGiveUp && m.pc[lv].why == jspg::R_SELF && !jspm4::leave_wait_applies(n, m.pc[lv].act, m.pc[lv].why));
+            for (int i = 0; i < n; i++) if (i != lv) {
+                CHECK(m.pc[i].act == Act::LeaveClose && m.pc[i].why == jspg::R_PEER_LEFT && m.pc[i].act_at <= at + 400);
+                CHECK(jspm4::leave_wait_applies(n, m.pc[i].act, m.pc[i].why));
+                CHECK(!m.pc[i].f.hold() && std::string(m.pc[i].f.postgame().outcome_text()) == "A player left: back to the room");
+            }
+        }
+        {   // mixed: Fight again, Select character, Fight again (, Select character): Select character everywhere
+            MRun m; m.n = n; CHECK(m.open(8000u + (uint64_t)n));
+            m.match_end(1);
+            for (int i = 0; i < n; i++) { m.pc[i].want = i % 2 ? jspg::CHARSELECT : jspg::REMATCH; m.pc[i].choose_at = m.t + 100 + 700 * (uint64_t)(n - i); }
+            m.run_for(10000);
+            for (int i = 0; i < n; i++) CHECK(m.pc[i].act == Act::CharSelect && m.pc[i].ready);
+        }
+        {   // a link goes silent at the prompt (PC n-1 stops): the others close after the silence, and do NOT wait (nobody chose to leave)
+            MRun m; m.n = n; CHECK(m.open(9000u + (uint64_t)n));
+            m.match_end(1);
+            m.pc[n - 1].dead_at = m.t + 50;
+            for (int i = 0; i < n - 1; i++) { m.pc[i].want = jspg::REMATCH; m.pc[i].choose_at = m.t + 100; }
+            const uint64_t at = m.t;
+            m.run_for(15000);
+            for (int i = 0; i < n - 1; i++) {
+                CHECK(m.pc[i].act == Act::LeaveClose && m.pc[i].why == jspg::R_LINK_LOST && m.pc[i].act_at >= at + 7000 && m.pc[i].act_at <= at + 9000);
+                CHECK(!jspm4::leave_wait_applies(n, m.pc[i].act, m.pc[i].why));
+            }
+        }
+        {   // FIX (REVIEW-MENU4 1): nobody has chosen and ONE path is cut (PC0 <-> PC1; PC 2.. hear both): every PC decides "link lost" and none holds
+            for (int cut_b = 1; cut_b < n; cut_b++) {
+                MRun m; m.n = n; CHECK(m.open(9050u + (uint64_t)(n * 10 + cut_b)));
+                m.match_end(1);
+                m.run_for(1000);
+                m.net.cut[0][cut_b] = m.net.cut[cut_b][0] = true;
+                m.run_for(30000);
+                bool hold0 = false;
+                for (int i = 0; i < n; i++) {
+                    CHECK(m.pc[i].act == Act::LeaveClose && m.pc[i].why == jspg::R_LINK_LOST);
+                    const bool h = jspm4::leave_wait_applies(n, m.pc[i].act, m.pc[i].why);
+                    if (!i) hold0 = h;
+                    CHECK(h == hold0 && !h);   // the same hold decision on every PC
+                    CHECK(m.pc[i].f.postgame().mine() == jspg::NONE);   // no LEAVE was written for a silence
+                }
+            }
+        }
+        {   // FIX (REVIEW-MENU4 2): PC 1's game makes no flip for 60 s at the prompt and then comes back: it gets Froze, the others hear its gone
+            // hello (+ its Leave: LeaveClose, or PeerFroze); every PC holds the same way
+            MRun m; m.n = n; CHECK(m.open(9070u + (uint64_t)n));
+            m.match_end(1);
+            m.pc[1].freeze_from = m.t; m.pc[1].freeze_to = m.t + jspf::kFreezeMs + 5000;
+            for (int i = 0; i < n; i++) if (i != 1) { m.pc[i].want = jspg::REMATCH; m.pc[i].choose_at = m.t + 100; }
+            m.run_for(jspf::kFreezeMs + 10000);
+            CHECK(m.pc[1].act == Act::Froze && jspm4::leave_wait_applies(n, m.pc[1].act, m.pc[1].why));
+            for (int i = 0; i < n; i++) if (i != 1) {
+                CHECK(m.pc[i].act == Act::LeaveClose || m.pc[i].act == Act::PeerFroze);
+                CHECK(jspm4::leave_wait_applies(n, m.pc[i].act, m.pc[i].why));
+            }
+        }
+        {   // idle: PC 1 never chooses (prompt idle 20 s): it leaves for itself (gives the room up), the others hear its Leave and wait for it to go
+            MRun m; m.n = n; m.pcf.idle_ms = 20000; CHECK(m.open(9100u + (uint64_t)n));
+            m.match_end(1);
+            const uint64_t at = m.t;
+            for (int i = 0; i < n; i++) if (i != 1) { m.pc[i].want = jspg::REMATCH; m.pc[i].choose_at = m.t + 100; }
+            m.run_for(25000);
+            CHECK(m.pc[1].act == Act::LeaveGiveUp && m.pc[1].why == jspg::R_IDLE && m.pc[1].act_at >= at + 20000 && m.pc[1].act_at <= at + 20100);
+            for (int i = 0; i < n; i++) if (i != 1) { CHECK(m.pc[i].act == Act::LeaveClose && m.pc[i].why == jspg::R_PEER_LEFT && m.pc[i].act_at <= at + 20500); CHECK(jspm4::leave_wait_applies(n, m.pc[i].act, m.pc[i].why)); }
+        }
+        {   // the pick round's idle lock: PC 2 never locks its pick: after the pick idle (30 s) its pick is locked as it is and the round gets READY
+            MRun m; m.n = n; m.kcf.idle_ms = 30000; CHECK(m.open(9200u + (uint64_t)n));
+            m.match_end(1);
+            for (int i = 0; i < n; i++) { m.pc[i].want = jspg::CHARSELECT; m.pc[i].choose_at = m.t + 100; }
+            m.pc[2].submit = false;
+            m.run_for(20000);
+            for (int i = 0; i < n; i++) CHECK(m.pc[i].act == Act::CharSelect && !m.pc[i].ready);
+            CHECK(!m.pc[0].f.start_ok() && m.pc[0].f.block_start());   // the host's Cross stays blocked meanwhile
+            m.run_for(15000);
+            for (int i = 0; i < n; i++) CHECK(m.pc[i].ready);
+            CHECK(m.pc[0].f.start_ok());
+        }
+        {   // the pick round loses a player (PC n-1 stops while picking): Lost on the others, no wait
+            MRun m; m.n = n; CHECK(m.open(9300u + (uint64_t)n));
+            m.match_end(1);
+            for (int i = 0; i < n; i++) { m.pc[i].want = jspg::CHARSELECT; m.pc[i].choose_at = m.t + 100; }
+            m.pc[n - 1].submit = false;
+            m.run_for(2000);
+            m.pc[n - 1].dead_at = m.t;
+            m.run_for(20000);
+            for (int i = 0; i < n - 1; i++) { CHECK(m.pc[i].act == Act::Lost && !m.pc[i].f.hold()); CHECK(!jspm4::leave_wait_applies(n, m.pc[i].act, m.pc[i].why)); }
+        }
+    }
+}
+
+// FIX (test11 field, room 77; re-done in test13 with REVIEW-QUIT's fixes): A's window closes at the after-match menu. The game thread polls A
+// at every step (10 ms) and the pump thread ticks every 100 ms, as in the game: jsp_net_quitting's own pump must have sent the Leave and the
+// gone hello before anything on A can close the link, and A's poll stays inert. B (and every other PC) must leave within ~300 ms, not after
+// 8 s of silence. stage 0: nobody chose; 1: A chose Fight again; 2: Select character, all picking; 3: READY.
+static void test_quitting()
+{
+    for (int n = 2; n <= 4; n++)
+        for (int stage = 0; stage <= 3; stage++)
+            for (int quitter = 0; quitter < n; quitter += n - 1) {   // the host and the last joiner
+                MRun m; m.n = n;
+                if (n == 2) { m.slot_of[0] = 0; m.slot_of[1] = 1; }
+                CHECK(m.open(9600u + (uint64_t)(n * 100 + stage * 10 + quitter)));
+                MPc& a = m.pc[quitter];
+                CHECK(!a.f.quitting(m.t));   // no menu yet: nothing to tell
+                m.match_end(1);
+                if (stage == 1) { a.want = jspg::REMATCH; a.choose_at = m.t; }
+                if (stage >= 2) for (int i = 0; i < n; i++) { m.pc[i].want = jspg::CHARSELECT; m.pc[i].choose_at = m.t; m.pc[i].submit = stage == 3; }
+                m.run_for(stage == 3 ? 4000 : 1000);
+                if (stage == 3) for (int i = 0; i < n; i++) CHECK(m.pc[i].ready);
+                for (int i = 0; i < n; i++) if (i != quitter) CHECK(m.pc[i].act == Act::None || m.pc[i].act == Act::CharSelect);
+                const uint64_t quit_at = m.t + 30;   // between two pump ticks (the game thread polls in between)
+                m.t = quit_at;
+                std::vector<int> got_to; bool gone = false, leave = false;
+                CHECK(a.f.quitting(m.t));
+                a.f.pump(m.t, [&](const uint8_t* b, size_t len) {   // jsp_net_quitting: at once, under the same lock, to every peer of the menu
+                    for (int k = 0; k < a.s.nto; k++) got_to.push_back(a.s.to[k]);
+                    Hello h; if (b[0] == kTagPostgame && hello_decode(b + 1, len - 1, &h) && h.gone) gone = true;
+                    if (b[0] == kTagPostgame && len == 1 + jspg::kMsgLen) { jspg::Msg pm; if (jspg::decode(b + 1, len - 1, &pm) && pm.pick == jspg::LEAVE) leave = true; }
+                    if (b[0] == kTagPostgame && len == 1 + kGroupMsgLen) { GroupMsg gm; if (group_decode(b + 1, len - 1, &gm) && gm.pick == jspg::LEAVE) leave = true; }
+                    m.net.send(m.pc, quitter, b, len, m.t);
+                });
+                CHECK(gone && (int)got_to.size() >= n - 1);
+                if (stage == 0) CHECK(leave);
+                CHECK(!a.f.quitting(m.t));   // told once
+                for (int k = 0; k < 30; k++) CHECK(a.f.poll(m.t + (uint64_t)k) == Act::None);   // REVIEW-QUIT 1b: inert, nothing closes the link
+                for (int i = 0; i < n; i++) if (i != quitter) m.pc[i].act = Act::None;
+                a.dead_at = quit_at + 3000;   // ps3_host_quit's grace
+                m.t = quit_at;
+                m.run_for(10000);
+                for (int i = 0; i < n; i++) if (i != quitter) {
+                    const Act y = m.pc[i].act;
+                    CHECK(y == Act::PeerFroze || y == Act::LeaveClose);
+                    CHECK(m.pc[i].act_at >= quit_at && m.pc[i].act_at <= quit_at + 300);
+                    if (n > 2) CHECK(jspm4::leave_wait_applies(n, y, m.pc[i].why));
+                    if (y == Act::None || m.pc[i].act_at > quit_at + 300)
+                        std::printf("  quitting n=%d stage %d quitter %d: PC %d %s after %llu ms\n", n, stage, quitter, i, act_name(y), (unsigned long long)(m.pc[i].act_at - quit_at));
+                }
+            }
+}
+
+// The 2-player menu is byte for byte what it was: the same scenario with the menu built by menu_seats with the switch on and off, and by the
+// old code's own mapping, sends the same datagrams to the same peers at the same times.
+static void test_two_unchanged()
+{
+    std::vector<std::string> logs[3];
+    for (int mode = 0; mode < 3; mode++) {
+        Flow f[2]; jspm4::Seats s[2];
+        for (int i = 0; i < 2; i++) {
+            TPlan p; p.host = i == 0; p.total_players = 2; p.local_first = (uint8_t)i; p.local_peer = (uint8_t)i;
+            TRemote r; r.first_slot = (uint8_t)(i ^ 1); r.peer = (uint8_t)(i ^ 1); p.remotes.push_back(r);
+            if (mode < 2) s[i] = jspm4::menu_seats(p, mode == 1);
+            else { s[i].ok = true; s[i].me = i; s[i].n = 2; s[i].slots[i] = (uint8_t)i; s[i].slots[i ^ 1] = (uint8_t)(i ^ 1); s[i].nto = 1; s[i].to[0] = (uint8_t)(i == 0 ? 1 : 0); }
+            CHECK(s[i].ok && f[i].open(424242, s[i].me, s[i].n, s[i].slots));
+        }
+        std::string& lg = logs[mode].emplace_back();
+        auto tick = [&](uint64_t t) {
+            for (int i = 0; i < 2; i++)
+                f[i].pump(t, [&](const uint8_t* b, size_t len) {
+                    for (int k = 0; k < s[i].nto; k++) {
+                        char h[32]; std::snprintf(h, sizeof h, "%llu %d>%d:", (unsigned long long)t, i, s[i].to[k]); lg += h;
+                        for (size_t j = 0; j < len; j++) { std::snprintf(h, sizeof h, "%02x", b[j]); lg += h; }
+                        lg += '\n';
+                        f[s[i].to[k]].route(i, b, len, t);
+                    }
+                });
+            for (int i = 0; i < 2; i++) { const Act a = f[i].poll(t); if (a != Act::None) { lg += act_name(a); lg += '\n'; } }
+        };
+        uint64_t t = 0;
+        for (; t < 5000; t += 100) tick(t);
+        CHECK(f[0].match_end(1, t) && f[1].match_end(1, t));
+        CHECK(f[0].choose(jspg::CHARSELECT, t) && f[1].choose(jspg::REMATCH, t));
+        for (uint64_t e = t + 3000; t < e; t += 100) tick(t);
+        jspk::Pick p; p.fighter = 9; CHECK(f[0].submit(p, true) && f[1].submit(p, true));
+        f[0].in_room(true); f[1].in_room(true);
+        for (uint64_t e = t + 3000; t < e; t += 100) tick(t);
+        CHECK(f[0].start_ok());
+        f[0].fight_running(); f[1].fight_running();
+        CHECK(f[0].match_end(2, t) && f[1].match_end(2, t));
+        CHECK(f[1].choose(jspg::LEAVE, t));
+        for (uint64_t e = t + 3000; t < e; t += 100) tick(t);
+    }
+    CHECK(!logs[0].empty() && logs[0] == logs[1] && logs[1] == logs[2]);
+}
+
 int main()
 {
     test_hello_wire();
     test_switch();
     test_freeze();
+    test_quitting();
+    test_multi_seats();
+    test_multi_flow();
+    test_two_unchanged();
     test_group_wire();
     test_group_states();
     int bad = 0;
@@ -679,6 +1049,6 @@ int main()
     int fbad = 0, runs = 0;
     for (int n = 2; n <= 4; n++) for (uint32_t s = 1; s <= 60; s++, runs++) if (!flow_random(s * 7919u + (uint32_t)n * 13u, n)) { if (fbad++ < 3) std::printf("FAIL flow run n=%d seed %u\n", n, s); fails++; }
     if (fails) { std::printf("net pick flow: %d failure(s)\n", fails); return 1; }
-    std::printf("net pick flow: switch handshake (one PC on, a lost last hello, an early decline, old link, forged sender), freeze owner (prompt, chosen, picking, READY; no false trip), group choice (900 random runs), 2-player path, routing, spoofed senders, late lock vs the host's start, member map, team bytes, picker texts, leave / silence / idle / lost, %d flow runs of 8 post-games (n = 2..4) ok\n", runs);
+    std::printf("net pick flow: switch handshake (one PC on, a lost last hello, an early decline, old link, forged sender), freeze owner (prompt, chosen, picking, READY; no false trip), group choice (900 random runs), 2-player path, routing, spoofed senders, late lock vs the host's start, member map, team bytes, picker texts, leave / silence / idle / lost, %d flow runs of 8 post-games (n = 2..4); test13: window close at the menu (n = 2..4, 4 stages, inert poll, sent at once), 3-4 player glue (seats from each PC's own plan, peer != slot, send to every peer, refusals), 3-4 players: all Fight again, one Select character, one leaves (+ leave rule), mixed, silence, one cut path with no choice made (same outcome and hold on every PC), a 60 s freeze that comes back (every PC holds), prompt idle, pick idle lock, lost pick round; 2-player menu byte for byte as before ok\n", runs);
     return 0;
 }

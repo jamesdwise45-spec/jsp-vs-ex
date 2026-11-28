@@ -141,11 +141,12 @@ public:
     void tick(uint64_t now)
     {
         if (!started_ || outcome_ != jspg::PENDING) return;
+        // FIX (test13 review of the 3-4 player menu, REVIEW-MENU4 1): a silent player ends the round as "link lost" WITHOUT writing a LEAVE into this
+        // PC's own choice. Before, that LEAVE went out and every PC that still heard this one took it for a player who chose to leave (R_PEER_LEFT)
+        // while this PC had R_LINK_LOST: the PCs split on the leave rule's hold (jsp_net_menu4.h). Now the others reach R_LINK_LOST by their own
+        // silence check once this PC's messages stop (linger_ms after its decision). Same wire; the 2-player jspg::Agreement is untouched.
         for (int i = 0; i < n_; i++)
-            if (i != me_ && now - heard_[i] >= cfg_.silence_ms) {
-                if (choice_[me_] == jspg::NONE) { choice_[me_] = jspg::LEAVE; bump(); }
-                decide(jspg::O_LEAVE, jspg::R_LINK_LOST, now); return;
-            }
+            if (i != me_ && now - heard_[i] >= cfg_.silence_ms) { decide(jspg::O_LEAVE, jspg::R_LINK_LOST, now); return; }
         if (choice_[me_] == jspg::NONE && now - t0_ >= cfg_.idle_ms) { choice_[me_] = jspg::LEAVE; bump(); decide(jspg::O_LEAVE, jspg::R_IDLE, now); return; }
         if (choice_[me_] != jspg::NONE && now - t0_ >= (uint64_t)cfg_.idle_ms + cfg_.silence_ms) decide(jspg::O_LEAVE, jspg::R_LINK_LOST, now);
     }
@@ -472,7 +473,13 @@ public:
     {
         if (peer_off_ && !peer_off_said_) { peer_off_said_ = true; return Act::PeerOff; }   // FIX (pick7): another PC declined this match
         if (frozen_ && !froze_said_) { froze_said_ = true; end_round(); return Act::Froze; }             // FIX (pick7): the freeze owner left for this PC
-        if (peer_gone_ && !peer_gone_said_) { peer_gone_said_ = true; end_round(); return Act::PeerFroze; }
+        if (peer_gone_ && !peer_gone_said_) {
+            peer_gone_said_ = true;
+            // FIX (test13 review, REVIEW-MENU4 5 / REVIEW-QUIT 3): the gone hello came with that player's Leave (a window closed, or a freeze with no
+            // choice made): the normal outcome below says "Opponent left" / "A player left" (Act::LeaveClose); the link closes the same way
+            const bool left = pg_.on() && !acted_ && pg_.outcome() == jspg::O_LEAVE && pg_.reason() == jspg::R_PEER_LEFT;
+            if (!left) { end_round(); return Act::PeerFroze; }
+        }
         if (!is_open() || !pg_.on()) return Act::None;
         const jspg::Outcome o = pg_.outcome();
         if (o == jspg::PENDING) return Act::None;
@@ -510,6 +517,22 @@ public:
 
     // UI
     bool choose(jspg::Choice c, uint64_t now) { return is_open() && pg_.pick(c, now); }
+    // FIX (test11 field, room 77; re-done in test13 with the review fixes of D:\jsp-audit\test12\REVIEW-QUIT.md): this PC's window is closing.
+    // As the freeze owner does (pump(), 3 at the top): the prompt's own choice becomes Leave when none was made, the pick round sends nothing
+    // more, and every hello says gone, so every other PC closes its round at once (Act::PeerFroze) instead of after silence_ms of nothing
+    // ("left or the connection was lost"). The caller pumps at once under the same lock (the pump thread's tick is 100 ms, and the game thread
+    // polls in between); the pump thread then keeps resending while the process lives (ps3_host_quit's grace). This PC's poll() is inert from
+    // here on (acted_, pg_left_ and the said-flags set), so nothing on the game thread closes the link before those datagrams are out.
+    // true = told (once; false before the prompt: a fight is the session's own disconnect).
+    bool quitting(uint64_t now)
+    {
+        if (!is_open() || !pg_.on() || frozen_) return false;
+        frozen_ = true; froze_said_ = true; peer_gone_said_ = true; hello_dirty_ = true;   // froze_said_: no Act::Froze for a process that is exiting
+        if (pg_.outcome() == jspg::PENDING && pg_.mine() == jspg::NONE) pg_.pick(jspg::LEAVE, now);
+        if (pick_on_) pick_.stop();
+        acted_ = true; pg_left_ = true;   // REVIEW-QUIT 1b: no Act::LeaveGiveUp -> native_close on the game thread before the Leave is sent
+        return true;
+    }
     bool submit(jspk::Pick p, bool lock) { if (!pick_on_ || !pick_.set_pick(p)) return false; return !lock || pick_.lock(); }
     // This PC reached its room page. The flag goes out only once this PC's round is READY (see the top: the host's start then proves that
     // every PC committed the same picks).
