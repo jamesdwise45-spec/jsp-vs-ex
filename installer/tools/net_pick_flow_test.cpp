@@ -1245,6 +1245,63 @@ static void test_two_unchanged()
     CHECK(!logs[0].empty() && logs[0] == logs[1] && logs[1] == logs[2]);
 }
 
+// FIX (test13 integration review 1 + 2, REVIEW-INTEGRATION): one PC's match ends abnormally (a refused restore, the NULL-call guard, a desync)
+// while the other PCs ended it normally and opened their prompt. The abnormal PC declines (Flow::decline): every open prompt closes at once
+// with "the other PC's menu is off" (Act::PeerOff) and no hold; a PC that ends the match normally only after the decline opens none (why 2).
+// The committed pair stays for the next fight's builder, but an explicit Together from the last round goes back to the room's teams, the same
+// on every PC. n = 2..4; the abnormal PC is the host and a joiner.
+static void test_abnormal_end()
+{
+    for (int n = 2; n <= 4; n++)
+        for (int bad = 0; bad < n; bad += n - 1) {
+            MRun m; m.n = n;
+            CHECK(m.open(9900u + (uint64_t)(n * 10 + bad)));
+            // match 1: Select character with the host's explicit Together; committed on every PC
+            m.match_end(1);
+            for (int i = 0; i < n; i++) { m.pc[i].want = jspg::CHARSELECT; m.pc[i].choose_at = m.t + 100; m.pc[i].pick.fighter = (uint16_t)(0x20 + i); }
+            m.pc[0].pick.mode = jspk::TOGETHER; m.pc[0].pick.room = false;
+            m.run_for(10000);
+            for (int i = 0; i < n; i++) { CHECK(m.pc[i].ready); jspf::PairOut po; CHECK(m.pc[i].f.pair(&po) && po.mode() == jspk::TOGETHER); }
+            for (int i = 0; i < n; i++) m.pc[i].f.fight_running();
+            m.run_for(1000);
+            // match 2: PC `bad` ends abnormally, the others (but the last one, if n > 2) end normally first and open their prompt
+            const int late = n > 2 ? (bad == n - 1 ? 1 : n - 1) : -1;
+            for (int i = 0; i < n; i++) { m.pc[i].act = Act::None; if (i != bad && i != late) CHECK(m.pc[i].f.match_end(2, m.t) && m.pc[i].f.hold()); }
+            m.run_for(500);
+            const uint64_t at = m.t;
+            m.pc[bad].f.decline(2);
+            CHECK(!m.pc[bad].f.hold() && m.pc[bad].f.poll(m.t) == Act::None);
+            m.run_for(1500);
+            if (late >= 0) { CHECK(!m.pc[late].f.match_end(2, m.t) && m.pc[late].f.decline_why() == 2 && !m.pc[late].f.hold()); }
+            m.run_for(2000);
+            jspf::PairOut p0; CHECK(m.pc[0].f.pair(&p0));
+            for (int i = 0; i < n; i++) {
+                if (i != bad && i != late) {
+                    CHECK(m.pc[i].act == Act::PeerOff && m.pc[i].act_at <= at + 300);
+                    if (m.pc[i].act != Act::PeerOff || m.pc[i].act_at > at + 300)
+                        std::printf("  abnormal end n=%d bad %d: PC %d %s after %llu ms\n", n, bad, i, act_name(m.pc[i].act), (unsigned long long)(m.pc[i].act_at - at));
+                } else CHECK(m.pc[i].act == Act::None);
+                CHECK(!m.pc[i].f.hold() && !m.pc[i].f.postgame().on());
+                jspf::PairOut po; CHECK(m.pc[i].f.pair(&po));
+                CHECK(po.mode() == jspk::ROOM && jspk::choice_of(po.pick[0]) == jspk::CHOICE_ROOM);   // the explicit Together does not carry on
+                for (int j = 0; j < n; j++) CHECK(po.pick[j] == p0.pick[j] && po.pick[j].fighter == 0x20 + j);   // same pair on every PC, fighters kept
+            }
+            // the link goes on: match 3 ends normally on every PC and the menu opens again
+            for (int i = 0; i < n; i++) m.pc[i].f.fight_running();
+            m.run_for(1000);
+            m.match_end(3);
+            for (int i = 0; i < n; i++) CHECK(m.pc[i].f.hold() && m.pc[i].f.postgame().on());
+        }
+    // without the decline (the bug): the prompt of a PC that ended normally stays open (2 players: until the idle timeout)
+    {
+        MRun m; m.n = 2;
+        CHECK(m.open(9990u));
+        CHECK(m.pc[1].f.match_end(1, m.t));
+        m.run_for(30000);
+        CHECK(m.pc[1].act == Act::None && m.pc[1].f.hold());
+    }
+}
+
 int main()
 {
     test_hello_wire();
@@ -1254,6 +1311,7 @@ int main()
     test_multi_seats();
     test_multi_flow();
     test_two_unchanged();
+    test_abnormal_end();
     test_group_wire();
     test_group_states();
     int bad = 0;

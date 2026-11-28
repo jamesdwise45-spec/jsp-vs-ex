@@ -396,7 +396,7 @@ public:
             if (h.gone && pg_.on() && !peer_gone_) peer_gone_ = true;   // FIX (pick7): that PC's game froze with the menu up
             if (h.declined) {
                 peer_declined_[peer] = h.declined;
-                if (pg_.on() && pg_.outcome() == jspg::PENDING && h.declined == (uint16_t)(pg_.seq() + 1u)) { pg_.stop(); peer_off_ = true; }
+                if (pg_.on() && pg_.outcome() == jspg::PENDING && h.declined == (uint16_t)(pg_.seq() + 1u)) { pg_.stop(); peer_off_ = true; reset_pair_teams(); }
             }
             return true;
         }
@@ -463,7 +463,19 @@ public:
         match_over(seq, now);
         if (!why) return true;
         pg_.stop(); decline_why_ = why; declined_ = (uint16_t)(seq + 1u); hello_dirty_ = true;
+        reset_pair_teams();   // FIX (test13 integration review 2): no round for this match on any PC
         return false;
+    }
+    // FIX (test13 integration review 1): this PC's match `seq` ended abnormally (a refused rollback restore, the NULL-call guard, a desync, a
+    // failure: not jkr::normal_end) after it ran, so this PC opens no menu for it. Before, it said nothing: another PC that had ended that match
+    // normally sat in its prompt (2 players: the idle timeout, 180 s, then gave the room up; 3-4: "link lost" after 8 s and a re-plan that
+    // needed this PC). Now the next hello (at once) declines the match: a prompt open elsewhere closes (Act::PeerOff, no hold, the link stays),
+    // and a PC that ends it normally later declines too (match_end, why 2). jsp_net_game.cpp end_with calls it under the pump mutex.
+    void decline(uint16_t seq)
+    {
+        if (!is_open()) return;
+        declined_ = (uint16_t)(seq + 1u); hello_dirty_ = true;
+        reset_pair_teams();
     }
     // FIX (pick7): every other player's hello is held and says it heard this PC's.
     bool agreed() const
@@ -584,6 +596,14 @@ private:
         PairOut p; p.n = n_; p.self_slot = slots_[me_];
         for (int i = 0; i < n_; i++) { p.slot[i] = slots_[i]; p.pick[i] = pick_.pick_of(i); }
         return p;
+    }
+    // FIX (test13 integration review 2): a match that ends without a round on every PC (this PC or another declined it: an abnormal end, a
+    // missing switch) keeps the committed pair for the next fight's builder, but its team choice goes back to the room default (the room's
+    // teams, Versus without them), so an earlier round's explicit Together / Versus never carries past its own fight ("team choice per round").
+    // Every PC does this for the same match (decline, match_end's decline, the PeerOff of an open prompt), so every builder applies the same pair.
+    void reset_pair_teams()
+    {
+        for (int i = 0; i < pair_.n; i++) jspk::set_choice(pair_.pick[i], room_teams_ ? jspk::CHOICE_ROOM : jspk::CHOICE_VERSUS);
     }
     // FIX (pick7): the menu of this match is over for this PC without an agreed outcome (a freeze here or there): no hold, no round, no messages.
     void end_round() { acted_ = true; pg_left_ = true; pick_.stop(); pick_on_ = false; pg_.stop(); want_room_ = false; }
