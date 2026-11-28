@@ -74,9 +74,18 @@ jobs:
           cat > notes.md <<EOF
           Online test build $VERSION of draft PR Tsamiuy/jsp-vs-ex#248 (rollback for Online Battle). Not an official release of the project.
 
-          ## New in test12
+          ## New in test13
 
-          - **Uninstall test11 first** (Start menu > Uninstall JSP Fan Revival), then run the new jsp-setup.exe. The main menu's lower right corner must say 0.7.0-test12 on every PC. **Every player needs test12**: a test11 and a test12 PC in the same fight will desync.
+          - **Uninstall test12 first** (Start menu > Uninstall JSP Fan Revival), then run the new jsp-setup.exe. The main menu's lower right corner must say 0.7.0-test13 on every PC. **Everyone in the room needs test13**: a test12 and a test13 PC can't use rollback together.
+          - **Pick your team.** The colour team you choose in the room is now the team you fight on, in every online case: 2 players with CPUs (you can team up with your friend), 3 players with a CPU, 4 players, and after Fight again or Select character. **Pick different colours to fight each other.** The host's Teams row in the after-match picker starts on "As chosen in the room" every round.
+          - **After-match menu for 3 and 4 players.** Fight again / Select character / Leave now appears in 3-4 player rooms too. If one player leaves, the others go back to the room and it carries on. JSP_ROLLBACK_PICK_MULTI=0 turns it off.
+          - **4-player fights no longer break for everyone.** When a rollback can't bring the game back to a clean state (a loading thread busy at the wrong moment), that one fight now ends cleanly and the room stays, instead of the game freezing and the whole session ending. When a desync happens, every PC now logs it.
+          - **Joining when a router changes the game's port.** The "communication error" when joining a friend's room (seen when one PC's router changed the game's online port) should be fixed: the game now finds the other player by their ID. PSNR_PUNCH_LEARN=0 turns this off.
+          - **Closing the game at the after-match menu** now tells the others at once.
+          - Support bundles now include the previous launch's network log. Please close the game before making a bundle, and send one after each session.
+
+          ## From test12
+
           - **Fight sound no longer stutters.** In online fights about two thirds of the fight's sound was silence, cutting in and out about 7 times a second (menus were fine). The game's sound engine was only allowed to run 30 times a second to keep both PCs in sync; it needs 60. It now runs 60 times a second, still in sync. In our local tests the silence in a fight went from 64% to under 8%, with no desyncs. JSP_NET_CRI_PER_TICK=1 in play_settings.txt brings back test11's sound (both players must use the same value).
           - **Steadier sound when a PC slows down for a moment.** Instead of a quick burst of short dropouts, the sound now slows down slightly for that moment without changing pitch. AUDIO_LOCK_FAST=0 turns this off.
           - Please send a support bundle after a session, and tell us how the fight sound and music feel now.

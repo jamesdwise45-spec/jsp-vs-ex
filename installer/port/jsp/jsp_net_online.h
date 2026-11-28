@@ -259,6 +259,8 @@ static const KV kDefaults[] = {
     // FORK TEST BUILD ONLY (not for upstream): a Friendly Match room of 3-4 humans gets the rollback mesh (test11, 4-player); JSP_ROLLBACK_MAX_PLAYERS=2 = two
     // players only, as upstream. Every PC in the room needs it (a test11 fork build has it).
     {"JSP_ROLLBACK_MAX_PLAYERS", "4"},
+    // FORK TEST BUILD ONLY (not for upstream): the after-match menu for 3-4 player rooms too (test13); JSP_ROLLBACK_PICK_MULTI=0 = 2 players only.
+    {"JSP_ROLLBACK_PICK_MULTI", "1"},
     // A restore waits (at most JSP_SNAPSHOT_SITE_MS, 50 ms) until every helper thread is parked where it was at the target's save (jsp_snapshot_sync.h, SiteMoved). Soak
     // 2026-11-21 (replay-driven depth 2, ~3,200 restores): a CRI loader worker was caught inside its file read at a restore; 0 desyncs, restore 10.7 ms avg (no cost).
     {"JSP_SNAPSHOT_SITE", "1"},
