@@ -30,6 +30,7 @@
 #ifndef JSP_ROLLBACK_BUILD
 extern "C" int jsp_net_lobby_open(const JspLobbyCfg*) { return 0; }
 extern "C" void jsp_net_lobby_close(void) {}
+extern "C" void jsp_net_quitting(void) {}
 extern "C" const char* jsp_net_lobby_reason(void) { return "this build has no rollback netcode"; }
 extern "C" int jsp_net_lobby_phase(void) { return 0; }
 extern "C" int jsp_net_match_begin(void) { return 0; }
@@ -92,6 +93,7 @@ static bool clock_diag() { static const bool v = [] { const char* e = std::geten
 #include "jsp_net_pick_flow.h"      // ENHANCEMENT (post-game / pick, JSP_ROLLBACK_PICK=1): the prompt, the pick round, the pair for the builder (pure, host-tested)
 #include "jsp_net_pick_drive.h"     // ENHANCEMENT (post-game / pick): the pad gate, the notice-box Cross, the joiner's Ready Cross (pure, host-tested)
 #include "jsp_net_pick_own.h"       // FIX (pick7): the planned seats, the predicted fighter map, the match-end rule (pure, host-tested)
+#include "jsp_net_menu4.h"          // ENHANCEMENT (test13, JSP_ROLLBACK_PICK_MULTI=1): the menu's players, slots and send peers for 3-4 players; the leave rule (pure, host-tested)
 #include "jsp_net_pick_page.h"      // ENHANCEMENT (JSP_PICK_NATIVE_SELECT=1): Select character on the game's own page for every player (pure, host-tested)
 #include "jsp_pick_skin.h"         // ENHANCEMENT (after-match menu art): the game's own menu art from the player's archives, and the layouts (pure, host-tested)
 static_assert(jspf::kTagPostgame == jspnet::kLinkTagPostgame && jspf::kTagPick == jspnet::kLinkTagPick, "one set of link tags");
@@ -339,6 +341,8 @@ struct State {
     // ENHANCEMENT (after-match menu art): pk is the menu in the game's own look (jsp_pick_skin.h); pk_open_ms starts its fade-in, pk_pic / pk_band_pic
     // cache the painted pictures by their content key (a paint costs ~10 ms; a redraw of the same content only blits).
     jspf::Flow flow; bool pick_link = false;
+    // ENHANCEMENT (test13, 3-4 players): the peer ids every menu message goes to (jspm4::menu_seats; 2 players: the one remote, host ? 1 : 0)
+    uint8_t menu_to[jspk::kMaxPlayers - 1] = {}; int menu_nto = 0;
     jpskin::View pk;
     std::string pk_key;
     uint64_t pk_open_ms = 0;
@@ -547,6 +551,10 @@ std::string path_word() { const int k = g.path_kind.load(); return k == 1 ? "dir
 // FIX (delay flapping, two-copy run native-rb1: 2 -> 3 -> 2 every 6-10 s on a steady 30 ms link): lowering needs five calm readings (10 s) in both rules.
 // ENHANCEMENT (post-game / pick): JSP_ROLLBACK_PICK=1 (jspf::key_on), read once; default 0 = no prompt, no pick, no roster write (today's behaviour).
 bool pick_on() { static int v = -1; if (v < 0) { char b[8] = {}; v = jsp_setting_get(jspf::kKey, b, sizeof b) && jspf::key_on(b) ? 1 : 0; } return v == 1; }
+// ENHANCEMENT (test13): JSP_ROLLBACK_PICK_MULTI=1 (jspm4::key_on) opens the menu on links of 3-4 players too; default 0 = 2 players only (test12's behaviour)
+bool pick_multi_on() { static int v = -1; if (v < 0) { char b[8] = {}; v = jsp_setting_get(jspm4::kKey, b, sizeof b) && jspm4::key_on(b) ? 1 : 0; } return v == 1; }
+// FIX (test11 field, room 77): JSP_PICK_QUIT_TELL (default 1): a window closed at the after-match menu tells the other PCs at once (jsp_net_quitting); 0 = as before
+bool pick_quit_tell_on() { static int v = -1; if (v < 0) { char b[8] = {}; v = jsp_setting_get("JSP_PICK_QUIT_TELL", b, sizeof b) && b[0] == '0' && !b[1] ? 0 : 1; } return v == 1; }
 std::atomic<int> g_pick_active{0};   // jsp_pick_active(): a pair is applied at the coming build (read on guest threads; written by pick_frame)
 // ENHANCEMENT (4-player online, JSP_ROLLBACK_MAX_PLAYERS = 2..4, default 2 = two players only): with 3-4 peers in the plan the input delay and the ping counter
 // follow the WORST link (this PC's inputs must reach every other PC in time; with 2 peers that is the one remote, as before): the rule reads the worst
@@ -1126,8 +1134,10 @@ void end_with(const std::string& text, bool quiet = false)
         // FIX (pick7): only when every PC has JSP_ROLLBACK_PICK=1 (the switch handshake, jsp_net_pick_flow.h 1b); else both PCs behave as off
         if (g.flow.is_open()) {
             if (g.flow.match_end((uint16_t)g.match_k, now_ms())) std::fprintf(stderr, "[net] postgame: prompt open (match %u, %d players)\n", g.match_k, g.flow.players());
-            else std::fprintf(stderr, "[net] postgame: off for match %u on both PCs: %s\n", g.match_k, g.flow.decline_why() == 2 ? "the other PC did not open its menu for this match"
+            else if (g.flow.players() == 2) std::fprintf(stderr, "[net] postgame: off for match %u on both PCs: %s\n", g.match_k, g.flow.decline_why() == 2 ? "the other PC did not open its menu for this match"
                               : "the other PC has not confirmed JSP_ROLLBACK_PICK=1 (every PC needs it)");
+            else std::fprintf(stderr, "[net] postgame: off for match %u on every PC: %s\n", g.match_k, g.flow.decline_why() == 2 ? "another PC did not open its menu for this match"   // ENHANCEMENT (test13): 3-4 players
+                              : "another PC has not confirmed JSP_ROLLBACK_PICK=1 and JSP_ROLLBACK_PICK_MULTI=1 (every PC needs both)");
         }
     }
     if (quiet) set_text(""); else show(text);   // quiet: the rendezvous texts are on the main menu's notice (jsp_net_notice); the message line stays empty so it does not clear that layer
@@ -1185,17 +1195,20 @@ uint64_t random_session_id()
     return r ? r : 1;
 }
 
+// ENHANCEMENT (test13): one menu message to every peer of the menu (jspm4::menu_seats: 2 players = the one remote, host ? 1 : 0, as before). Pump mutex held.
+void menu_send(const uint8_t* b, size_t n) { for (int i = 0; i < g.menu_nto; i++) g.link->send(g.menu_to[i], b, n); }
+
 // ---- the pump thread: rendezvous, handshake objects, handshake driving (everything under the pump mutex) ----------------------------------------------------------
 void pump_tick(uint64_t t)
 {
-    // ENHANCEMENT (post-game / pick): before the ended-match return below (the prompt runs after the match); the one remote: peer 1 from the host, peer 0 from the client
-    // (2 players; the 4-player mesh is not in this build)
+    // ENHANCEMENT (post-game / pick): before the ended-match return below (the prompt runs after the match); 2 players: the one remote, peer 1 from the host,
+    // peer 0 from the client. ENHANCEMENT (test13, JSP_ROLLBACK_PICK_MULTI=1): 3-4 players: every remote peer of the plan (menu_send)
     if (g.phase.load() != Phase::Off && g.link && g.flow.is_open()) {
         if (g.phase.load() == Phase::Running) g.flow.fight_running();
         // FIX (pick7, the freeze owner while the menu is up): every new flip proves the game runs; with the menu up and none for 60 s this
         // thread leaves the menu for this PC (jsp_net_pick_flow.h 3), as it ends a running match on the frame clock's failure below
         { static uint32_t last_flip = 0; const uint32_t f = cellGcm_flip_request_count(); if (f != last_flip) { last_flip = f; g.flow.game_alive(t); } }
-        g.flow.pump(t, [](const uint8_t* b, size_t n) { g.link->send(g.host ? 1 : 0, b, n); });
+        g.flow.pump(t, menu_send);
         if (g.flow.take_froze())
             std::fprintf(stderr, "[net] postgame: the game made no flip for %llu s with the after-match menu up: the pump thread leaves it for this PC (the other PC is told now)\n",
                          (unsigned long long)(jspf::kFreezeMs / 1000));
@@ -1270,22 +1283,28 @@ void pump_tick(uint64_t t)
             if (g.mc->join(g.plan.session_id, 0, t) != jpsm::Reason::None) { pump_fail("settings handshake: cannot join"); return; }
         }
         g.plan_ready = true;
-        if (g.pick_link) {   // ENHANCEMENT (post-game / pick): 2 players: player index = peer id (host 0, client 1), battle slot of each (its room record index)
-            const int me = g.host ? 0 : 1;
-            uint8_t slots[jspk::kMaxPlayers] = {};
-            const bool two = g.plan.total_players == 2 && g.plan.remotes.size() == 1;
-            if (two) { slots[me] = g.plan.local_first; slots[me ^ 1] = g.plan.remotes[0].first_slot; }
+        if (g.pick_link) {   // ENHANCEMENT (post-game / pick): player index = peer id (host 0), battle slot of each (its room record index)
+            // ENHANCEMENT (test13, JSP_ROLLBACK_PICK_MULTI=1): jspm4::menu_seats. 2 players: test12's mapping (me = host ? 0 : 1, the one remote at me ^ 1).
+            // 3-4 players: me = local_peer, slots[peer] = each peer's first slot (peer and slot differ: "slot 2 peer 1"), every remote peer gets each message.
             // FIX (pick7): the players' battle slots must be exactly the planned rollback seats, the ones every session start maps (jsp_native_fight_map)
-            const bool ok = two && jspo::seats_ok(slots, 2, (int)g.plan.total_players);
-            if (ok && g.flow.open(g.plan.session_id, me, 2, slots)) {
+            const jspm4::Seats ms = jspm4::menu_seats(g.plan, pick_multi_on());
+            if (ms.ok && g.flow.open(g.plan.session_id, ms.me, ms.n, ms.slots)) {
+                for (int i = 0; i < ms.nto; i++) g.menu_to[i] = ms.to[i];
+                g.menu_nto = ms.nto;
                 jspg::Config pc; pc.idle_ms = jspg::idle_ms_from(std::getenv(jspg::kIdleKey));
                 jspk::Config kc; kc.idle_ms = jspk::idle_ms_from(std::getenv(jspk::kIdleKey));
                 g.flow.set_config(pc, kc);
-                std::fprintf(stderr, "[net] postgame: on for this link (2 players, this PC player %d slot %u; prompt idle %u s, pick idle %u s)\n", me,
-                             (unsigned)g.plan.local_first, pc.idle_ms / 1000, kc.idle_ms / 1000);
-            } else if (g.plan.total_players > 2)   // FIX (test11, 4-player): said plainly; the menu, the pick round and the roster write are 2-player only for now
-                std::fprintf(stderr, "[net] postgame: off for this link (%u players: the after-match menu is for 2 players in this build; after each match the room "
-                             "is the game's own, and the next match starts from there)\n", (unsigned)g.plan.total_players);
+                if (ms.n == 2)
+                    std::fprintf(stderr, "[net] postgame: on for this link (2 players, this PC player %d slot %u; prompt idle %u s, pick idle %u s)\n", ms.me,
+                                 (unsigned)g.plan.local_first, pc.idle_ms / 1000, kc.idle_ms / 1000);
+                else
+                    std::fprintf(stderr, "[net] postgame: on for this link (%d players, JSP_ROLLBACK_PICK_MULTI=1; this PC player %d slot %u; battle slot of each player %u/%u/%u/%u; "
+                                 "prompt idle %u s, pick idle %u s)\n", ms.n, ms.me, (unsigned)g.plan.local_first, (unsigned)ms.slots[0], (unsigned)ms.slots[1],
+                                 (unsigned)ms.slots[2], ms.n > 3 ? (unsigned)ms.slots[3] : 9u, pc.idle_ms / 1000, kc.idle_ms / 1000);
+            } else if (g.plan.total_players > 2 && ms.why == jspm4::Why::MultiOff)   // FIX (test11, 4-player): said plainly
+                std::fprintf(stderr, "[net] postgame: off for this link (%u players: the after-match menu for 3-4 players needs JSP_ROLLBACK_PICK_MULTI=1 on every PC; after each "
+                             "match the room is the game's own, and the next match starts from there)\n", (unsigned)g.plan.total_players);
+            else if (g.plan.total_players > 2) std::fprintf(stderr, "[net] postgame: off for this link (%u players: %s)\n", (unsigned)g.plan.total_players, jspm4::why_text(ms.why));
             else std::fprintf(stderr, "[net] postgame: off for this link (the plan is not 2 players on the planned rollback seats 0 and 1)\n");
         }
         if (g.rrz && g.rrz->room_id()) g.presence_room = g.rrz->room_id();
@@ -2341,7 +2360,7 @@ bool conn_open(const Conn& c, std::string* why, jpno::Refusal* code)
         g.rp->start(c.relay);
     } else g.rz.reset(g.host ? new DirectRendezvous(g.mux, *g.hub, 1, random_session_id()) : new DirectRendezvous(g.mux, *g.hub, 1, g.join));
     g.link.reset(new M2LinkT<jpsm::Transport>(g.mux));
-    g.flow.close(); g.pick_link = c.pair && pick_on();   // ENHANCEMENT (post-game / pick): native-room links only (the prompt drives the game's own room)
+    g.flow.close(); g.menu_nto = 0; g.pick_link = c.pair && pick_on();   // ENHANCEMENT (post-game / pick): native-room links only (the prompt drives the game's own room)
     g.phase = Phase::Handshake;
     if (c.repsn) std::fprintf(stderr, "[net] re-psn: %s a room on %s:%u as %s (relay %s), local UDP port %u%s\n", g.host ? "creating" : "joining", rid.host.c_str(), (unsigned)rid.port, rid.name.c_str(), c.relay ? "allowed" : "not allowed", (unsigned)g.mux.local_port(),
                               c.pair ? (" (paired with the game's room " + std::to_string((unsigned long long)c.pair) + ", comm id " + rid.comm_id + ")").c_str() : "");
@@ -2351,7 +2370,8 @@ bool conn_open(const Conn& c, std::string* why, jpno::Refusal* code)
             if (g.flow.route(peer, d, n, ms)) {   // ENHANCEMENT (post-game / pick): a 'P' / 'C' message of that peer (before match_peek: it belongs to the match that ended)
                 if (!g.flow.is_open() && g.flow.off_hellos() == 1)   // FIX (pick7): the other PC asks for the menu, this one runs none (once per link)
                     std::fprintf(stderr, "[net] postgame: the other PC has JSP_ROLLBACK_PICK=1, %s: the after-match menu stays off on both PCs for this link\n",
-                                 pick_on() ? "but this link runs no menu here (not a 2-player native-room link)" : "this PC has not");
+                                 pick_on() ? (pick_multi_on() ? "but this link runs no menu here (its plan does not fit the menu)" : "but this link runs no menu here (not a 2-player native-room link)")
+                                           : "this PC has not");
                 return;
             }
             if (g.plan_ready) {   // ENHANCEMENT (same-link rematch): which match of this link the datagram belongs to (jsp_net_match.h)
@@ -2393,7 +2413,7 @@ void conn_close()
     g.listen_port = 0; g.join = Endpoint{};
     g.match_k = 0; g.match_jump = 0; g.beacon_next = 0; g.fresh_gate = false;   // ENHANCEMENT (same-link rematch): the counter belongs to the link
     g_ad_carry = jpdr::Carry();   // ENHANCEMENT (rematch carry): so does the carried input delay
-    g.flow.close(); g.pick_link = false; g_pick_active = 0;   // ENHANCEMENT (post-game / pick): a new link never reuses a pair (the pump thread is stopped)
+    g.flow.close(); g.menu_nto = 0; g.pick_link = false; g_pick_active = 0;   // ENHANCEMENT (post-game / pick): a new link never reuses a pair (the pump thread is stopped)
     g.phase = Phase::Off;
     show(""); badge(""); ping_hide();
 }
@@ -2424,6 +2444,8 @@ struct Native {
     bool replan_count = false;    // FIX (review, optional item): that refusal was the player-count check (only a changed room count needs a new plan)
 } g_nat;
 constexpr uint64_t kReplanDebounceMs = 1500;   // FIX (a 4-copy run: a 3-player rendezvous failed visibly while the 4th joined): the count must hold this long before a re-plan
+// ENHANCEMENT (test13, the 3-4 player leave rule, jsp_net_menu4.h): set by pick_frame when another player left the menu's link; read by native_poll. Main thread.
+jspm4::LeaveWait g_nat_leave;
 void g_nat_replan_next(bool count) { if (!g_nat.replan_next) g_nat.replan_count = count; else if (!count) g_nat.replan_count = false; g_nat.replan_next = true; }
 // ENHANCEMENT (4-player online): TEST ONLY knob kept at 0 in play (JSP_NET_TEST_BOTS needs JSP_ROLLBACK_ALLOW_DEBUG=1): extra rollback peers that are not in
 // the native room. No bot ships with this change (four real copies are the test), so it stays 0 unless set by hand.
@@ -2559,6 +2581,16 @@ void native_poll()
     }
     if (g.phase.load() != Phase::Off || g.mux.is_open()) return;   // a link of the lobby API: not ours
     if (st != 2 || !want || !room || room == g_nat.given_up) { if (st != 2 || room != g_nat.seen_room) g_nat.seen_room = 0; return; }
+    // ENHANCEMENT (test13, 3-4 players): after a player left the menu's link, no new plan while the room still has the old count (the leaver is still in it)
+    {
+        const jspm4::Gate lg = jspm4::leave_gate(g_nat_leave, room, want, now);
+        if (lg == jspm4::Gate::Hold) return;
+        if (lg == jspm4::Gate::Release) {
+            g_nat.tries = 0; g_nat.seen_players = want; g_nat.seen_since = now;   // a new plan for the players who stay: its own 3 tries, after the usual settle
+            log("native room", "the player who left is out of the room (or the wait is over): planning the link for " + std::to_string(want) + " players");
+            return;
+        }
+    }
     if (room != g_nat.seen_room) { g_nat.seen_room = room; g_nat.seen_since = now; g_nat.seen_players = want; g_nat.tries = 0; g_nat.retry_at = 0; return; }
     if (want != g_nat.seen_players) { g_nat.seen_players = want; g_nat.seen_since = now; return; }   // ENHANCEMENT (4-player online): a join or a leave restarts the wait
     // two members for half a second (a join in progress settles). ENHANCEMENT (4-player online): 3-4 wait until the room is full (the setting's count or the room's
@@ -2721,6 +2753,7 @@ void pick_frame()
     bool page_give_up = false;
     jspf::Act act = jspf::Act::None;
     bool open = false, host = false, picking = false, start_ok = false, rematch = false, capture = false, block = false; int nplayers = 2;
+    jspg::Reason pg_reason = jspg::R_NONE;   // ENHANCEMENT (test13): why the prompt decided Leave (the 3-4 player leave rule, jspm4::leave_wait_applies)
     std::string outcome_text, round_status; jspg::View v; int lock_secs = -1;
     std::vector<std::string> who;   // one line per player's pick (Select character), for everyone to see
     jpskin::View pn;
@@ -2746,6 +2779,7 @@ void pick_frame()
                 }
             }
             outcome_text = f.postgame().outcome_text();
+            pg_reason = f.postgame().reason(); nplayers = f.players();
             // the prompt's input
             if (u.drive == PkDrive::Prompt && pg_open) {
                 const jspg::View pv = f.postgame().view(u.sel, nm);
@@ -2891,11 +2925,22 @@ void pick_frame()
     if (act == jspf::Act::LeaveGiveUp || act == jspf::Act::LeaveClose || act == jspf::Act::Lost || act == jspf::Act::Froze || act == jspf::Act::PeerFroze) {
         const bool self = act == jspf::Act::LeaveGiveUp;   // FIX (pick7): a freeze (here or there) closes the link without giving the room up
         u.notice = act == jspf::Act::Froze ? "This game stopped for a minute: the rollback link was closed"
-                 : act == jspf::Act::PeerFroze ? "The other player's game stopped responding: back to the room"
+                 : act == jspf::Act::PeerFroze ? (nplayers > 2 ? "A player's game stopped responding: back to the room" : "The other player's game stopped responding: back to the room")
                  : act == jspf::Act::Lost ? round_status : self ? "Match left: press Circle in the room to go back to the lobby" : outcome_text;
         u.notice_until = now + 6000;
         pk_drive(PkDrive::Off); g_pk_capture = 0; u.ps.stop();
-        if (g_nat.link) { const uint64_t room = g_nat.room; native_close(self ? "post-game: this player left" : "post-game: the round ended without this link"); if (self) g_nat.given_up = room; }
+        if (g_nat.link) {
+            const uint64_t room = g_nat.room;
+            native_close(self ? "post-game: this player left" : "post-game: the round ended without this link");
+            if (self) g_nat.given_up = room;
+            // ENHANCEMENT (test13, 3-4 players): another player chose to go (or its game froze / its window closed): the room goes on for the others, and the
+            // link is planned again for them once the leaver is out of the room (native_poll, jspm4::leave_gate; at most jspm4::kLeaveWaitMs)
+            else if (jspm4::leave_wait_applies(nplayers, act, pg_reason)) {
+                g_nat_leave = jspm4::leave_wait(room, nplayers, now);
+                std::fprintf(stderr, "[net] postgame: a player left the %d-player link: back to the room; the link is planned again for the players who stay once the room "
+                             "has fewer than %d players (at most %llu s)\n", nplayers, nplayers, (unsigned long long)(jspm4::kLeaveWaitMs / 1000));
+            }
+        }
         open = false;
     }
     if (page_give_up) {   // ENHANCEMENT (JSP_PICK_NATIVE_SELECT=1): still on the page at the round's deadline: this PC leaves the round, the room stays
@@ -2906,7 +2951,7 @@ void pick_frame()
         open = false;
     }
     if (act == jspf::Act::PeerOff) {   // FIX (pick7): the other PC opened no prompt for this match: the game goes on as with the switch off
-        u.notice = "The other player's after-match menu is off: continue in the game"; u.notice_until = now + 6000;
+        u.notice = nplayers > 2 ? "Another player's after-match menu is off: continue in the game" : "The other player's after-match menu is off: continue in the game"; u.notice_until = now + 6000;
         pk_drive(PkDrive::Off); g_pk_capture = 0; capture = false;
     }
     if (!open && u.drive != PkDrive::Off) pk_drive(PkDrive::Off);
@@ -3172,6 +3217,29 @@ extern "C" int jsp_pick_pressing(void)
 {
     if (g.phase.load() == Phase::Running) return 0;   // pick_pad is inert while a match runs
     return jspd::live_press(g_pk_capture.load() != 0, g_pk_block.load() != 0, (uint16_t)g_pk_press.load(), GetTickCount64() < g_pk_press_until.load());
+}
+// FIX (test11 field, room 77: the host closed its window at the after-match menu; the joiner heard nothing for 8 s, then "left or the connection was
+// lost"). Re-done in test13 from the parked lane D:\jsp-t12-quit with the fixes of its review (D:\jsp-audit\test12\REVIEW-QUIT.md 1a / 1b / 2) and the
+// 3-4 player send. main.cpp calls this when the window closes, before ps3_host_quit. With the after-match menu up (prompt or pick round), this PC's
+// Leave and a "gone" hello go out at once, here, under the pump mutex, to every peer of the menu (menu_send, as pump_tick sends them), and Flow::quitting
+// makes this PC's poll inert, so the game thread cannot close the link first. The pump thread (tick 100 ms) then resends them (the hello every 1 s, the
+// prompt's message every 250 ms) while ps3_host_quit's grace (PS3_QUIT_GRACE_MS, 3 s) keeps the process alive; the short sleep below is only a margin
+// for the first datagrams to leave the socket. A fight in progress is left to the session's own disconnect. JSP_PICK_QUIT_TELL=0: as before (nothing).
+extern "C" void jsp_net_quitting(void)
+{
+    if (!g_installed || g.bench || !pick_on() || !pick_quit_tell_on()) return;
+    bool told = false; int n = 2;
+    {
+        std::lock_guard<std::mutex> lk(g.pump.mutex());
+        if (g.link && g.flow.is_open()) {
+            const uint64_t t = now_ms();
+            told = g.flow.quitting(t); n = g.flow.players();
+            if (told) g.flow.pump(t, menu_send);   // REVIEW-QUIT 1a: at once, not on the pump thread's next tick
+        }
+    }
+    if (!told) return;
+    std::fprintf(stderr, "[net] postgame: the window is closing: the other player%s told this PC left\n", n > 2 ? "s are" : " is");
+    Sleep(120);
 }
 // AUTO_ONLINE steps (test tooling): the prompt's choice (1 Fight again, 2 Select character, 3 Leave) and the pick (ids, 1 = together, 1 = lock). 1 = taken.
 extern "C" int jsp_pick_choose(int choice)

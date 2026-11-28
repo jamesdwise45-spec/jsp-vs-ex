@@ -32,7 +32,12 @@ before "$ew_body" "jsp_native_fight_arm(0);" "g.flow.match_end(" "end_with"
 ss_body=$(body "void start_session(")
 need "$ss_body" "jsp_native_fight_map((int)g.plan.local_first, jspo::plan_seats((int)g.plan.total_players)" "start_session (the planned seats)"
 pt_body=$(body "void pump_tick(")
-need "$pt_body" "jspo::seats_ok(slots, 2, (int)g.plan.total_players)" "pump_tick (the menu's link on the planned seats)"
+# ENHANCEMENT (test13): the seat check moved into jspm4::menu_seats (jsp_net_menu4.h, host-tested by net_pick_flow_test): 2 players and 3-4 players
+need "$pt_body" "jspm4::menu_seats(g.plan, pick_multi_on())" "pump_tick (the menu's players and slots from the plan)"
+need "$pt_body" "if (ms.ok && g.flow.open(g.plan.session_id, ms.me, ms.n, ms.slots))" "pump_tick (the menu opens only on the planned seats)"
+m4=$(tr -d '\r' < "$d/../port/jsp/jsp_net_menu4.h")
+need "$m4" "s.ok = jspo::seats_ok(s.slots, 2, (int)plan.total_players);" "menu_seats (2 players on the planned seats)"
+need "$m4" "s.ok = jspo::seats_ok(s.slots, n, n);" "menu_seats (3-4 players on the planned seats)"
 need "$pt_body" "g.flow.game_alive(t)" "pump_tick (the freeze owner while the menu is up)"
 if [ $fail -ne 0 ]; then echo "net pick match: source guard FAILED"; exit 1; fi
 echo "net pick match: source guard ok (reset_match, end_with order, planned seats, freeze owner)"
