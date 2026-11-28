@@ -30,6 +30,7 @@
 #ifndef JSP_ROLLBACK_BUILD
 extern "C" int jsp_net_lobby_open(const JspLobbyCfg*) { return 0; }
 extern "C" void jsp_net_lobby_close(void) {}
+extern "C" void jsp_net_quitting(void) {}
 extern "C" const char* jsp_net_lobby_reason(void) { return "this build has no rollback netcode"; }
 extern "C" int jsp_net_lobby_phase(void) { return 0; }
 extern "C" int jsp_net_match_begin(void) { return 0; }
@@ -92,6 +93,7 @@ static bool clock_diag() { static const bool v = [] { const char* e = std::geten
 #include "jsp_net_pick_flow.h"      // ENHANCEMENT (post-game / pick, JSP_ROLLBACK_PICK=1): the prompt, the pick round, the pair for the builder (pure, host-tested)
 #include "jsp_net_pick_drive.h"     // ENHANCEMENT (post-game / pick): the pad gate, the notice-box Cross, the joiner's Ready Cross (pure, host-tested)
 #include "jsp_net_pick_own.h"       // FIX (pick7): the planned seats, the predicted fighter map, the match-end rule (pure, host-tested)
+#include "jsp_net_menu4.h"          // ENHANCEMENT (test13, JSP_ROLLBACK_PICK_MULTI=1): the menu's players, slots and send peers for 3-4 players; the leave rule (pure, host-tested)
 #include "jsp_net_pick_page.h"      // ENHANCEMENT (JSP_PICK_NATIVE_SELECT=1): Select character on the game's own page for every player (pure, host-tested)
 #include "jsp_pick_skin.h"         // ENHANCEMENT (after-match menu art): the game's own menu art from the player's archives, and the layouts (pure, host-tested)
 static_assert(jspf::kTagPostgame == jspnet::kLinkTagPostgame && jspf::kTagPick == jspnet::kLinkTagPick, "one set of link tags");
@@ -101,6 +103,7 @@ static_assert(jspf::kTagPostgame == jspnet::kLinkTagPostgame && jspf::kTagPick =
 #include "jsp_mods_glue.h"   // rollback_gate, kModsNotAsListed (ENHANCEMENT, mods)
 #include "jsp_version_line.h"   // parse_version_txt (ENHANCEMENT, version mismatch message)
 #include "jsp_thread_bit.h"   // jtb::thread_bit: guest thread id 1..64 -> mask bit t - 1 (helper-thread register save / restore)
+#include "jsp_rb_guard.h"     // FIX (test13): NULL-call loop count, desync-first order, register write-back skips, loader boundary wait (pure, host-tested)
 
 extern "C" {
 int jsp_online_repsn_identity(char* server, int sn, char* name, int nn, char* comm, int cn, int* report_rtt);   // jsp_online.cpp: repsn.ini even with enabled=0
@@ -112,6 +115,8 @@ uint64_t jsp_snapshot_ext_pool_evicted(void);
 void jsp_snapshot_ext_set_budget_ms(unsigned ms);   // the commit gate's wall-time budget
 void jsp_snapshot_ext_budget_reset(void);           // after every session update: one budget from the last update across all gates
 void jsp_snapshot_ext_set_idle_hook(void (*fn)());
+void jsp_snapshot_ext_set_stop_hook(int (*fn)());   // FIX (test13): the gate gives up at once while this returns nonzero (a guest NULL-call loop)
+int jsp_snapshot_ext_parts(uint32_t k, uint64_t* out8);   // DIAGNOSTIC (test13): the 8 hash parts of tick k, for the match report
 void jsp_snapshot_ext_guard_summary(void);
 void jsp_snapshot_ext_session_end(void);           // FIX (same-link rematch): the next session starts with a full baseline at its tick 1
 int jsp_snapshot_ext_rsx_write_hazard(void);      // write guard: the previous capture had RSX commands pending and an RSX-side write into saved memory landed after it
@@ -178,6 +183,10 @@ RendezvousNotice g_rdv;
 // ENHANCEMENT (lobby): the start decision's lobby outcome (JSP_ROLLBACK=1 with no role key): jsp_net_game_install installs the hooks and opens no session; the
 // in-game lobby opens one later (jsp_net_lobby_open). Constant-initialized, like g_refusal (decide_env may run from another translation unit's constructor).
 std::atomic<bool> g_boot_lobby{false};
+// FIX (log wording, test13 field): the host closes the link because the other player left the native room (native_close); its handshake
+// Cancel still carries HostCancelled to any client left, but the host's own log line says why instead of "the host cancelled the match".
+// Set by native_poll before native_close, cleared when a link opens (conn_open). Log text only.
+std::atomic<bool> g_close_peer_left{false};
 void decide_env()
 {
     std::string why; jpno::Refusal code = jpno::Refusal::None; bool lobby = false;
@@ -339,6 +348,8 @@ struct State {
     // ENHANCEMENT (after-match menu art): pk is the menu in the game's own look (jsp_pick_skin.h); pk_open_ms starts its fade-in, pk_pic / pk_band_pic
     // cache the painted pictures by their content key (a paint costs ~10 ms; a redraw of the same content only blits).
     jspf::Flow flow; bool pick_link = false;
+    // ENHANCEMENT (test13, 3-4 players): the peer ids every menu message goes to (jspm4::menu_seats; 2 players: the one remote, host ? 1 : 0)
+    uint8_t menu_to[jspk::kMaxPlayers - 1] = {}; int menu_nto = 0;
     jpskin::View pk;
     std::string pk_key;
     uint64_t pk_open_ms = 0;
@@ -547,6 +558,10 @@ std::string path_word() { const int k = g.path_kind.load(); return k == 1 ? "dir
 // FIX (delay flapping, two-copy run native-rb1: 2 -> 3 -> 2 every 6-10 s on a steady 30 ms link): lowering needs five calm readings (10 s) in both rules.
 // ENHANCEMENT (post-game / pick): JSP_ROLLBACK_PICK=1 (jspf::key_on), read once; default 0 = no prompt, no pick, no roster write (today's behaviour).
 bool pick_on() { static int v = -1; if (v < 0) { char b[8] = {}; v = jsp_setting_get(jspf::kKey, b, sizeof b) && jspf::key_on(b) ? 1 : 0; } return v == 1; }
+// ENHANCEMENT (test13): JSP_ROLLBACK_PICK_MULTI=1 (jspm4::key_on) opens the menu on links of 3-4 players too; default 0 = 2 players only (test12's behaviour)
+bool pick_multi_on() { static int v = -1; if (v < 0) { char b[8] = {}; v = jsp_setting_get(jspm4::kKey, b, sizeof b) && jspm4::key_on(b) ? 1 : 0; } return v == 1; }
+// FIX (test11 field, room 77): JSP_PICK_QUIT_TELL (default 1): a window closed at the after-match menu tells the other PCs at once (jsp_net_quitting); 0 = as before
+bool pick_quit_tell_on() { static int v = -1; if (v < 0) { char b[8] = {}; v = jsp_setting_get("JSP_PICK_QUIT_TELL", b, sizeof b) && b[0] == '0' && !b[1] ? 0 : 1; } return v == 1; }
 std::atomic<int> g_pick_active{0};   // jsp_pick_active(): a pair is applied at the coming build (read on guest threads; written by pick_frame)
 // ENHANCEMENT (4-player online, JSP_ROLLBACK_MAX_PLAYERS = 2..4, default 2 = two players only): with 3-4 peers in the plan the input delay and the ping counter
 // follow the WORST link (this PC's inputs must reach every other PC in time; with 2 peers that is the one remote, as before): the rule reads the worst
@@ -939,22 +954,136 @@ void regs_save(uint32_t tick)
     }
     g_regs_saved++;
 }
-void regs_restore(uint32_t tick)
+// DIAGNOSTIC (test13, room 38: three PCs each skipped one write-back at the rollback that preceded the desync, and the log could not say which thread): every skip
+// is logged (the first kRegsSkipLines of a match, then a count) with the tick, the depth, the thread and its marker kind and caller lr at the save and now.
+constexpr uint32_t kRegsSkipLines = 16;
+uint32_t g_regs_skip_lines = 0;
+void regs_skip_line(uint32_t tick, uint32_t t, jrg::RegSkip why, uint32_t kind_was, uint32_t lr_was, uint32_t kind_now, uint32_t lr_now)
 {
-    if (!g_regs || g.bench) return;
+    if (g_regs_skip_lines++ >= kRegsSkipLines) { if (g_regs_skip_lines == kRegsSkipLines + 1) std::fprintf(stderr, "[net] helper thread registers: further skips in this match not shown (count in the end line)\n"); return; }
+    char nm[64] = "-"; uint64_t o[5] = {};
+    if (t && !ps3_ppu_thread_view(t, o, nm)) std::snprintf(nm, sizeof nm, "(gone)");
+    std::fprintf(stderr, "[net] helper thread registers NOT written back: rollback to tick %u (session tick %u, %u deep), tid %u \"%s\": %s; at the save kind %u lr 0x%08X, now kind %u lr 0x%08X\n",
+                 tick, tick - g.base, g.done_now - tick, t, nm, jrg::regs_skip_name(why), kind_was, lr_was, kind_now, lr_now);
+}
+uint32_t regs_restore(uint32_t tick)   // returns the write-backs skipped by this rollback (FIX test13: JSP_NET_REGS_SKIP_FAIL acts on it)
+{
+    if (!g_regs || g.bench) return 0;
     TickRegs& R = g_regs[tick % kRegRing];
-    if (R.tick != tick) { g_regs_skipped++; return; }
+    if (R.tick != tick) { g_regs_skipped++; regs_skip_line(tick, 0, jrg::RegSkip::NoSave, 0, 0, 0, 0); return 1; }
     static uint32_t kind[65], id[65], obj[65], lr[65]; static uint8_t alive[65], unrel[65]; uint32_t ov = 0, ub = 0;
     ps3_hle_thread_census(kind, id, obj, lr, alive, unrel, &ov, &ub);
+    uint32_t skipped = 0;
     for (uint32_t t = 1; t < 65; t++) {
         if (!jtb::has_thread(R.mask, t)) continue;
         const ThrRegs& r = R.t[t];
-        if (!alive[t] || kind[t] != r.kind || lr[t] != r.lr) { g_regs_skipped++; continue; }   // not parked in the same wait: leave it
+        const jrg::RegSkip why = jrg::regs_skip_kind(true, alive[t] != 0, r.kind, r.lr, kind[t], lr[t]);
+        if (why != jrg::RegSkip::None) { g_regs_skipped++; skipped++; regs_skip_line(tick, t, why, r.kind, r.lr, kind[t], lr[t]); continue; }   // not parked in the same wait: leave it
         ppu_context* c = ps3_ppu_thread_ctx(t); if (!c) continue;
         std::memcpy(c->gpr, r.gpr, sizeof r.gpr); std::memcpy(c->fpr, r.fpr, sizeof r.fpr); std::memcpy(c->vr, r.vr, sizeof r.vr);
         c->cr = r.cr; c->xer = r.xer; c->fpscr = r.fpscr; c->vscr = r.vscr; c->lr = r.lrr; c->ctr = r.ctr;
         g_regs_restored++;
     }
+    return skipped;
+}
+// FIX (test13, JSP_NET_REGS_SKIP_FAIL=1, off by default): a skipped write-back ends the fight (as a refused restore) instead of going on with a helper thread that
+// keeps registers of the undone timeline. Off by default: it is found AFTER the memory went back (it cannot be refused before), its cause (a race with a thread
+// woken after the gate, or a real move) is not known yet, and in 7 field match ends it happened only in room 38 (once on 3 PCs). The log lines above come first.
+bool regs_skip_fail_on() { static const bool v = [] { char b[8] = {}; return jsp_setting_get("JSP_NET_REGS_SKIP_FAIL", b, sizeof b) && b[0] == '1'; }(); return v; }
+
+// FIX (test13, room 34; JSP_NET_NULLCALL_GUARD=0 turns it off): after a rollback a job worker looped on NULL indirect calls (the toolkit's guard returns from each
+// with r3 untouched, so the loop never ends), the commit gate then waited its whole 15 s budget for a worker that never parks, and the session ended for all 4 PCs.
+// An indirect-call hook (patch 0500, chained in front of the hooks already set) counts NULL calls per thread between two tick boundaries; at kNullCallsPerTick
+// it raises a flag. The commit / restore gate gives up on it at once (jsp_snapshot_ext_set_stop_hook) and the boundary ends the match with one log line.
+extern "C" int (*g_ppu_icall_hook)(uint32_t target, uint64_t* gpr);   // patch 0500
+std::atomic<int (*)(uint32_t, uint64_t*)> g_nc_prev{nullptr}; bool g_nc_installed = false;
+std::atomic<bool> g_nc_armed{false}; std::atomic<uint32_t> g_nc_epoch{0}; std::atomic<int> g_nc_storm{0}; bool g_nc_said = false;
+std::atomic<DWORD> g_nc_host_tid{0}; std::atomic<uint32_t> g_nc_r3{0};
+const char* const kNullCallEnd = "a game thread is stuck calling a NULL function (game state error after a rollback)";
+int nc_icall(uint32_t target, uint64_t* gpr)
+{
+    if (target == 0 && g_nc_armed.load(std::memory_order_relaxed)) {
+        static thread_local jrg::NcThread me;
+        const uint32_t ep = g_nc_epoch.load(std::memory_order_relaxed);
+        if (jrg::nc_count(me, ep) && !g_nc_storm.load(std::memory_order_relaxed)) {
+            g_nc_host_tid.store(GetCurrentThreadId()); g_nc_r3.store((uint32_t)gpr[3]);
+            g_nc_storm.store(1);
+        }
+    }
+    int (*const prev)(uint32_t, uint64_t*) = g_nc_prev.load(std::memory_order_acquire);
+    return prev ? prev(target, gpr) : 0;
+}
+bool nullcall_guard_on() { static const bool v = [] { char b[8] = {}; return !(jsp_setting_get("JSP_NET_NULLCALL_GUARD", b, sizeof b) && b[0] == '0'); }(); return v; }
+void nullcall_start()
+{
+    g_nc_storm.store(0); g_nc_said = false;
+    if (!nullcall_guard_on() || g.bench) return;
+    // stays installed (a hook set after it may chain to it). FIX (test13 review): installed again when something cleared the hook (the test-only
+    // ICALL_OFF_IN_FIGHT); the chained hook is published before the hook itself (release), so a guest thread never sees ours with a stale chain
+    int (*const cur)(uint32_t, uint64_t*) = __atomic_load_n(&g_ppu_icall_hook, __ATOMIC_ACQUIRE);
+    if (!g_nc_installed || cur == nullptr) {
+        g_nc_prev.store(cur == nc_icall ? nullptr : cur, std::memory_order_relaxed);
+        __atomic_store_n(&g_ppu_icall_hook, &nc_icall, __ATOMIC_RELEASE);
+        g_nc_installed = true;
+    }
+    g_nc_armed.store(true);
+    jsp_snapshot_ext_set_stop_hook([] { return g_nc_storm.load(); });
+}
+void nullcall_end() { g_nc_armed.store(false); jsp_snapshot_ext_set_stop_hook(nullptr); }
+// At every boundary of a running match: a new epoch; true when a thread hit the limit (the line is printed once per match).
+bool nullcall_tick()
+{
+    g_nc_epoch.fetch_add(1, std::memory_order_relaxed);
+    if (!g_nc_storm.load()) return false;
+    if (!g_nc_said) {
+        g_nc_said = true;
+        const DWORD ht = g_nc_host_tid.load(); uint32_t gt = 0; char nm[64] = "(not a guest thread)";
+        for (uint32_t t = 1; t < 65; t++) { uint64_t o[5] = {}; char n2[64] = {}; if (ps3_ppu_thread_view(t, o, n2) && (DWORD)o[0] == ht) { gt = t; std::snprintf(nm, sizeof nm, "%s", n2); break; } }
+        std::fprintf(stderr, "[net] NULL-call loop: guest tid %u \"%s\" (host tid %lu) made %u NULL indirect calls within one tick (r3=0x%08X, at tick %u): the game state is broken, the match ends now (JSP_NET_NULLCALL_GUARD=0 turns this off)\n",
+                     gt, nm, (unsigned long)ht, jrg::kNullCallsPerTick, g_nc_r3.load(), g.done_now);
+    }
+    return true;
+}
+
+// STRUCTURAL (test13, JSP_NET_LOADER_WAIT=1, OFF by default): the file loader thread (guest "sp_file_server_load_thread", tid 18 in the field logs) is in no
+// boundary barrier: a rollback in room 34 found it inside a job that the restored memory had not yet given it. With the switch, the boundary waits (at most
+// jrg::kLoaderWaitMs) before the session iteration until the loader sits in its idle wait (lr 0x0052E658) on two samples in a row, so the saves and restores of
+// that iteration see it idle; after jrg::kLoaderMissesOff timeouts in a row the wait is off for the match. Off by default: the idle site was confirmed in 2 matches
+// only, a loader that the main thread must feed would cost every boundary its timeout, and the waits add hitches during loads (KO cut-ins, the fight end).
+uint32_t g_ld_tid = 0; jrg::LoaderGate g_ld; double g_ld_wait_ms = 0, g_ld_wait_max = 0;
+bool loader_wait_on() { static const bool v = [] { char b[8] = {}; return jsp_setting_get("JSP_NET_LOADER_WAIT", b, sizeof b) && b[0] == '1'; }(); return v; }
+void loader_start()
+{
+    g_ld_tid = 0; g_ld = jrg::LoaderGate(); g_ld_wait_ms = g_ld_wait_max = 0;
+    if (!loader_wait_on() || g.bench) return;
+    for (uint32_t t = 1; t < 65; t++) { uint64_t o[5] = {}; char nm[64] = {}; if (ps3_ppu_thread_view(t, o, nm) && !std::strcmp(nm, "sp_file_server_load_thread")) { g_ld_tid = t; break; } }
+    std::fprintf(stderr, "[net] loader boundary wait (JSP_NET_LOADER_WAIT=1): %s\n", g_ld_tid ? ("guest tid " + std::to_string(g_ld_tid)).c_str() : "the loader thread was not found, no wait");
+}
+bool loader_idle_once()
+{
+    static uint32_t kind[65], id[65], obj[65], lr[65]; static uint8_t alive[65], unrel[65]; uint32_t ov = 0, ub = 0;
+    ps3_hle_thread_census(kind, id, obj, lr, alive, unrel, &ov, &ub);
+    return jrg::loader_idle(alive[g_ld_tid] != 0, kind[g_ld_tid], lr[g_ld_tid]);
+}
+void loader_wait()
+{
+    if (!g_ld_tid || g_ld.off) return;
+    const int64_t t0 = qpc_now(); bool idle = false;
+    for (int spins = 0;; spins++) {
+        if (loader_idle_once()) { YieldProcessor(); if (loader_idle_once()) { idle = true; break; } }
+        if (qpc_ms(t0, qpc_now()) > jrg::kLoaderWaitMs) break;
+        if (spins > 20) { Sleep(0); if ((spins & 63) == 0) g.sess.poll(); }
+    }
+    const double ms = qpc_ms(t0, qpc_now()); g_ld_wait_ms += ms; if (ms > g_ld_wait_max) g_ld_wait_max = ms;
+    if (!idle && g_ld.timeouts < 5) std::fprintf(stderr, "[net] loader still busy after %.0f ms at tick %u\n", jrg::kLoaderWaitMs, g.done_now);
+    if (g_ld.result(idle)) std::fprintf(stderr, "[net] loader boundary wait off for this match: %d timeouts in a row\n", jrg::kLoaderMissesOff);
+}
+void loader_end()
+{
+    if (!g_ld_tid) return;
+    std::fprintf(stderr, "[net] loader boundary waits: %llu, mean %.3f ms, max %.1f ms, %llu timeouts%s\n", (unsigned long long)g_ld.waits, g_ld.waits ? g_ld_wait_ms / (double)g_ld.waits : 0.0,
+                 g_ld_wait_max, (unsigned long long)g_ld.timeouts, g_ld.off ? " (turned off)" : "");
+    g_ld_tid = 0;
 }
 // DIAGNOSTIC (JSP_NET_PAGE_DUMP=N, test runs only): every N session ticks of a CONFIRMED tick (a save of a final frame, hash_only), a fingerprint of every committed
 // 4 KB guest page below 0x40000000 is appended to pagedump-<host|join>.bin in the run folder: u32 tick, u32 count, then count x (u32 page index, u64 hash).
@@ -994,9 +1123,22 @@ void report_start()
     char b[16]; std::snprintf(b, sizeof b, "%08x", build_id()); g_rep.set_build(b);
     for (const jpno::KV& e : jpno::kDefaults) { char v[128] = {}; if (jsp_setting_get(e.k, v, sizeof v)) g_rep.add_setting(e.k, v); }
     { char v[16] = {}; g_rep.add_setting("JSP_SHAREPAD_WATCHDOG", jsp_setting_get("JSP_SHAREPAD_WATCHDOG", v, sizeof v) && v[0] ? v : "1 (default)"); }   // FIX (rematch black screen)
+    // FIX (test13): the rollback guards in effect (jsp_rb_guard.h)
+    for (const char* k : {"JSP_NET_NULLCALL_GUARD", "JSP_NET_REGS_SKIP_FAIL", "JSP_NET_LOADER_WAIT"}) {
+        char v[16] = {}; const bool set = jsp_setting_get(k, v, sizeof v) && v[0];
+        g_rep.add_setting(k, set ? v : !std::strcmp(k, "JSP_NET_NULLCALL_GUARD") ? "1 (default)" : "0 (default)");
+    }
     jsnr::SessionFacts f; f.local_slot = (int)g.plan.local_first; f.players = (int)g.plan.total_players; f.input_delay = g.bv.delay; f.base_tick = g.base;
     f.link = path_word(); g_rep.set_session(f);
     g_rep.add_machine_redactions();
+}
+// DIAGNOSTIC (test13, room 38: the desync tick could not name its part): every committed tick goes to the report with the 8 hash parts of that tick
+// (all rng glob seed setup cam fi pad, jsp_fight_hash.cpp), when the snapshot still holds them.
+std::string jsx_hex8(uint32_t v) { char b[12]; std::snprintf(b, sizeof b, "%08x", v); return b; }
+void report_commit(uint32_t tick, uint32_t hash, uint32_t raw)
+{
+    uint64_t parts[8];
+    g_rep.commit(tick - g.base, hash, raw, jsp_snapshot_ext_parts(tick, parts) ? parts : nullptr);
 }
 void report_write(const std::string& why)
 {
@@ -1072,7 +1214,7 @@ void reset_match()
     g_hz = jph::Match(); g_hz_exit = 0; g_hz_after_rerun = false;   // DIAGNOSTIC (per-hitch line): per match
     g_audio_waits = g_audio_timeouts = 0; g_audio_wait_ms = 0;
     g_hold_ms = 0; g_holds = g_hold_renders = 0;
-    g_regs_saved = g_regs_restored = g_regs_skipped = 0;
+    g_regs_saved = g_regs_restored = g_regs_skipped = 0; g_regs_skip_lines = 0;
     if (g_regs) for (int i = 0; i < kRegRing; i++) { g_regs[i].tick = 0xFFFFFFFFu; g_regs[i].mask = 0; }   // tick numbers repeat in the next fight
     g_ko_track = 0;   // the offline game as before (set again by start_session)
     // ENHANCEMENT (native fight takeover): the game's own online fight code runs as before (arm(0) is a no-op when not armed). DECISION (changed by the native
@@ -1095,6 +1237,8 @@ void end_with(const std::string& text, bool quiet = false)
     jsp_stepper_lockstep(0);
     cri_lock_end();
     guest_clock_end();
+    nullcall_end();   // FIX (test13)
+    loader_end();     // STRUCTURAL (test13): its end line (only when it ran)
     save_replay();   // before the stepper is torn down; the session object still holds the recording after a failure
     if (g.glue) std::fprintf(stderr, "[net] saves %llu, of which without a snapshot (final frame) %llu\n", (unsigned long long)g.glue->commits(), (unsigned long long)g.glue->skipped());
     // DIAGNOSTIC (test12, rollback cost): the re-run saves of rollbacks apart (the ones a replay pays), and the snapshots of exactly the final frame
@@ -1126,8 +1270,10 @@ void end_with(const std::string& text, bool quiet = false)
         // FIX (pick7): only when every PC has JSP_ROLLBACK_PICK=1 (the switch handshake, jsp_net_pick_flow.h 1b); else both PCs behave as off
         if (g.flow.is_open()) {
             if (g.flow.match_end((uint16_t)g.match_k, now_ms())) std::fprintf(stderr, "[net] postgame: prompt open (match %u, %d players)\n", g.match_k, g.flow.players());
-            else std::fprintf(stderr, "[net] postgame: off for match %u on both PCs: %s\n", g.match_k, g.flow.decline_why() == 2 ? "the other PC did not open its menu for this match"
+            else if (g.flow.players() == 2) std::fprintf(stderr, "[net] postgame: off for match %u on both PCs: %s\n", g.match_k, g.flow.decline_why() == 2 ? "the other PC did not open its menu for this match"
                               : "the other PC has not confirmed JSP_ROLLBACK_PICK=1 (every PC needs it)");
+            else std::fprintf(stderr, "[net] postgame: off for match %u on every PC: %s\n", g.match_k, g.flow.decline_why() == 2 ? "another PC did not open its menu for this match"   // ENHANCEMENT (test13): 3-4 players
+                              : "another PC has not confirmed JSP_ROLLBACK_PICK=1 and JSP_ROLLBACK_PICK_MULTI=1 (every PC needs both)");
         }
     }
     if (quiet) set_text(""); else show(text);   // quiet: the rendezvous texts are on the main menu's notice (jsp_net_notice); the message line stays empty so it does not clear that layer
@@ -1185,17 +1331,20 @@ uint64_t random_session_id()
     return r ? r : 1;
 }
 
+// ENHANCEMENT (test13): one menu message to every peer of the menu (jspm4::menu_seats: 2 players = the one remote, host ? 1 : 0, as before). Pump mutex held.
+void menu_send(const uint8_t* b, size_t n) { for (int i = 0; i < g.menu_nto; i++) g.link->send(g.menu_to[i], b, n); }
+
 // ---- the pump thread: rendezvous, handshake objects, handshake driving (everything under the pump mutex) ----------------------------------------------------------
 void pump_tick(uint64_t t)
 {
-    // ENHANCEMENT (post-game / pick): before the ended-match return below (the prompt runs after the match); the one remote: peer 1 from the host, peer 0 from the client
-    // (2 players; the 4-player mesh is not in this build)
+    // ENHANCEMENT (post-game / pick): before the ended-match return below (the prompt runs after the match); 2 players: the one remote, peer 1 from the host,
+    // peer 0 from the client. ENHANCEMENT (test13, JSP_ROLLBACK_PICK_MULTI=1): 3-4 players: every remote peer of the plan (menu_send)
     if (g.phase.load() != Phase::Off && g.link && g.flow.is_open()) {
         if (g.phase.load() == Phase::Running) g.flow.fight_running();
         // FIX (pick7, the freeze owner while the menu is up): every new flip proves the game runs; with the menu up and none for 60 s this
         // thread leaves the menu for this PC (jsp_net_pick_flow.h 3), as it ends a running match on the frame clock's failure below
         { static uint32_t last_flip = 0; const uint32_t f = cellGcm_flip_request_count(); if (f != last_flip) { last_flip = f; g.flow.game_alive(t); } }
-        g.flow.pump(t, [](const uint8_t* b, size_t n) { g.link->send(g.host ? 1 : 0, b, n); });
+        g.flow.pump(t, menu_send);
         if (g.flow.take_froze())
             std::fprintf(stderr, "[net] postgame: the game made no flip for %llu s with the after-match menu up: the pump thread leaves it for this PC (the other PC is told now)\n",
                          (unsigned long long)(jspf::kFreezeMs / 1000));
@@ -1270,22 +1419,28 @@ void pump_tick(uint64_t t)
             if (g.mc->join(g.plan.session_id, 0, t) != jpsm::Reason::None) { pump_fail("settings handshake: cannot join"); return; }
         }
         g.plan_ready = true;
-        if (g.pick_link) {   // ENHANCEMENT (post-game / pick): 2 players: player index = peer id (host 0, client 1), battle slot of each (its room record index)
-            const int me = g.host ? 0 : 1;
-            uint8_t slots[jspk::kMaxPlayers] = {};
-            const bool two = g.plan.total_players == 2 && g.plan.remotes.size() == 1;
-            if (two) { slots[me] = g.plan.local_first; slots[me ^ 1] = g.plan.remotes[0].first_slot; }
+        if (g.pick_link) {   // ENHANCEMENT (post-game / pick): player index = peer id (host 0), battle slot of each (its room record index)
+            // ENHANCEMENT (test13, JSP_ROLLBACK_PICK_MULTI=1): jspm4::menu_seats. 2 players: test12's mapping (me = host ? 0 : 1, the one remote at me ^ 1).
+            // 3-4 players: me = local_peer, slots[peer] = each peer's first slot (peer and slot differ: "slot 2 peer 1"), every remote peer gets each message.
             // FIX (pick7): the players' battle slots must be exactly the planned rollback seats, the ones every session start maps (jsp_native_fight_map)
-            const bool ok = two && jspo::seats_ok(slots, 2, (int)g.plan.total_players);
-            if (ok && g.flow.open(g.plan.session_id, me, 2, slots)) {
+            const jspm4::Seats ms = jspm4::menu_seats(g.plan, pick_multi_on());
+            if (ms.ok && g.flow.open(g.plan.session_id, ms.me, ms.n, ms.slots)) {
+                for (int i = 0; i < ms.nto; i++) g.menu_to[i] = ms.to[i];
+                g.menu_nto = ms.nto;
                 jspg::Config pc; pc.idle_ms = jspg::idle_ms_from(std::getenv(jspg::kIdleKey));
                 jspk::Config kc; kc.idle_ms = jspk::idle_ms_from(std::getenv(jspk::kIdleKey));
                 g.flow.set_config(pc, kc);
-                std::fprintf(stderr, "[net] postgame: on for this link (2 players, this PC player %d slot %u; prompt idle %u s, pick idle %u s)\n", me,
-                             (unsigned)g.plan.local_first, pc.idle_ms / 1000, kc.idle_ms / 1000);
-            } else if (g.plan.total_players > 2)   // FIX (test11, 4-player): said plainly; the menu, the pick round and the roster write are 2-player only for now
-                std::fprintf(stderr, "[net] postgame: off for this link (%u players: the after-match menu is for 2 players in this build; after each match the room "
-                             "is the game's own, and the next match starts from there)\n", (unsigned)g.plan.total_players);
+                if (ms.n == 2)
+                    std::fprintf(stderr, "[net] postgame: on for this link (2 players, this PC player %d slot %u; prompt idle %u s, pick idle %u s)\n", ms.me,
+                                 (unsigned)g.plan.local_first, pc.idle_ms / 1000, kc.idle_ms / 1000);
+                else
+                    std::fprintf(stderr, "[net] postgame: on for this link (%d players, JSP_ROLLBACK_PICK_MULTI=1; this PC player %d slot %u; battle slot of each player %u/%u/%u/%u; "
+                                 "prompt idle %u s, pick idle %u s)\n", ms.n, ms.me, (unsigned)g.plan.local_first, (unsigned)ms.slots[0], (unsigned)ms.slots[1],
+                                 (unsigned)ms.slots[2], ms.n > 3 ? (unsigned)ms.slots[3] : 9u, pc.idle_ms / 1000, kc.idle_ms / 1000);
+            } else if (g.plan.total_players > 2 && ms.why == jspm4::Why::MultiOff)   // FIX (test11, 4-player): said plainly
+                std::fprintf(stderr, "[net] postgame: off for this link (%u players: the after-match menu for 3-4 players needs JSP_ROLLBACK_PICK_MULTI=1 on every PC; after each "
+                             "match the room is the game's own, and the next match starts from there)\n", (unsigned)g.plan.total_players);
+            else if (g.plan.total_players > 2) std::fprintf(stderr, "[net] postgame: off for this link (%u players: %s)\n", (unsigned)g.plan.total_players, jspm4::why_text(ms.why));
             else std::fprintf(stderr, "[net] postgame: off for this link (the plan is not 2 players on the planned rollback seats 0 and 1)\n");
         }
         if (g.rrz && g.rrz->room_id()) g.presence_room = g.rrz->room_id();
@@ -1316,7 +1471,8 @@ void pump_tick(uint64_t t)
             }
         }
         if (st == jpsm::State::Ready) g.mh->start(0);
-        if (jpsm::terminal(st) && st != jpsm::State::Ended) pump_fail(std::string("match cancelled: ") + jpsm::explain(g.mh->reason()));
+        if (jpsm::terminal(st) && st != jpsm::State::Ended)
+            pump_fail(std::string("match cancelled: ") + (g.mh->reason() == jpsm::Reason::HostCancelled && g_close_peer_left.load() ? "the other player left" : jpsm::explain(g.mh->reason())));
         if (st == jpsm::State::Started) g.m2_started = true;
         // ENHANCEMENT (same-link rematch): a re-armed host waiting for its client's Hello says which match it is at, so a client that is still behind follows
         // (jsp_net_match.h; the first match on a link sends nothing new)
@@ -1366,6 +1522,7 @@ public:
         const int64_t t0 = g.bench ? qpc_now() : 0;
         const int r = jsp_snapshot_ext_commit(tick, g.ctx, hash);
         if (g.bench) g.bs.save.add(qpc_ms(t0, qpc_now()));
+        if (r == 0 && g_nc_storm.load()) { log("snapshot commit stopped", kNullCallEnd); g.sess.abort(kNullCallEnd); return false; }   // FIX (test13): the end names the loop
         if (r == 0) { log("snapshot commit failed", std::to_string(tick)); return false; }
         if (r == 2) { log("snapshot layout changed", "older rollback targets are gone: ending the session"); return false; }
         const uint32_t raw = *hash;
@@ -1378,7 +1535,7 @@ public:
         regs_save(tick);
         if ((int)(tick - g.base) - 1 < g.sess.final_frame()) page_dump(tick);   // DIAGNOSTIC (JSP_NET_PAGE_DUMP): only a confirmed tick (its save frame is final)
         ko_record(tick);   // FIX (a missed KO): every save, predicted or not (ko_scan ends the match once the tick is confirmed)
-        g_rep.commit(tick - g.base, *hash, raw);
+        report_commit(tick, *hash, raw);
         if (!g.bench && tick_log()) std::fprintf(stderr, "[net] commit tick=%u hash=%08x raw=%08x\n", tick, *hash, raw);   // a two-instance test compares the LAST commit line per tick across the two peers (the bench: no per-tick lines, they would be timed)
         return true;
     }
@@ -1389,7 +1546,7 @@ public:
         if (raw == 0) return false;   // no hash for this tick: the full commit runs (and reports it)
         *hash = raw ^ ((tick - g.base) * 2654435761u);
         if (*hash == 0) *hash = 1;
-        g_rep.commit(tick - g.base, *hash, raw);
+        report_commit(tick, *hash, raw);
         regs_save(tick);
         page_dump(tick);   // DIAGNOSTIC (JSP_NET_PAGE_DUMP): a confirmed tick
         ko_record(tick);
@@ -1403,8 +1560,19 @@ public:
         // (the depth-1 bench stalled before every fight). Kept as it is, at no cost.
         if (tick == g.done_now) return true;
         const int64_t t0 = g.bench ? qpc_now() : 0;
-        const bool ok = jsp_snapshot_ext_rollback(g.done_now, tick, g.ctx) == 1;
+        const int rr = jsp_snapshot_ext_rollback(g.done_now, tick, g.ctx);
+        const bool ok = rr == 1;
         if (g.bench) g.bs.restore.add(qpc_ms(t0, qpc_now()));
+        // FIX (test13, room 34): refused before any memory was touched (a helper thread is still away from where the save saw it): this fight ends in order, the
+        // snapshot is not failed, so the room and the link go on (the other PCs are told by the failure Cancel and re-arm, as after any failure on another player)
+        if (rr == 3) {
+            std::fprintf(stderr, "[net] rollback to tick %u (session tick %u, %u deep) refused: a game helper thread was busy; nothing was restored, this fight ends, the room stays\n",
+                         tick, tick - g.base, g.done_now - tick);
+            g_rep.note("rollback to session tick " + std::to_string(tick - g.base) + " (" + std::to_string(g.done_now - tick) + " deep) refused: a helper thread was away from its save-time wait site");
+            g.sess.abort("rollback refused (a game helper thread was busy at the restore; nothing was restored)");
+            return false;
+        }
+        if (!ok && g_nc_storm.load()) { log("snapshot rollback stopped", kNullCallEnd); g.sess.abort(kNullCallEnd); return false; }
         if (!ok) { log("snapshot rollback failed", std::to_string(tick)); return false; }
         jpnb::note_rollback(g.bv, (int64_t)g.done_now - (int64_t)tick);
         adapt_note_rollback((int64_t)g.done_now - (int64_t)tick);   // ENHANCEMENT (adaptive input delay, rule 2): the depth trigger
@@ -1416,7 +1584,12 @@ public:
         // (voices ended later on the copy with more rollbacks). The boundary that follows mixes them again.
         if (g_ps3_audio_lock_target >= 0) ps3_audio_lock_rewind(tick > g.base ? audio_blocks_at(tick - 1) : 0);
         g_ko.drop_after(tick);   // FIX (a missed KO): those ticks run again; their re-saves record them anew
-        regs_restore(tick);   // FIX (helper thread registers): back to what they held at that save   // the audio goes back with the tick (the mix thread is idle here)   // the ticks gone back and run again (status badge and status line)
+        const uint32_t regs_skips = regs_restore(tick);   // FIX (helper thread registers): back to what they held at that save
+        if (regs_skips) {   // FIX (test13): logged per thread in regs_restore; the report keeps the first ones
+            if (g_regs_skip_lines <= 4) g_rep.note("helper thread registers: " + std::to_string(regs_skips) + " not written back at the rollback to session tick " + std::to_string(tick - g.base) + " (see the log)");
+            // FIX (test13 review): the memory is already at `tick`: the end (stepper replay off, the local continuation) must see that tick
+            if (regs_skip_fail_on()) { g.done_now = tick; g.sess.abort("helper thread registers could not be written back after a rollback (JSP_NET_REGS_SKIP_FAIL=1)"); return false; }
+        }
         g.done_now = tick;
         if (!g.bench && tick_log()) std::fprintf(stderr, "[net] rollback to tick=%u (longest game-thread stretch without a session call since the last rollback: %u ms, keepalive polls so far: %llu)\n", tick, g.sess.take_max_gap_ms(), (unsigned long long)g.sess.keepalive_polls());
         return true;
@@ -1776,6 +1949,8 @@ void start_session(ppu_context* c)
     jsp_stepper_lockstep(1);   // FIX (rollback determinism): 2 vblanks per flip in the live ticks too (jsp_stepper.cpp)
     guest_clock_start();
     cri_lock_start();
+    nullcall_start();   // FIX (test13): the NULL-call loop guard (JSP_NET_NULLCALL_GUARD)
+    loader_start();     // STRUCTURAL (test13): the loader boundary wait (JSP_NET_LOADER_WAIT=1 only)
     jsp_sound_preload_fight_start();   // FIX (test8 sound-barrier hitches): logs how much of the sound archive is still in RAM, reads the rest again
     show("Connecting to opponent...");
 }
@@ -1988,6 +2163,9 @@ void boundary(ppu_context* c)
         jpperf::on_frame(g_perf, pn, !g.was_replaying, g.bv.delay);
         if (jpperf::wants_ack(g_perf)) jpperf::on_ack(g_perf, pn, g.sess.stats().acked_frame);
     }
+    // FIX (test13, room 34): a guest thread loops on NULL calls (the guest state is broken): end now, the other PCs are told why (the gate gave up on it already)
+    if (nullcall_tick()) { g.sess.abort(kNullCallEnd); send_failure_cancel(); end_with(std::string("Match ended: ") + kNullCallEnd); return; }
+    if (loader_wait_on() && !g.bench) loader_wait();   // STRUCTURAL (test13, off by default): the saves / restores of this iteration see the loader idle
     const int64_t hz_s0 = hz.armed ? qpc_now() : 0;   // DIAGNOSTIC (per-hitch line): the session part (GekkoNet update, the save or restore it calls, the time-sync stretch)
     const uint64_t u0 = g.glue->updates();
     jsx::Op op = g.glue->iteration(true);   // update is called whenever the stepper has nothing queued (skipping it for pacing stalled both peers in a two-copy test)
@@ -2017,6 +2195,7 @@ void boundary(ppu_context* c)
         const int64_t h0 = qpc_now();
         while (op.kind != jsx::OpKind::Run && qpc_ms(h0, qpc_now()) < 400.0 && !g.sess.failed()) {
             Sleep(1); g.sess.poll();
+            if (loader_wait_on()) loader_wait();   // STRUCTURAL (test13, off by default): as before the first iteration
             const uint64_t u1 = g.glue->updates();
             const int64_t hu0 = hz.armed ? qpc_now() : 0;   // DIAGNOSTIC (per-hitch line): the update and any save it calls are session time, not hold
             op = g.glue->iteration(true);
@@ -2027,7 +2206,10 @@ void boundary(ppu_context* c)
         g_jsp_main_stage = 5;
     }
     int events_ff = -1;   // FIX (review of PR 248): GekkoNet's final frame read with the events, under the session lock (the live watermark below)
-    for (const SessionEvent& e : g.sess.take_events(&events_ff)) {
+    std::vector<SessionEvent> evs = g.sess.take_events(&events_ff);
+    // FIX (test13, room 38): a Desync in the same batch as a Disconnected (the PC that found the split leaves right after it) is handled first, so this PC names it
+    jrg::desync_first(evs, [](const SessionEvent& x) { return x.kind == SessionEventKind::Desync; });
+    for (const SessionEvent& e : evs) {
         switch (e.kind) {
         case SessionEventKind::Started: log("gekko session synchronized", ""); if (!g.path_line.empty()) { show(g.path_line); g.path_until = GetTickCount64() + 6000; } else show(""); break;
         case SessionEventKind::Disconnected:   // GekkoNet fires it after the disconnect timeout = the grace window: the match is over
@@ -2059,8 +2241,14 @@ void boundary(ppu_context* c)
                 if (g.bs.desyncs++ < 20) std::fprintf(stderr, "[bench] RE-RUN DIFFERS at tick %d (session-relative; base %u): first run %08x, re-run %08x\n", e.tick, g.base, e.remote_hash, e.local_hash);
                 break;
             }
-            std::fprintf(stderr, "[net] DESYNC at tick %u (stepper tick numbering, session-relative; add the base %u): local=%08x remote=%08x\n", (unsigned)e.tick, g.base, e.local_hash, e.remote_hash);
+            std::fprintf(stderr, "[net] DESYNC at tick %u (stepper tick numbering, session-relative; add the base %u): local=%08x remote=%08x (player %d)\n", (unsigned)e.tick, g.base, e.local_hash, e.remote_hash, e.handle + 1);
             if (e.tick <= 3) std::fprintf(stderr, "[net] base mismatch suspected: the desync is at the first compared ticks; the two peers probably armed at different ticks (local base %u; the base is part of the per-tick hash, it is not exchanged)\n", g.base);
+            // FIX (test13, room 38: only 3 of 4 PCs logged the desync): GekkoNet queues this PC's checksum of the compared frame in the same update that found
+            // the split and sends it at the next poll. The abort below leaves the session (gekko_disconnect_actor), which marks every peer disconnected BEFORE it
+            // flushes, and a disconnected peer gets no broadcast (backend.cpp SendDataToAll): the checksum never left. One poll first sends it to every peer while
+            // they are still connected, so each of them finds the same split and logs DESYNC with both hashes (instead of "Connection lost").
+            g.sess.poll();
+            g_rep.note("desync at session tick " + std::to_string(e.tick) + ": local " + jsx_hex8(e.local_hash) + ", remote " + jsx_hex8(e.remote_hash) + " (player " + std::to_string(e.handle + 1) + ")");
             g.sess.abort("desync detected"); end_with("Desync detected: match ended"); return;
         default: break;
         }
@@ -2275,6 +2463,7 @@ std::string own_release()
 // why and calls conn_close to be sure). Main thread, with the pump thread stopped.
 bool conn_open(const Conn& c, std::string* why, jpno::Refusal* code)
 {
+    g_close_peer_left = false;   // a new link: no close reason yet (log text only)
     RepsnIdentity rid;
     g.host = c.host; g.listen_port = c.port; g.join = c.join;
     g_ad_carry = jpdr::Carry();   // ENHANCEMENT (rematch carry): a new link starts from the manifest
@@ -2341,7 +2530,7 @@ bool conn_open(const Conn& c, std::string* why, jpno::Refusal* code)
         g.rp->start(c.relay);
     } else g.rz.reset(g.host ? new DirectRendezvous(g.mux, *g.hub, 1, random_session_id()) : new DirectRendezvous(g.mux, *g.hub, 1, g.join));
     g.link.reset(new M2LinkT<jpsm::Transport>(g.mux));
-    g.flow.close(); g.pick_link = c.pair && pick_on();   // ENHANCEMENT (post-game / pick): native-room links only (the prompt drives the game's own room)
+    g.flow.close(); g.menu_nto = 0; g.pick_link = c.pair && pick_on();   // ENHANCEMENT (post-game / pick): native-room links only (the prompt drives the game's own room)
     g.phase = Phase::Handshake;
     if (c.repsn) std::fprintf(stderr, "[net] re-psn: %s a room on %s:%u as %s (relay %s), local UDP port %u%s\n", g.host ? "creating" : "joining", rid.host.c_str(), (unsigned)rid.port, rid.name.c_str(), c.relay ? "allowed" : "not allowed", (unsigned)g.mux.local_port(),
                               c.pair ? (" (paired with the game's room " + std::to_string((unsigned long long)c.pair) + ", comm id " + rid.comm_id + ")").c_str() : "");
@@ -2351,7 +2540,8 @@ bool conn_open(const Conn& c, std::string* why, jpno::Refusal* code)
             if (g.flow.route(peer, d, n, ms)) {   // ENHANCEMENT (post-game / pick): a 'P' / 'C' message of that peer (before match_peek: it belongs to the match that ended)
                 if (!g.flow.is_open() && g.flow.off_hellos() == 1)   // FIX (pick7): the other PC asks for the menu, this one runs none (once per link)
                     std::fprintf(stderr, "[net] postgame: the other PC has JSP_ROLLBACK_PICK=1, %s: the after-match menu stays off on both PCs for this link\n",
-                                 pick_on() ? "but this link runs no menu here (not a 2-player native-room link)" : "this PC has not");
+                                 pick_on() ? (pick_multi_on() ? "but this link runs no menu here (its plan does not fit the menu)" : "but this link runs no menu here (not a 2-player native-room link)")
+                                           : "this PC has not");
                 return;
             }
             if (g.plan_ready) {   // ENHANCEMENT (same-link rematch): which match of this link the datagram belongs to (jsp_net_match.h)
@@ -2377,7 +2567,8 @@ void conn_close()
 {
     g.pump.stop();                    // joins the pump thread: nothing touches the handshake objects, the rendezvous or the re-psn client after this
     g.ev.clear();                     // a settings layer still installed (closed mid-handshake) is removed; restored() tells the settings reader
-    g.mh.reset(); g.mc.reset(); g.link.reset();
+    g.mh.reset(); g.mc.reset();
+    { std::lock_guard<std::mutex> lk(g.pump.mutex()); g.link.reset(); g.flow.close(); g.menu_nto = 0; }   // FIX (test13 review 4): jsp_net_quitting (main thread) reads them under it
     g.rz.reset(); g.rrz = nullptr;    // the rendezvous uses the re-psn client and the hub: first
     g.rp.reset();                     // leaves the room, closes the server connection, takes its hooks off the mux
     g.hub.reset();
@@ -2393,7 +2584,7 @@ void conn_close()
     g.listen_port = 0; g.join = Endpoint{};
     g.match_k = 0; g.match_jump = 0; g.beacon_next = 0; g.fresh_gate = false;   // ENHANCEMENT (same-link rematch): the counter belongs to the link
     g_ad_carry = jpdr::Carry();   // ENHANCEMENT (rematch carry): so does the carried input delay
-    g.flow.close(); g.pick_link = false; g_pick_active = 0;   // ENHANCEMENT (post-game / pick): a new link never reuses a pair (the pump thread is stopped)
+    g.flow.close(); g.menu_nto = 0; g.pick_link = false; g_pick_active = 0;   // ENHANCEMENT (post-game / pick): a new link never reuses a pair (the pump thread is stopped)
     g.phase = Phase::Off;
     show(""); badge(""); ping_hide();
 }
@@ -2424,6 +2615,8 @@ struct Native {
     bool replan_count = false;    // FIX (review, optional item): that refusal was the player-count check (only a changed room count needs a new plan)
 } g_nat;
 constexpr uint64_t kReplanDebounceMs = 1500;   // FIX (a 4-copy run: a 3-player rendezvous failed visibly while the 4th joined): the count must hold this long before a re-plan
+// ENHANCEMENT (test13, the 3-4 player leave rule, jsp_net_menu4.h): set by pick_frame when another player left the menu's link; read by native_poll. Main thread.
+jspm4::LeaveWait g_nat_leave;
 void g_nat_replan_next(bool count) { if (!g_nat.replan_next) g_nat.replan_count = count; else if (!count) g_nat.replan_count = false; g_nat.replan_next = true; }
 // ENHANCEMENT (4-player online): TEST ONLY knob kept at 0 in play (JSP_NET_TEST_BOTS needs JSP_ROLLBACK_ALLOW_DEBUG=1): extra rollback peers that are not in
 // the native room. No bot ships with this change (four real copies are the test), so it stays 0 unless set by hand.
@@ -2519,7 +2712,11 @@ void native_poll()
         // FIX (a brief room-view gap ended a live fight): during a running match a brief matching2 reading (a re-psn hiccup) must not end a live fight: 10 s there (the rollback link's own
         // disconnect timer ends a match whose peer is really gone first); 1 s between matches, as before.
         const uint64_t away_ms = g.phase.load() == Phase::Running ? 10000 : 1000;
-        if (g_nat.away_since && now - g_nat.away_since >= away_ms) { native_close(st != 2 ? "this game left the native room" : room != g_nat.room ? "this game is in another native room" : "the other player left the native room"); return; }
+        if (g_nat.away_since && now - g_nat.away_since >= away_ms) {
+            g_close_peer_left = st == 2 && room == g_nat.room;
+            native_close(st != 2 ? "this game left the native room" : room != g_nat.room ? "this game is in another native room" : "the other player left the native room");
+            return;
+        }
         // ENHANCEMENT (4-player online): the room's player count changed outside a fight (a join before the first fight, a leave between matches): the link is planned
         // again for the new count (a new rendezvous; 2 left = the 2-player path). FIX: with JSP_ROLLBACK_MAX_PLAYERS 2, a link opened at 2 members whose room grew
         // to 3-4 is closed (it would take over a fight of more humans than it has slots); the room gets no rollback until it is back to 2 in another room.
@@ -2559,6 +2756,16 @@ void native_poll()
     }
     if (g.phase.load() != Phase::Off || g.mux.is_open()) return;   // a link of the lobby API: not ours
     if (st != 2 || !want || !room || room == g_nat.given_up) { if (st != 2 || room != g_nat.seen_room) g_nat.seen_room = 0; return; }
+    // ENHANCEMENT (test13, 3-4 players): after a player left the menu's link, no new plan while the room still has the old count (the leaver is still in it)
+    {
+        const jspm4::Gate lg = jspm4::leave_gate(g_nat_leave, room, want, now);
+        if (lg == jspm4::Gate::Hold) return;
+        if (lg == jspm4::Gate::Release) {
+            g_nat.tries = 0; g_nat.seen_players = want; g_nat.seen_since = now;   // a new plan for the players who stay: its own 3 tries, after the usual settle
+            log("native room", "the player who left is out of the room (or the wait is over): planning the link for " + std::to_string(want) + " players");
+            return;
+        }
+    }
     if (room != g_nat.seen_room) { g_nat.seen_room = room; g_nat.seen_since = now; g_nat.seen_players = want; g_nat.tries = 0; g_nat.retry_at = 0; return; }
     if (want != g_nat.seen_players) { g_nat.seen_players = want; g_nat.seen_since = now; return; }   // ENHANCEMENT (4-player online): a join or a leave restarts the wait
     // two members for half a second (a join in progress settles). ENHANCEMENT (4-player online): 3-4 wait until the room is full (the setting's count or the room's
@@ -2668,7 +2875,7 @@ struct PkUi {
     uint32_t ps_blk[14] = {};                  // R+0x08..+0x3C before the Square (the log of what the page changed: TODO-MAPPING P3)
     uint32_t ps_of = 0, ps_os = 0, ps_o2c = 0; // the pick block (raw fighter / support, word +0x2C) when the page last opened: unchanged at the lock = not saved
     uint64_t ps_unsaved_t = 0;                 // test8: when the page closed with nothing saved (the notice shows for 6 s)
-    size_t fi = 0, si = 0; bool together = false;   // the picker's values
+    size_t fi = 0, si = 0; jspk::TeamChoice team = jspk::CHOICE_ROOM;   // the picker's values (FIX test13 review L3: the Teams row, reset every round)
     std::vector<uint16_t> fighters, supports;       // Random first, then the stock fighter list (0x00756C64); supports: Random, ids only with JSP_PICK_SUPPORT_IDS=1
     std::string notice; uint64_t notice_until = 0;
 } g_pk;
@@ -2695,7 +2902,7 @@ size_t pk_index(const std::vector<uint16_t>& v, uint16_t id) { for (size_t i = 0
 jspk::Pick pk_current(const PkUi& u)
 {
     jspk::Pick p; p.fighter = u.fighters.empty() ? jspk::kRandom : u.fighters[u.fi]; p.support = u.supports.empty() ? jspk::kRandom : u.supports[u.si];
-    p.mode = u.together ? jspk::TOGETHER : jspk::VERSUS; return p;
+    jspk::set_choice(p, u.team); return p;
 }
 bool pk_plausible(uint32_t a) { return a >= 0x10000u && a < 0xF0000000u && !(a & 3); }
 
@@ -2720,7 +2927,8 @@ void pick_frame()
     static const int native_page = native_sel ? 0 : native_page_set;   // JSP_PICK_NATIVE_SELECT=1 replaces the host-only page
     bool page_give_up = false;
     jspf::Act act = jspf::Act::None;
-    bool open = false, host = false, picking = false, start_ok = false, rematch = false, capture = false, block = false; int nplayers = 2;
+    bool open = false, host = false, picking = false, start_ok = false, rematch = false, capture = false, block = false, room_teams = true; int nplayers = 2;
+    jspg::Reason pg_reason = jspg::R_NONE;   // ENHANCEMENT (test13): why the prompt decided Leave (the 3-4 player leave rule, jspm4::leave_wait_applies)
     std::string outcome_text, round_status; jspg::View v; int lock_secs = -1;
     std::vector<std::string> who;   // one line per player's pick (Select character), for everyone to see
     jpskin::View pn;
@@ -2737,7 +2945,7 @@ void pick_frame()
                 pk_drive(PkDrive::ToRoom); u.room_since = 0; u.room_seen = false; u.page = 0; u.joined = false; u.start_failed = false; u.prow = 0;
                 pk_lists(u);
                 const jspk::Pick m = f.round().mine();
-                u.fi = pk_index(u.fighters, m.fighter); u.si = pk_index(u.supports, m.support); u.together = m.mode == jspk::TOGETHER;
+                u.fi = pk_index(u.fighters, m.fighter); u.si = pk_index(u.supports, m.support); u.team = jspk::choice_of(m);   // the room's teams: Flow resets it every round
                 u.ps.stop(); u.ps_f = u.ps_s = 0xFFFFFFFFu;
                 if (native_sel && act == jspf::Act::CharSelect) {   // the page step: its deadline is the round's own (idle lock + wait: then the round is lost anyway)
                     jsps::Cfg pc; pc.deadline_ms = (uint64_t)jspk::idle_ms_from(std::getenv(jspk::kIdleKey)) + jspk::kWaitMs;
@@ -2746,6 +2954,7 @@ void pick_frame()
                 }
             }
             outcome_text = f.postgame().outcome_text();
+            pg_reason = f.postgame().reason(); nplayers = f.players();
             // the prompt's input
             if (u.drive == PkDrive::Prompt && pg_open) {
                 const jspg::View pv = f.postgame().view(u.sel, nm);
@@ -2785,7 +2994,7 @@ void pick_frame()
                     bool odd = false;
                     jsps::read_pick(rf, rsp, [](int id) { return jnames::fighter_name(id) != nullptr; },
                                     [](int id) { return sup_ids && id != jnames::kSupportStub && jnames::support_name(id) != nullptr; }, &p->fighter, &p->support, &odd);
-                    p->mode = u.together ? jspk::TOGETHER : jspk::VERSUS;   // no team row on the page (U8): the previous round's mode
+                    jspk::set_choice(*p, u.team);   // no team row on the page (U8): this round's start choice, the room's teams (test13)
                     if (rf == u.ps_f && rsp == u.ps_s) return false;
                     if (odd) std::fprintf(stderr, "[net] postgame: page pick block fighter %08X support %08X: a fighter the port does not know, sent as Random\n", rf, rsp);
                     u.ps_f = rf; u.ps_s = rsp;
@@ -2819,7 +3028,7 @@ void pick_frame()
                     const bool took = f.picking() && f.submit(p, true);
                     const jspk::Pick m = f.round().mine();
                     std::fprintf(stderr, "[net] postgame: pick locked from the Battle settings page: fighter %03X support %03X (%s)%s\n", m.fighter, m.support,
-                                 m.mode ? "together" : "versus", took ? "" : " (it was locked already: the round's idle lock or a script)");
+                                 jspk::team_mode_text(jspk::agreed_mode(&m)), took ? "" : " (it was locked already: the round's idle lock or a script)");
                     if (pk_plausible(R)) {   // TODO-MAPPING (P3): what else the page changed in this PC's own pick block (the stage / music words on a joiner)
                         std::string d;
                         for (uint32_t k = 0; k < 14; k++) {
@@ -2850,9 +3059,14 @@ void pick_frame()
                             const uint32_t R = vm_read32(0x0095839Cu);
                             jspk::Pick p;
                             if (pk_plausible(R)) { const uint32_t pf = vm_read32(R + jspk::kOffSelfFighter), ps = vm_read32(R + jspk::kOffSelfSupport); if (pf <= 0xFFFF) p.fighter = (uint16_t)pf; if (ps <= 0xFFFF) p.support = (uint16_t)ps; }
-                            char t[16] = {}; p.mode = jsp_setting_get("JSP_ONLINE_TEAMS", t, sizeof t) && !std::strcmp(t, "together") ? jspk::TOGETHER : jspk::VERSUS;
+                            // FIX (test13 review L3): JSP_ONLINE_TEAMS=together used to force Together here; the players' room teams stand instead
+                            // (this path runs only in a rollback room's pick round; nothing else reads the key)
+                            char t[16] = {};
+                            if (jsp_setting_get("JSP_ONLINE_TEAMS", t, sizeof t) && t[0])
+                                std::fprintf(stderr, "[net] postgame: JSP_ONLINE_TEAMS=%s is IGNORED: the teams chosen in the room stand\n", t);
+                            jspk::set_choice(p, u.team);
                             f.submit(p, true); u.page = 3;
-                            std::fprintf(stderr, "[net] postgame: host's pick from the Battle settings page: fighter %03X support %03X (%s)\n", p.fighter, p.support, p.mode ? "together" : "versus");
+                            std::fprintf(stderr, "[net] postgame: host's pick from the Battle settings page: fighter %03X support %03X (%s)\n", p.fighter, p.support, jspk::team_mode_text(jspk::agreed_mode(&p)));
                         }
                     }
                 } else {   // the port picker: Up / Down row, Left / Right value, Cross locks (Ready)
@@ -2865,18 +3079,18 @@ void pick_frame()
                         auto step = [dir](size_t i, size_t n) { return n ? (i + (dir > 0 ? 1 : n - 1)) % n : 0; };
                         if (u.prow == 0) u.fi = step(u.fi, u.fighters.size());
                         else if (u.prow == 1) u.si = step(u.si, u.supports.size());
-                        else if (u.prow == 2) u.together = !u.together;
+                        else if (u.prow == 2) u.team = jspk::next_choice(u.team, dir, f.room_teams());   // an explicit choice for this round only
                         changed = true;
                     }
                     if (changed) f.submit(pk_current(u), false);
-                    if (edges & kBtnCross) { const jspk::Pick p = pk_current(u); f.submit(p, true); std::fprintf(stderr, "[net] postgame: pick locked: fighter %03X support %03X (%s)\n", p.fighter, p.support, p.mode ? "together" : "versus"); }
+                    if (edges & kBtnCross) { const jspk::Pick p = pk_current(u); f.submit(p, true); std::fprintf(stderr, "[net] postgame: pick locked: fighter %03X support %03X (%s)\n", p.fighter, p.support, jspk::team_mode_text(jspk::agreed_mode(&p))); }
                     capture = f.picking();
                     lock_secs = f.round().seconds_left(nm);
                 }
             }
             if (f.pick_on() && !rematch)
                 for (int p = 0; p < f.players(); p++) who.push_back(jspf::pick_line(p, f.me(), f.round().pick_of(p), f.round().locked_of(p)));
-            start_ok = f.start_ok(); nplayers = f.players();
+            start_ok = f.start_ok(); nplayers = f.players(); room_teams = f.room_teams();
             // FIX (review): the host's own Cross on the room page cannot start the fight before every PC committed the round (by hand, in the
             // by-hand drive, with JSP_PICK_HOST_START=0); outside the room it stays free (the auto-skip and the player go through the screens with it).
             // TODO-MAPPING (U4): relies on the room-page targets (JSP_PICK_ROOM_TG) being seen while the room page is up.
@@ -2891,11 +3105,23 @@ void pick_frame()
     if (act == jspf::Act::LeaveGiveUp || act == jspf::Act::LeaveClose || act == jspf::Act::Lost || act == jspf::Act::Froze || act == jspf::Act::PeerFroze) {
         const bool self = act == jspf::Act::LeaveGiveUp;   // FIX (pick7): a freeze (here or there) closes the link without giving the room up
         u.notice = act == jspf::Act::Froze ? "This game stopped for a minute: the rollback link was closed"
-                 : act == jspf::Act::PeerFroze ? "The other player's game stopped responding: back to the room"
+                 : act == jspf::Act::PeerFroze ? (nplayers > 2 ? "A player left or their game stopped responding: back to the room" : "The other player left or their game stopped responding: back to the room")
                  : act == jspf::Act::Lost ? round_status : self ? "Match left: press Circle in the room to go back to the lobby" : outcome_text;
         u.notice_until = now + 6000;
         pk_drive(PkDrive::Off); g_pk_capture = 0; u.ps.stop();
-        if (g_nat.link) { const uint64_t room = g_nat.room; native_close(self ? "post-game: this player left" : "post-game: the round ended without this link"); if (self) g_nat.given_up = room; }
+        if (g_nat.link) {
+            const uint64_t room = g_nat.room;
+            native_close(self ? "post-game: this player left" : "post-game: the round ended without this link");
+            if (self) g_nat.given_up = room;
+            // ENHANCEMENT (test13, 3-4 players): another player chose to go (or its game froze / its window closed): the room goes on for the others, and the
+            // link is planned again for them once the leaver is out of the room (native_poll, jspm4::leave_gate; at most jspm4::kLeaveWaitMs)
+            else if (jspm4::leave_wait_applies(nplayers, act, pg_reason)) {
+                g_nat_leave = jspm4::leave_wait(room, nplayers, now);
+                std::fprintf(stderr, "[net] postgame: a player left the %d-player link (%s): back to the room; the link is planned again once the room's player count "
+                             "changes (at most %llu s; after that the plan counts every member still in the room, the one who left included)\n", nplayers, jspf::act_name(act),
+                             (unsigned long long)(jspm4::kLeaveWaitMs / 1000));
+            }
+        }
         open = false;
     }
     if (page_give_up) {   // ENHANCEMENT (JSP_PICK_NATIVE_SELECT=1): still on the page at the round's deadline: this PC leaves the round, the room stays
@@ -2906,7 +3132,7 @@ void pick_frame()
         open = false;
     }
     if (act == jspf::Act::PeerOff) {   // FIX (pick7): the other PC opened no prompt for this match: the game goes on as with the switch off
-        u.notice = "The other player's after-match menu is off: continue in the game"; u.notice_until = now + 6000;
+        u.notice = nplayers > 2 ? "Another player's after-match menu is off: continue in the game" : "The other player's after-match menu is off: continue in the game"; u.notice_until = now + 6000;
         pk_drive(PkDrive::Off); g_pk_capture = 0; capture = false;
     }
     if (!open && u.drive != PkDrive::Off) pk_drive(PkDrive::Off);
@@ -2976,10 +3202,8 @@ void pick_frame()
         pn.rows = { { "Battle Character", jspf::fighter_text(pk_current(u).fighter) }, { "Support Character", jspf::support_text(pk_current(u).support) } };
         if (host) {   // what jspk::roster_apply makes of the mode (humans in join order): 2 players: 1 + 1 or 2 against the COMs; 3: 2 + 1 (with a COM); 4: 2 + 2.
             // Written with the P numbers of the pick lines below (jspf::pick_line: P1 = the first to join).
-            const char* t = nplayers == 2 ? (u.together ? "P1 + P2 vs 2 COMs" : "P1 + COM vs P2 + COM")
-                          : nplayers == 3 ? (u.together ? "P1 + P2 vs P3 + COM" : "P1 + P3 vs P2 + COM")
-                          : (u.together ? "P1 + P2 vs P3 + P4" : "P1 + P3 vs P2 + P4");
-            pn.rows.push_back({ "Teams", t });
+            // FIX (test13): the room's teams by default every round (jspk::ROOM), or the host's explicit Versus / Together for this round
+            pn.rows.push_back({ "Teams", jspk::choice_text(room_teams || u.team != jspk::CHOICE_ROOM ? u.team : jspk::CHOICE_VERSUS, nplayers) });
         }
         pn.lines.push_back(Line{ round_status, jpskin::WHITE });
         if (!host) pn.lines.push_back(Line{ "Teams: the host decides", jpskin::GREY });
@@ -3173,6 +3397,29 @@ extern "C" int jsp_pick_pressing(void)
     if (g.phase.load() == Phase::Running) return 0;   // pick_pad is inert while a match runs
     return jspd::live_press(g_pk_capture.load() != 0, g_pk_block.load() != 0, (uint16_t)g_pk_press.load(), GetTickCount64() < g_pk_press_until.load());
 }
+// FIX (test11 field, room 77: the host closed its window at the after-match menu; the joiner heard nothing for 8 s, then "left or the connection was
+// lost"). Re-done in test13 from the parked lane D:\jsp-t12-quit with the fixes of its review (D:\jsp-audit\test12\REVIEW-QUIT.md 1a / 1b / 2) and the
+// 3-4 player send. main.cpp calls this when the window closes, before ps3_host_quit. With the after-match menu up (prompt or pick round), this PC's
+// Leave and a "gone" hello go out at once, here, under the pump mutex, to every peer of the menu (menu_send, as pump_tick sends them), and Flow::quitting
+// makes this PC's poll inert, so the game thread cannot close the link first. The pump thread (tick 100 ms) then resends them (the hello every 1 s, the
+// prompt's message every 250 ms) while ps3_host_quit's grace (PS3_QUIT_GRACE_MS, 3 s) keeps the process alive; the short sleep below is only a margin
+// for the first datagrams to leave the socket. A fight in progress is left to the session's own disconnect. JSP_PICK_QUIT_TELL=0: as before (nothing).
+extern "C" void jsp_net_quitting(void)
+{
+    if (!g_installed || g.bench || !pick_on() || !pick_quit_tell_on()) return;
+    bool told = false; int n = 2;
+    {
+        std::lock_guard<std::mutex> lk(g.pump.mutex());
+        if (g.link && g.flow.is_open()) {
+            const uint64_t t = now_ms();
+            told = g.flow.quitting(t); n = g.flow.players();
+            if (told) g.flow.pump(t, menu_send);   // REVIEW-QUIT 1a: at once, not on the pump thread's next tick
+        }
+    }
+    if (!told) return;
+    std::fprintf(stderr, "[net] postgame: the window is closing: the other player%s told this PC left\n", n > 2 ? "s are" : " is");
+    Sleep(120);
+}
 // AUTO_ONLINE steps (test tooling): the prompt's choice (1 Fight again, 2 Select character, 3 Leave) and the pick (ids, 1 = together, 1 = lock). 1 = taken.
 extern "C" int jsp_pick_choose(int choice)
 {
@@ -3185,7 +3432,9 @@ extern "C" int jsp_pick_submit(unsigned fighter, unsigned support, int together,
     if (!pick_on() || fighter > 0xFFFF || support > 0xFFFF) return 0;
     std::lock_guard<std::mutex> lk(g.pump.mutex());
     if (!g.flow.picking()) return 0;
-    jspk::Pick p; p.fighter = (uint16_t)fighter; p.support = (uint16_t)support; p.mode = together ? jspk::TOGETHER : jspk::VERSUS;
+    // FIX (test13): together 0 = the room's teams (the default), 1 = Together, 2 = Versus (an explicit choice for this round)
+    jspk::Pick p; p.fighter = (uint16_t)fighter; p.support = (uint16_t)support;
+    jspk::set_choice(p, together == 1 ? jspk::CHOICE_TOGETHER : together == 2 ? jspk::CHOICE_VERSUS : jspk::CHOICE_ROOM);
     return g.flow.submit(p, lock != 0) ? 1 : 0;
 }
 

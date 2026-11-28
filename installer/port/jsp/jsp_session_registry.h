@@ -131,13 +131,14 @@ inline bool is_local_only(const char* name)
 //   StartsWithZero   the default is on; only a value starting with '0' changes behaviour (LATE_FLIP, VBLANK_QPC, TRAINING_MODE, ...)
 //   StartsWithOne    the reader reacts only to a value starting with '1' (USLEEP_SPIN, PAD_P2_ALWAYS)
 //   NotEqual         a non-empty value other than `arg`, the value the port sets itself when unset (CRI_LEAD, default 12)
+//   Equal            exactly `arg` (JSP_ONLINE_VERSUS_DEFAULT: jspk::versus_on reacts to exactly "1")
 // Method (limits): the getenv names in the port's sources (jsp_hle.cpp, main.cpp, jsp_game.cpp, jsp_autopilot.cpp, jsp_fight_hash.cpp and
 // the development builds' probe and measurement readers) and the getenv lines added by the toolkit patches were read, and listed those that feed pad input or scripted menus/fights, the simulation seed or anchor, SPU/SPURS timing or
 // loss, sleep/flip/vblank/vsync pacing, probes that perturb timing, or training mode. Video, shader, texture, log and snapshot/diagnostic
 // names are not listed (the snapshot switches are the rollback machinery's own). Names read only inside the third-party
 // runtime sources outside port/ were not searched, so THE LIST MAY STILL MISS SOME. The flag a peer sends is self-reported: it protects
 // honest peers from a mistake, not from a modified client.
-enum class Trigger : uint8_t { NonEmpty, NonZero, StartsWithZero, StartsWithOne, NotEqual };
+enum class Trigger : uint8_t { NonEmpty, NonZero, StartsWithZero, StartsWithOne, NotEqual, Equal };
 struct DebugSwitch { const char* name; Trigger trigger; const char* arg = nullptr; };
 inline constexpr DebugSwitch kDebugSwitches[] = {
     { "JSP_FIGHT_SEED", Trigger::NonEmpty }, { "JSP_FIGHT_HASH", Trigger::NonZero }, { "JSP_FIGHT_PROBE", Trigger::NonEmpty },
@@ -158,6 +159,9 @@ inline constexpr DebugSwitch kDebugSwitches[] = {
     { "JSP_SPU_JITTER_US", Trigger::NonEmpty }, { "JSP_SPU_JITTER_IMGS", Trigger::NonEmpty }, { "JSP_SPU_JITTER_SEED", Trigger::NonEmpty },
     { "SPURS_JC_DELAY", Trigger::NonEmpty }, { "SPURS_GUARD_EVENT", Trigger::StartsWithZero }, { "SPURS_CTX_PAD", Trigger::StartsWithZero },
     { "JSP_RENDER60_PADROW", Trigger::NonZero },
+    // FIX (test13 review M1): the 2-human versus safeguard (jsp_net_native.cpp versus_apply) writes this PC's own room teams before the fight. Set on
+    // one PC only, the PCs built different fights (a desync every match, no reason shown); listed here, the rollback handshake refuses on both PCs.
+    { "JSP_ONLINE_VERSUS_DEFAULT", Trigger::Equal, "1" },
 };
 inline bool trigger_hit(Trigger t, const char* v, const char* arg = nullptr)
 {
@@ -168,6 +172,7 @@ inline bool trigger_hit(Trigger t, const char* v, const char* arg = nullptr)
     case Trigger::StartsWithZero: return v[0] == '0';
     case Trigger::StartsWithOne: return v[0] == '1';
     case Trigger::NotEqual: return !arg || std::strcmp(v, arg) != 0;
+    case Trigger::Equal: return arg && std::strcmp(v, arg) == 0;
     }
     return false;
 }

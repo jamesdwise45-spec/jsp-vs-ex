@@ -17,9 +17,9 @@ static Pick pk(uint16_t f, uint16_t s, TeamMode m = VERSUS) { Pick p; p.fighter 
 // ---- wire format ----
 static void test_wire()
 {
-    for (int fl = 0; fl < 8; fl++)
+    for (int fl = 0; fl < 16; fl++)   // FIX (test13): bit 3 = the room-teams bit
         for (int pl = 0; pl < 4; pl++) {
-            Msg m; m.session = 0xA1B2C3D4u; m.seq = 0x1234; m.rev = 0xFEDC; m.pick = pk(0x0102, 0x00D3, (fl & 4) ? TOGETHER : VERSUS);
+            Msg m; m.session = 0xA1B2C3D4u; m.seq = 0x1234; m.rev = 0xFEDC; m.pick = pk(0x0102, 0x00D3, (fl & 4) ? TOGETHER : VERSUS); m.pick.room = (fl & 8) != 0;
             m.locked = fl & 1; m.in_room = (fl & 2) != 0; m.player = (uint8_t)pl; m.saw = (uint8_t)(0xF >> pl);
             uint8_t b[kMsgLen]; encode(m, b);
             Msg d; CHECK(decode(b, kMsgLen, &d));
@@ -37,6 +37,11 @@ static void test_wire()
     Msg m; m.session = 7; encode(m, b);
     for (int at : { 14, 15, 16 }) {
         uint8_t c[kMsgLen]; std::memcpy(c, b, kMsgLen); c[at] |= 0x80; c[17] ^= 0x80; CHECK(!decode(c, kMsgLen, &d));
+    }
+    {   // FIX (test13): byte 14 bit 3 is the room-teams bit now (a default Pick sends it), bit 4 is still reserved
+        CHECK(b[14] & kFlagRoomTeams);
+        uint8_t c[kMsgLen]; std::memcpy(c, b, kMsgLen); c[14] |= 0x10; c[17] ^= 0x10; CHECK(!decode(c, kMsgLen, &d));
+        std::memcpy(c, b, kMsgLen); c[14] &= (uint8_t)~kFlagRoomTeams; c[17] ^= kFlagRoomTeams; CHECK(decode(c, kMsgLen, &d) && !d.pick.room);   // an old build's message
     }
     // garbage: random bytes are refused (only a valid check byte with the right magic/version could pass)
     std::mt19937 r(5); int passed = 0;
@@ -367,17 +372,134 @@ static void test_random()
     const uint8_t a[1] = { 'a' }; CHECK(fnv1a64(a, 1) == 0xaf63dc4c8601ec8cull);
 }
 
+// ---- FIX (test13): the agreed team mode and its switches ----
+static void test_mode_rule()
+{
+    Pick by[kMaxPlayers];
+    CHECK(Pick().room && Pick().mode == VERSUS);
+    CHECK(agreed_mode(by) == ROOM);                                    // the default: the room's teams
+    by[0].mode = TOGETHER; CHECK(agreed_mode(by) == TOGETHER);         // an explicit Together (port picker, JSP_ONLINE_TEAMS=together) wins
+    by[0].mode = VERSUS; by[0].room = false; CHECK(agreed_mode(by) == VERSUS);   // the host's JSP_PICK_ROOM_TEAMS=0: the old rebuild
+    for (int i = 1; i < 4; i++) { by[i].room = true; by[i].mode = TOGETHER; }
+    CHECK(agreed_mode(by) == VERSUS);                                  // the joiners' wishes and bits never count
+    by[0].room = true; CHECK(agreed_mode(by) == ROOM);
+    CHECK(std::strcmp(team_mode_text(ROOM), "room teams") == 0 && std::strcmp(team_mode_text(VERSUS), "versus") == 0 && std::strcmp(team_mode_text(TOGETHER), "together") == 0);
+    // the switches: the safeguard is off unless exactly "1"; room teams on unless "0" (or the safeguard is on and room teams are not set)
+    CHECK(!versus_on(nullptr) && !versus_on("") && !versus_on("0") && versus_on("1") && !versus_on("10") && !versus_on("yes"));
+    CHECK(room_teams_from(nullptr, nullptr) && room_teams_from("", nullptr) && room_teams_from("junk", "0"));
+    CHECK(!room_teams_from("0", nullptr) && !room_teams_from("0", "0") && room_teams_from("1", "1"));
+    CHECK(!room_teams_from(nullptr, "1") && room_teams_from(nullptr, "0"));
+    // FIX (test13 review L3): the host's Teams row
+    for (TeamChoice c : { CHOICE_ROOM, CHOICE_VERSUS, CHOICE_TOGETHER }) {
+        Pick q; q.mode = TOGETHER; q.room = false; set_choice(q, c); CHECK(choice_of(q) == c);
+        Pick hb[kMaxPlayers]; hb[0] = q; CHECK(agreed_mode(hb) == (c == CHOICE_ROOM ? ROOM : c == CHOICE_VERSUS ? VERSUS : TOGETHER));
+    }
+    CHECK(choice_of(Pick()) == CHOICE_ROOM);
+    CHECK(next_choice(CHOICE_ROOM, 1, true) == CHOICE_VERSUS && next_choice(CHOICE_VERSUS, 1, true) == CHOICE_TOGETHER && next_choice(CHOICE_TOGETHER, 1, true) == CHOICE_ROOM);
+    CHECK(next_choice(CHOICE_ROOM, -1, true) == CHOICE_TOGETHER && next_choice(CHOICE_TOGETHER, -1, true) == CHOICE_VERSUS && next_choice(CHOICE_VERSUS, -1, true) == CHOICE_ROOM);
+    CHECK(next_choice(CHOICE_VERSUS, 1, false) == CHOICE_TOGETHER && next_choice(CHOICE_TOGETHER, -1, false) == CHOICE_VERSUS && next_choice(CHOICE_ROOM, 1, false) == CHOICE_TOGETHER);
+    CHECK(!std::strcmp(choice_text(CHOICE_ROOM, 4), "As chosen in the room") && !std::strcmp(choice_text(CHOICE_TOGETHER, 2), "P1 + P2 vs 2 COMs") &&
+          !std::strcmp(choice_text(CHOICE_VERSUS, 4), "P1 + P3 vs P2 + P4"));
+}
+
+// ---- FIX (test13): ROOM keeps the teams the players chose in the room ----
+// The 6 layouts of a 2 + 2 (record r's team = bit r of the mask, two bits set)
+static const uint8_t kSplits[6] = { 0x3, 0x5, 0x6, 0x9, 0xA, 0xC };
+static void test_roster_room()
+{
+    const HumanPick h4[4] = { { 1, pk(10, 0xD1) }, { 2, pk(20, 0xD2) }, { 3, pk(30, 0xD3) }, { 4, pk(40, 0xD4) } };
+    int kept = 0;
+    for (int n = 2; n <= 4; n++)   // n humans in records 0..n-1, COMs after them: every 2 + 2 stands as the room has it
+        for (uint8_t mask : kSplits) {
+            Rec rec[4];
+            for (int r = 0; r < 4; r++) rec[r] = Rec{ (uint16_t)(r < n ? r + 1 : 0), (uint8_t)((mask >> r) & 1), (uint16_t)(0x30 + r), 0 };
+            uint8_t img[kRoomSize]; make_room(img, rec, 0x133, 0x133, 1);
+            ApplyInfo ai;
+            CHECK(roster_apply_image(img, h4, n, ROOM, 0, &ai) == Result::Ok && ai.moved == 0 && !ai.room_fixed);
+            for (int r = 0; r < 4; r++) CHECK(team_of(img, r) == rec[r].team && img[kOffSlotTeam + r] == rec[r].team);
+            for (int r = 0; r < n; r++) CHECK(fighter_of(img, r) == h4[r].pick.fighter);   // own pick on own record
+            for (int r = n; r < 4; r++) CHECK(fighter_of(img, r) == rec[r].fighter);        // the COMs keep theirs
+            CHECK(supports_follow_team(img));
+            check_symmetry(rec, h4, n, ROOM, __LINE__);
+            kept++;
+        }
+    CHECK(kept == 18);
+    // 2 humans + 2 COMs, the humans on ONE team (the tester report): kept, the two COMs together on the other team; the shared team takes
+    // the lower member id's support (the host's)
+    {
+        const Rec rec[4] = { { 1, 1, 0, 0 }, { 2, 1, 0, 0 }, { 0, 0, 30, 0 }, { 0, 0, 31, 0 } };
+        uint8_t img[kRoomSize]; make_room(img, rec, 0x77, 0x66, 1);
+        CHECK(roster_apply_image(img, h4, 2, ROOM, 0) == Result::Ok);
+        CHECK(team_of(img, 0) == 1 && team_of(img, 1) == 1 && team_of(img, 2) == 0 && team_of(img, 3) == 0);
+        CHECK(team_support(img, 1) == 0xD1 && team_support(img, 0) == 0x77 && supports_follow_team(img));
+        // VERSUS (the switch off) still splits them, as before
+        make_room(img, rec, 0x77, 0x66, 1);
+        CHECK(roster_apply_image(img, h4, 2, VERSUS, 0) == Result::Ok && team_of(img, 0) != team_of(img, 1));
+    }
+    // not valid: the nearest valid layout, humans first (member-id order), then COMs (record order)
+    struct Bad { int n; uint8_t team[4]; uint16_t member[4]; uint8_t want[4]; };
+    const Bad bad[] = {
+        { 2, { 0, 0, 0, 0 }, { 1, 2, 0, 0 }, { 0, 0, 1, 1 } },   // all on team 0: the humans stay together, the COMs move
+        { 2, { 2, 2, 1, 1 }, { 1, 2, 0, 0 }, { 0, 1, 1, 0 } },   // humans unset: spread out (member 1 team 0, member 2 team 1); COM 2 keeps 1, COM 3 fills 0
+        { 2, { 1, 2, 1, 1 }, { 1, 2, 0, 0 }, { 1, 0, 1, 0 } },   // one unset human: to the team with fewer humans
+        { 3, { 0, 0, 0, 1 }, { 1, 2, 3, 0 }, { 0, 0, 1, 1 } },   // 3 humans on 0: the third joins the COM
+        { 3, { 1, 1, 1, 1 }, { 1, 2, 3, 0 }, { 1, 1, 0, 0 } },   // all on team 1: members 1, 2 stay, member 3 and the COM go to 0
+        { 4, { 1, 1, 1, 1 }, { 1, 2, 3, 4 }, { 1, 1, 0, 0 } },   // 4 humans on team 1: members 1, 2 stay, 3, 4 move
+        { 4, { 1, 1, 1, 1 }, { 4, 3, 2, 1 }, { 0, 0, 1, 1 } },   // the same with the member ids reversed: members 1, 2 (records 3, 2) stay
+        { 4, { 0, 1, 2, 1 }, { 1, 2, 3, 4 }, { 0, 1, 0, 1 } },   // one unset of four: the team with room
+        { 4, { 2, 2, 2, 2 }, { 1, 2, 3, 4 }, { 0, 1, 0, 1 } },   // nothing set: spread A, B, A, B
+        { 2, { 0, 9, 0, 0 }, { 1, 2, 0, 0 }, { 0, 1, 0, 1 } },   // a junk byte is unset
+    };
+    for (const Bad& c : bad) {
+        Rec rec[4];
+        for (int r = 0; r < 4; r++) rec[r] = Rec{ c.member[r], c.team[r], (uint16_t)(0x30 + r), 0 };
+        HumanPick hp[4]; int k = 0;
+        for (int r = 0; r < 4; r++) if (c.member[r]) hp[k++] = HumanPick{ c.member[r], pk((uint16_t)(0x50 + c.member[r]), kRandom) };
+        uint8_t img[kRoomSize]; make_room(img, rec, 0x133, 0x133, 1);
+        ApplyInfo ai;
+        CHECK(roster_apply_image(img, hp, c.n, ROOM, 0, &ai) == Result::Ok && ai.room_fixed && ai.moved > 0 && balanced(img));
+        bool same = true; for (int r = 0; r < 4; r++) same = same && team_of(img, r) == c.want[r];
+        if (!same) std::printf("FAIL: room fix n=%d teams %u%u%u%u -> %u%u%u%u, want %u%u%u%u\n", c.n, c.team[0], c.team[1], c.team[2], c.team[3], team_of(img, 0), team_of(img, 1),
+                               team_of(img, 2), team_of(img, 3), c.want[0], c.want[1], c.want[2], c.want[3]);
+        CHECK(same);
+        for (int r = 0; r < 4; r++) if (c.team[r] <= 1 && team_of(img, r) != c.team[r]) CHECK(img[kOffSlotTeam + r] == team_of(img, r));   // a set slot byte follows
+        for (int r = 0; r < 4; r++) if (c.member[r]) CHECK(fighter_of(img, r) == 0x50 + c.member[r]);
+        check_symmetry(rec, hp, c.n, ROOM, __LINE__);
+    }
+    // every 4-record team-byte combination of 0 / 1 / 2 for 2..4 humans: always a valid 2 + 2, the same on every PC, idempotent; valid input untouched;
+    // a human whose team had room keeps it
+    int combos = 0;
+    for (int n = 2; n <= 4; n++)
+        for (int code = 0; code < 81; code++) {
+            Rec rec[4]; int c = code;
+            for (int r = 0; r < 4; r++) { rec[r] = Rec{ (uint16_t)(r < n ? r + 1 : 0), (uint8_t)(c % 3), (uint16_t)(0x30 + r), 0 }; c /= 3; }
+            uint8_t img[kRoomSize]; make_room(img, rec, 0x133, 0x133, 1);
+            Roster in = roster_read(img);
+            ApplyInfo ai;
+            CHECK(roster_apply_image(img, h4, n, ROOM, 0, &ai) == Result::Ok && balanced(img));
+            CHECK(ai.room_fixed == !room_teams_valid(in));
+            int per[2] = { 0, 0 };
+            for (int r = 0; r < n; r++) if (rec[r].team <= 1) per[rec[r].team]++;
+            for (int r = 0; r < n; r++) if (rec[r].team <= 1 && per[rec[r].team] <= 2) CHECK(team_of(img, r) == rec[r].team);   // its team had room for all its humans
+            check_symmetry(rec, h4, n, ROOM, __LINE__);
+            combos++;
+        }
+    CHECK(combos == 243);
+}
+
 int main()
 {
     test_wire();
+    test_mode_rule();
     test_states();
     test_stale();
     int bad[5] = {};
     for (int n = 2; n <= 4; n++) for (uint32_t s = 1; s <= 400; s++) if (!random_run(s * 7919u + (uint32_t)n, n)) { if (bad[n]++ < 3) std::printf("FAIL random run n=%d seed %u\n", n, s); fails++; }
     test_roster_two();
     test_roster_more();
+    test_roster_room();
     test_random();
     if (fails) { std::printf("net pick: %d failure(s)\n", fails); return 1; }
-    std::printf("net pick: wire, agreement (2..4 players, 1200 random runs), roster (versus / together, 2..4 players, symmetry) ok\n");
+    std::printf("net pick: wire, agreement (2..4 players, 1200 random runs), roster (versus / together, 2..4 players, symmetry), room teams (18 valid layouts kept, 10 fixes, 243 combinations), mode rule and switches ok\n");
     return 0;
 }

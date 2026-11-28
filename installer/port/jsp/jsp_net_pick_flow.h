@@ -36,8 +36,14 @@
 //   4. apply_pair(): the roster write on a room image. Player i's room member id is the member id in the record at its battle slot (slot = record
 //      index, the 4-player claim; 2 players: host slot 0, joiner slot 1). TODO-MAPPING (U5): if that record is a COM or has member id 0, the human
 //      records in record order are given to the players in slot order (fallback, logged); both are functions of R and the plan only.
-//      The record team bytes are cleared to "unset" before roster_apply, so the teams come only from the member ids, the record order and the
-//      agreed mode (anchor team 0), never from team bytes that a PC's own versus_apply may or may not have swapped yet. This PC's own pick
+//      FIX (test13) agreed mode ROOM (the default: the host's pick carries the room-teams bit, JSP_PICK_ROOM_TEAMS): the record team bytes
+//      are the players' choice in the room and are KEPT when they are a valid 2 + 2 (jsp_net_pick.h 3.; else the nearest valid layout). They
+//      are the host's broadcast, the same bytes the game's own builder places from on every PC; versus_apply (off by default since test13)
+//      never runs while a pair is active. Agreed mode VERSUS / TOGETHER (JSP_PICK_ROOM_TEAMS=0 on the host, the versus safeguard on, or the
+//      port picker's Together row): the record team bytes are cleared to "unset" before roster_apply, so the teams come only from the member
+//      ids, the record order and the agreed mode (anchor team 0), never from team bytes that a PC's own versus_apply may or may not have
+//      swapped yet. Either way the fighter map of the session start pairs pads and fighters by member id (jnf::net_ports), so every layout
+//      keeps each player's pad on its own fighter (jspo::predict_map / own_ok, host-tested). This PC's own pick
 //      block (R+0x08 / +0x0C) is NOT written: it would differ between PCs (TODO-MAPPING U6/U6b: if the loading scene's upsert 0x002EE96C
 //      rebuilds this PC's record from it after the builder's entry, JSP_PICK_SCENE_APPLY=1 writes the roster again on every loading update).
 //   5. The picker's texts: the lists (named ids only: fighters in the select screen's own order, the stock list 0x00756C64; Supports
@@ -49,6 +55,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 
 namespace jspf {
@@ -141,11 +148,12 @@ public:
     void tick(uint64_t now)
     {
         if (!started_ || outcome_ != jspg::PENDING) return;
+        // FIX (test13 review of the 3-4 player menu, REVIEW-MENU4 1): a silent player ends the round as "link lost" WITHOUT writing a LEAVE into this
+        // PC's own choice. Before, that LEAVE went out and every PC that still heard this one took it for a player who chose to leave (R_PEER_LEFT)
+        // while this PC had R_LINK_LOST: the PCs split on the leave rule's hold (jsp_net_menu4.h). Now the others reach R_LINK_LOST by their own
+        // silence check once this PC's messages stop (linger_ms after its decision). Same wire; the 2-player jspg::Agreement is untouched.
         for (int i = 0; i < n_; i++)
-            if (i != me_ && now - heard_[i] >= cfg_.silence_ms) {
-                if (choice_[me_] == jspg::NONE) { choice_[me_] = jspg::LEAVE; bump(); }
-                decide(jspg::O_LEAVE, jspg::R_LINK_LOST, now); return;
-            }
+            if (i != me_ && now - heard_[i] >= cfg_.silence_ms) { decide(jspg::O_LEAVE, jspg::R_LINK_LOST, now); return; }
         if (choice_[me_] == jspg::NONE && now - t0_ >= cfg_.idle_ms) { choice_[me_] = jspg::LEAVE; bump(); decide(jspg::O_LEAVE, jspg::R_IDLE, now); return; }
         if (choice_[me_] != jspg::NONE && now - t0_ >= (uint64_t)cfg_.idle_ms + cfg_.silence_ms) decide(jspg::O_LEAVE, jspg::R_LINK_LOST, now);
     }
@@ -353,6 +361,7 @@ public:
         tag_ = jspk::session_tag(plan_session); me_ = me; n_ = n;
         for (int i = 0; i < n; i++) slots_[i] = slots[i];
         pg_.configure(me, n, tag_);
+        room_teams_ = jspk::room_teams_from(std::getenv(jspk::kRoomTeamsKey), std::getenv(jspk::kVersusKey));   // FIX (test13)
         return true;
     }
     void close() { *this = Flow(); }
@@ -361,6 +370,9 @@ public:
     int me() const { return me_; }
     bool host() const { return is_open() && me_ == 0; }
     void set_config(const jspg::Config& pc, const jspk::Config& kc) { pcfg_ = pc; kcfg_ = kc; }
+    // FIX (test13): this PC's room-teams switch (open() reads JSP_PICK_ROOM_TEAMS; only the host's counts, jspk::agreed_mode). Before a round.
+    void set_room_teams(bool on) { room_teams_ = on; }
+    bool room_teams() const { return room_teams_; }
 
     // One datagram of the link's settings channel from peer id `peer` (the link's sender, = that player's index). true: a 'P' / 'C' message,
     // consumed here (also when this link runs no prompt, so the handshake objects never see one). A message whose player index is not its
@@ -472,7 +484,13 @@ public:
     {
         if (peer_off_ && !peer_off_said_) { peer_off_said_ = true; return Act::PeerOff; }   // FIX (pick7): another PC declined this match
         if (frozen_ && !froze_said_) { froze_said_ = true; end_round(); return Act::Froze; }             // FIX (pick7): the freeze owner left for this PC
-        if (peer_gone_ && !peer_gone_said_) { peer_gone_said_ = true; end_round(); return Act::PeerFroze; }
+        if (peer_gone_ && !peer_gone_said_) {
+            peer_gone_said_ = true;
+            // FIX (test13 review, REVIEW-MENU4 5 / REVIEW-QUIT 3): the gone hello came with that player's Leave (a window closed, or a freeze with no
+            // choice made): the normal outcome below says "Opponent left" / "A player left" (Act::LeaveClose); the link closes the same way
+            const bool left = pg_.on() && !acted_ && pg_.outcome() == jspg::O_LEAVE && pg_.reason() == jspg::R_PEER_LEFT;
+            if (!left) { end_round(); return Act::PeerFroze; }
+        }
         if (!is_open() || !pg_.on()) return Act::None;
         const jspg::Outcome o = pg_.outcome();
         if (o == jspg::PENDING) return Act::None;
@@ -481,7 +499,10 @@ public:
             if (o == jspg::O_LEAVE) { pg_left_ = true; return pg_.reason() == jspg::R_SELF || pg_.reason() == jspg::R_IDLE ? Act::LeaveGiveUp : Act::LeaveClose; }
             rematch_ = o == jspg::O_REMATCH;
             round_pair_ = !rematch_ || pair_.n > 0;   // Fight again without an earlier pick: the native roster stands
-            const jspk::Pick prev = pair_.n ? pair_.pick[me_] : jspk::Pick();
+            jspk::Pick prev = pair_.n ? pair_.pick[me_] : jspk::Pick();
+            // FIX (test13 review L3): every round starts from the room's teams (Versus without room teams): an earlier round's explicit Versus /
+            // Together never carries on, and a Fight again (prev locked at once) always plays the room's teams
+            jspk::set_choice(prev, room_teams_ ? jspk::CHOICE_ROOM : jspk::CHOICE_VERSUS);
             pick_.start(tag_, pg_.seq(), me_, n_, prev, now, kcfg_);
             pick_on_ = true;
             if (rematch_) pick_.lock();
@@ -510,7 +531,25 @@ public:
 
     // UI
     bool choose(jspg::Choice c, uint64_t now) { return is_open() && pg_.pick(c, now); }
-    bool submit(jspk::Pick p, bool lock) { if (!pick_on_ || !pick_.set_pick(p)) return false; return !lock || pick_.lock(); }
+    // FIX (test11 field, room 77; re-done in test13 with the review fixes of D:\jsp-audit\test12\REVIEW-QUIT.md): this PC's window is closing.
+    // As the freeze owner does (pump(), 3 at the top): the prompt's own choice becomes Leave when none was made, the pick round sends nothing
+    // more, and every hello says gone, so every other PC closes its round at once (Act::PeerFroze) instead of after silence_ms of nothing
+    // ("left or the connection was lost"). The caller pumps at once under the same lock (the pump thread's tick is 100 ms, and the game thread
+    // polls in between); the pump thread then keeps resending while the process lives (ps3_host_quit's grace). This PC's poll() is inert from
+    // here on (acted_, pg_left_ and the said-flags set), so nothing on the game thread closes the link before those datagrams are out.
+    // true = told (once; false before the prompt: a fight is the session's own disconnect).
+    bool quitting(uint64_t now)
+    {
+        if (!is_open() || !pg_.on() || frozen_) return false;
+        frozen_ = true; froze_said_ = true; peer_gone_said_ = true; hello_dirty_ = true;   // froze_said_: no Act::Froze for a process that is exiting
+        if (pg_.outcome() == jspg::PENDING && pg_.mine() == jspg::NONE) pg_.pick(jspg::LEAVE, now);
+        if (pick_on_) pick_.stop();
+        acted_ = true; pg_left_ = true;   // REVIEW-QUIT 1b: no Act::LeaveGiveUp -> native_close on the game thread before the Leave is sent
+        return true;
+    }
+    // FIX (test13): the caller's team choice stands (jspk::set_choice: the room's teams by default, an explicit Versus / Together this round);
+    // without room teams (JSP_PICK_ROOM_TEAMS=0) the room bit is always off.
+    bool submit(jspk::Pick p, bool lock) { if (!room_teams_) p.room = false; if (!pick_on_ || !pick_.set_pick(p)) return false; return !lock || pick_.lock(); }
     // This PC reached its room page. The flag goes out only once this PC's round is READY (see the top: the host's start then proves that
     // every PC committed the same picks).
     void in_room(bool v) { want_room_ = v; on_round_change(); }
@@ -563,6 +602,7 @@ private:
     jspk::Config kcfg_;
     Postgame pg_;
     jspk::PickAgreement pick_;
+    bool room_teams_ = true;   // FIX (test13)
     bool pick_on_ = false, acted_ = false, ready_said_ = false, rematch_ = false, round_pair_ = false, pg_left_ = false, committed_ = false, want_room_ = false;
     PairOut pair_;
     uint64_t routed_ = 0, sent_ = 0, spoofed_ = 0;
@@ -607,11 +647,13 @@ inline jspk::Result apply_pair(uint8_t img[jspk::kRoomSize], const PairOut& p, j
     const MemberMap m = members_of(img, p, hp);
     if (how) *how = m;
     if (m == MemberMap::None) return jspk::Result::HumansMismatch;
-    // the teams only from the member ids, the record order and the mode: the record team bytes as "unset" (see the top); the slot team bytes
-    // keep whether they are set (0/1) or not (2), which versus_apply never changes
+    // ROOM (test13, the default): the room's own record teams (see the top). VERSUS / TOGETHER: the teams only from the member ids, the record
+    // order and the mode: the record team bytes as "unset" (see the top); the slot team bytes keep whether they are set (0/1) or not (2),
+    // which versus_apply never changes
+    const jspk::TeamMode mode = p.mode();
     jspk::Roster in = jspk::roster_read(img), out;
-    for (int r = 0; r < 4; r++) in.rec[r].set_team(2);
-    const jspk::Result res = jspk::roster_apply(in, hp, p.n, p.mode(), &out, info);
+    if (mode != jspk::ROOM) for (int r = 0; r < 4; r++) in.rec[r].set_team(2);
+    const jspk::Result res = jspk::roster_apply(in, hp, p.n, mode, &out, info);
     if (res == jspk::Result::Ok) jspk::roster_write(out, img);   // the own pick block R+0x08 / +0x0C stays as it is (it differs between PCs)
     return res;
 }

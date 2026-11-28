@@ -21,7 +21,7 @@ What goes in (text only: .log .txt .ini .cmd), every file and file name through 
   Known limits: a name or host name that is in none of those settings files and in no known line format stays as written (for example a
   server given only on the game's command line, or an IPv6 address); the settings are read from the files the launcher uses by default,
   not from a file given to jsp-launcher.exe with --settings; a common word used as a name is replaced wherever it stands as a word.
-  logs\\*.log, build\\**\\*.log (step logs), game\\run\\*.txt (play_stderr.prev.txt is the launch before the last one), the *.log, *.txt, *.ini and *.cmd files of the install folder
+  logs\\*.log, build\\**\\*.log (step logs), game\\run\\*.txt (play_stderr.prev.txt and play_stdout.prev.txt are the launch before the last one), the *.log, *.txt, *.ini and *.cmd files of the install folder
   (play_settings.txt, jsp-install.ini, build-again.cmd, paths.txt, VERSION.txt, tree.txt when present), the settings file in
   %APPDATA%\\JSP Fan Revival, and the newest two Inno Setup logs in %TEMP% that mention this app. Plus facts.txt.
 facts.txt: version, Windows, CPU count and model, AVX2, RAM, free space, the game exe, step markers, the GPU (from the last launch's log; a note when

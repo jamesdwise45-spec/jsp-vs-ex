@@ -2,17 +2,20 @@
 // block, injected presses), the notice-box Cross of the mapping run's U4 fix (map1: "You got a new title." over the room), and the joiner's Ready
 // Cross (U7). It also replays the two map1 timelines on a model room page, with the host's start block on, to show the box always closes and the
 // start never runs before every pick is committed. No game, no GPU.
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <random>
+#include <vector>
 #include "../port/jsp/jsp_net_pick_drive.h"
 #include "../port/jsp/jsp_net_pick_flow.h"      // apply_pair: the roster write at the builder (ownership after Select character)
 // glibc's <math.h> declares a function jnf (Bessel); the port's namespace of the same name is renamed for this test only (the math headers are in above)
 #define jnf jsp_native_fight_ns
 #include "../port/jsp/jsp_net_native_fight.h"   // jnf::placement_net_slot: the builder's net slot of a record (swapped-controls fix)
 #include "../port/jsp/jsp_net_pick_own.h"       // FIX (pick7): the planned seats and the fighter map the session start builds (jnf::net_ports)
+#include "../port/jsp/jsp_net_menu4.h"         // ENHANCEMENT (test13): the 3-4 player menu glue and its leave rule
 
 static int fails = 0;
 #define CHECK(c) do { if (!(c)) { std::printf("FAIL line %d: %s\n", __LINE__, #c); fails++; } } while (0)
@@ -304,6 +307,9 @@ static void test_ownership()
         for (int k = 0; k < 2; k++) { p.pick[k].fighter = r() % 3 == 0 ? jspk::kRandom : (uint16_t)(r() % 42); p.pick[k].support = jspk::kRandom; }
         p.pick[0].mode = (r() & 1) ? jspk::TOGETHER : jspk::VERSUS;   // the host's mode wins
         p.pick[1].mode = (r() & 1) ? jspk::TOGETHER : jspk::VERSUS;
+        // FIX (test13): per-PC swapped team bytes come only from the versus safeguard (JSP_ONLINE_VERSUS_DEFAULT=1), which turns the room-teams
+        // bit off (jspk::room_teams_from): this is the old Versus / Together rebuild. The room-teams path is checked in test_ownership_mapper.
+        p.pick[0].room = false; p.pick[1].room = (r() & 1) != 0;   // the joiner's bit never counts
         bool ok = true;
         for (int me = 0; me < 2; me++) { p.self_slot = (uint8_t)me; ok = ok && jspf::apply_pair(pc[me], p) == jspk::Result::Ok; }
         CHECK(ok);
@@ -344,10 +350,12 @@ static void test_ownership_mapper()
     CHECK(jspo::seats_ok(s01, 2, 2) && jspo::seats_ok(s10, 2, 2));
     CHECK(!jspo::seats_ok(s02, 2, 2) && !jspo::seats_ok(s11, 2, 2) && !jspo::seats_ok(s01, 2, 3) && !jspo::seats_ok(s01, 1, 1));
     std::mt19937 r(20261122u + 7u);
-    int rooms = 0, together = 0, swapped = 0;
+    int rooms = 0, together = 0, swapped = 0, kept = 0;
     for (int it = 0; it < 500; it++) {
         jspf::Flow h, j;
         CHECK(h.open(5000u + (uint64_t)it, 0, 2, s01) && j.open(5000u + (uint64_t)it, 1, 2, s01));
+        const bool room = it % 2 == 0;   // FIX (test13): the host's room-teams bit (the default on); off = the versus safeguard's old rebuild
+        h.set_room_teams(room); j.set_room_teams((r() & 1) != 0);
         uint64_t t = 0;
         auto step = [&] {
             h.pump(t, [&](const uint8_t* d, size_t n) { j.route(0, d, n, t); });
@@ -375,7 +383,8 @@ static void test_ownership_mapper()
         put_rec(img, 2, 0, true, (uint8_t)(r() % 2), 0x20); put_rec(img, 3, 0, true, (uint8_t)(r() % 2), 0x21);
         uint8_t pc[2][jspk::kRoomSize];
         std::memcpy(pc[0], img, sizeof img); std::memcpy(pc[1], img, sizeof img);
-        if (r() & 1) { std::swap(pc[1][jspk::kOffRecords + jspk::kRecSize + jspk::kRecTeam], pc[1][jspk::kOffRecords + jspk::kRecSize * 2 + jspk::kRecTeam]); swapped++; }
+        // a PC's own versus_apply swap exists only with the safeguard on (room teams off); with room teams both PCs hold the host's broadcast
+        if (!room && (r() & 1)) { std::swap(pc[1][jspk::kOffRecords + jspk::kRecSize + jspk::kRecTeam], pc[1][jspk::kOffRecords + jspk::kRecSize * 2 + jspk::kRecTeam]); swapped++; }
         for (int me = 0; me < 2; me++) CHECK(jspf::apply_pair(pc[me], pa[me]) == jspk::Result::Ok);
         const jspo::Map m0 = jspo::predict_map(pc[0], jspo::plan_seats(2)), m1 = jspo::predict_map(pc[1], jspo::plan_seats(2));
         CHECK(m0.err == jnf::MAP_OK && m1.err == jnf::MAP_OK);
@@ -383,9 +392,14 @@ static void test_ownership_mapper()
         CHECK(!std::memcmp(m0.port, m1.port, sizeof m0.port) && !std::memcmp(m0.net_of_rec, m1.net_of_rec, sizeof m0.net_of_rec));   // one map
         for (int rc = 0; rc < 2; rc++) CHECK(m0.net_of_rec[rc] >= 0 && m0.port[m0.net_of_rec[rc]] == rc);
         CHECK(m0.net_of_rec[2] < 0 && m0.net_of_rec[3] < 0);                                     // the COMs get no net slot
-        const bool tog = jspk::agreed_mode(pa[0].pick) == jspk::TOGETHER;
+        const jspk::TeamMode mode = jspk::agreed_mode(pa[0].pick);
+        CHECK(mode == jspk::agreed_mode(pa[1].pick) && mode == (ph.mode == jspk::TOGETHER ? jspk::TOGETHER : room ? jspk::ROOM : jspk::VERSUS));
+        const bool tog = mode == jspk::TOGETHER;
         const uint8_t t0 = pc[0][jspk::kOffRecords + jspk::kRecTeam], t1 = pc[0][jspk::kOffRecords + jspk::kRecSize + jspk::kRecTeam];
-        CHECK(tog ? t0 == t1 : t0 != t1);
+        if (mode == jspk::ROOM) {   // the room's teams stand when they are a valid 2 + 2 (the bytes are random here, so sometimes not)
+            if (jspk::room_teams_valid(jspk::roster_read(img))) { for (int rc = 0; rc < 4; rc++) CHECK(pc[0][jspk::kOffRecords + jspk::kRecSize * rc + jspk::kRecTeam] == img[jspk::kOffRecords + jspk::kRecSize * rc + jspk::kRecTeam]); kept++; }
+            CHECK(!std::memcmp(pc[0], pc[1], sizeof img));   // one roster on both PCs
+        } else CHECK(tog ? t0 == t1 : t0 != t1);
         together += tog;
         if (ph.fighter != jspk::kRandom) CHECK(jspk::be16(pc[0] + jspk::kOffRecords + jspk::kRecFighter) == ph.fighter);
         if (pj.fighter != jspk::kRandom) CHECK(jspk::be16(pc[1] + jspk::kOffRecords + jspk::kRecSize + jspk::kRecFighter) == pj.fighter);
@@ -393,12 +407,18 @@ static void test_ownership_mapper()
         h.fight_running(); j.fight_running();
         CHECK(h.match_end(2, t) && j.match_end(2, t) && h.choose(jspg::REMATCH, t) && j.choose(jspg::REMATCH, t));
         for (int k = 0; k < 30 && !(h.round().state() == jspk::READY && j.round().state() == jspk::READY); k++) step();
-        jspf::PairOut again; CHECK(h.pair(&again) && again.pick[0] == pa[0].pick[0] && again.pick[1] == pa[0].pick[1]);
+        jspf::PairOut again; CHECK(h.pair(&again));
+        for (int k = 0; k < 2; k++) CHECK(again.pick[k].fighter == pa[0].pick[k].fighter && again.pick[k].support == pa[0].pick[k].support);
+        // FIX (test13 review L3): the team choice is not kept: a Fight again plays the room's teams (Versus without room teams)
+        CHECK(again.mode() == (room ? jspk::ROOM : jspk::VERSUS));
         uint8_t re[jspk::kRoomSize]; std::memcpy(re, img, sizeof img);
-        CHECK(jspf::apply_pair(re, again) == jspk::Result::Ok && !std::memcmp(re + jspk::kOffRecords, pc[0] + jspk::kOffRecords, 4 * jspk::kRecSize));
+        CHECK(jspf::apply_pair(re, again) == jspk::Result::Ok);
+        if (again.mode() == mode) CHECK(!std::memcmp(re + jspk::kOffRecords, pc[0] + jspk::kOffRecords, 4 * jspk::kRecSize));
+        const jspo::Map ma = jspo::predict_map(re, jspo::plan_seats(2));
+        CHECK(jspo::own_ok(ma, 0) && jspo::own_ok(ma, 1));
         rooms++;
     }
-    CHECK(rooms == 500 && together > 50 && swapped > 50);
+    CHECK(rooms == 500 && together > 50 && swapped > 50 && kept > 30);
     // what the session start refuses stays refused: a stale third member (the roster write refuses it, and the native roster maps MAP_EXTRA) ...
     uint8_t img[jspk::kRoomSize] = {};
     put_rec(img, 0, 1, false, 0, 3); put_rec(img, 1, 2, false, 1, 4); put_rec(img, 2, 3, false, 0, 5); put_rec(img, 3, 0, true, 1, 6);
@@ -412,10 +432,111 @@ static void test_ownership_mapper()
     CHECK(!jspo::seats_ok(s02b, 2, 2) && jspo::predict_map(img, jspo::plan_seats(2)).err != jnf::MAP_OK);
 }
 
+// ---- 7. ENHANCEMENT (test13, JSP_ROLLBACK_PICK_MULTI=1): 3-4 players ----
+// (a) Ownership after Select character with the menu built from each PC's own plan (jspm4::menu_seats), peer ids != battle slots: every PC
+// writes its committed pair into its copy of the room and the fighter map the session start builds (planned seats (1 << n) - 1) must give each
+// PC's pad its own fighter, the same map on every PC. The TEAM bytes after the write are lane C's rule (jspf::apply_pair / jspk::roster_apply);
+// this test only checks that whatever the teams are, each pad drives its own fighter and the PCs agree.
+struct MRemote { uint8_t peer = 0, first_slot = 0, count = 1; };
+struct MPlan { bool host = false; uint8_t total_players = 0, local_peer = 0, local_first = 0, local_count = 1; std::vector<MRemote> remotes; };
+static void test_multi_ownership()
+{
+    std::mt19937 r(20261128u);
+    int rooms = 0;
+    for (int it = 0; it < 300; it++) {
+        const int n = 3 + (it & 1);
+        uint8_t slot_of[4] = { 0, 1, 2, 3 };
+        std::shuffle(slot_of, slot_of + n, r);   // peer i plays battle slot slot_of[i]
+        jspf::Flow f[4]; jspm4::Seats s[4];
+        for (int i = 0; i < n; i++) {
+            MPlan p; p.host = i == 0; p.total_players = (uint8_t)n; p.local_peer = (uint8_t)i; p.local_first = slot_of[i];
+            for (int j = 0; j < n; j++) if (j != i) { MRemote m; m.peer = (uint8_t)j; m.first_slot = slot_of[j]; p.remotes.push_back(m); }
+            s[i] = jspm4::menu_seats(p, true);
+            CHECK(s[i].ok && f[i].open(7000u + (uint64_t)it, s[i].me, s[i].n, s[i].slots));
+        }
+        uint64_t t = 0;
+        auto step = [&] {
+            for (int i = 0; i < n; i++) f[i].pump(t, [&](const uint8_t* d, size_t len) { for (int k = 0; k < s[i].nto; k++) f[s[i].to[k]].route(i, d, len, t); });
+            for (int i = 0; i < n; i++) f[i].poll(t);
+            t += 100;
+        };
+        for (int k = 0; k < 30; k++) step();
+        for (int i = 0; i < n; i++) CHECK(f[i].match_end(1, t));
+        for (int i = 0; i < n; i++) CHECK(f[i].choose(i == (it % n) ? jspg::CHARSELECT : ((r() & 1) ? jspg::REMATCH : jspg::CHARSELECT), t));
+        for (int k = 0; k < 10; k++) step();
+        jspk::Pick pk[4];
+        for (int i = 0; i < n; i++) { CHECK(f[i].picking()); pk[i].fighter = r() % 3 == 0 ? jspk::kRandom : (uint16_t)(r() % 42); pk[i].mode = (r() & 1) ? jspk::TOGETHER : jspk::VERSUS; CHECK(f[i].submit(pk[i], true)); }
+        for (int k = 0; k < 40; k++) step();
+        jspf::PairOut pa[4];
+        for (int i = 0; i < n; i++) { CHECK(f[i].round().state() == jspk::READY && f[i].pair(&pa[i])); CHECK(pa[i].self_slot == slot_of[i] && jspo::slot_seats(pa[i].slot, n) == jspo::plan_seats(n)); }
+        // the room after the host's broadcast: peer i's human record at slot_of[i] (member id 10 + i), COMs on the other records; random team bytes
+        uint8_t img[jspk::kRoomSize];
+        for (uint32_t i = 0; i < jspk::kRoomSize; i++) img[i] = (uint8_t)r();
+        for (int i = 0; i < 4; i++) img[jspk::kOffSlotTeam + i] = (uint8_t)(r() % 3);
+        for (int rc = 0; rc < 4; rc++) put_rec(img, rc, 0, true, (uint8_t)(r() % 2), (uint16_t)(0x20 + rc));
+        for (int i = 0; i < n; i++) put_rec(img, slot_of[i], (uint16_t)(10 + i), false, (uint8_t)(r() % 2), (uint16_t)(r() % 42));
+        uint8_t pc[4][jspk::kRoomSize];
+        for (int i = 0; i < n; i++) { std::memcpy(pc[i], img, sizeof img); CHECK(jspf::apply_pair(pc[i], pa[i]) == jspk::Result::Ok); }
+        jspo::Map m[4];
+        for (int i = 0; i < n; i++) {
+            m[i] = jspo::predict_map(pc[i], jspo::plan_seats(n));
+            CHECK(m[i].err == jnf::MAP_OK && jspo::own_ok(m[i], slot_of[i]));   // this PC's pad -> its own fighter
+            if (i) CHECK(!std::memcmp(m[i].port, m[0].port, sizeof m[0].port) && !std::memcmp(pc[i] + jspk::kOffRecords, pc[0] + jspk::kOffRecords, 4 * jspk::kRecSize));
+            if (pk[i].fighter != jspk::kRandom) CHECK(jspk::be16(pc[i] + jspk::kOffRecords + jspk::kRecSize * slot_of[i] + jspk::kRecFighter) == pk[i].fighter);
+        }
+        rooms++;
+    }
+    CHECK(rooms == 300);
+    // The seat gap after a leave (REVIEW-MENU4): 4 -> 3 with the last fight's humans on records 0, 2, 3. The re-plan's claims are then the member order
+    // (jsp4::room_claim: not packed in 0..n-1 -> Claim::Rank, net_four_test), so the plan's slots are 0, 1, 2 and the menu opens (seats_ok). If the game
+    // has NOT repacked the records by the next fight, the session start's map with seats 0b111 refuses (no wrong ownership; the link is planned again
+    // from the records that fight filled); if it has, every pad drives its own fighter.
+    {
+        const uint8_t rank_slots[3] = { 0, 1, 2 };   // members 1, 3, 4 in member order
+        CHECK(jspo::seats_ok(rank_slots, 3, 3));
+        uint8_t gap[jspk::kRoomSize] = {}, packed[jspk::kRoomSize] = {};
+        put_rec(gap, 0, 1, false, 0, 3); put_rec(gap, 1, 0, true, 0, 4); put_rec(gap, 2, 3, false, 1, 5); put_rec(gap, 3, 4, false, 1, 6);
+        CHECK(jspo::predict_map(gap, jspo::plan_seats(3)).err != jnf::MAP_OK);
+        put_rec(packed, 0, 1, false, 0, 3); put_rec(packed, 1, 3, false, 0, 5); put_rec(packed, 2, 4, false, 1, 6); put_rec(packed, 3, 0, true, 1, 4);
+        const jspo::Map pm = jspo::predict_map(packed, jspo::plan_seats(3));
+        CHECK(pm.err == jnf::MAP_OK && jspo::own_ok(pm, 0) && jspo::own_ok(pm, 1) && jspo::own_ok(pm, 2));
+    }
+}
+
+// (b) The leave rule's gate in native_poll (jspm4::leave_gate): hold while the room still has the link's player count, release when it drops or
+// the wait is over (the caller then counts the room's tries afresh), forget it in another room.
+static void test_leave_gate()
+{
+    using jspf::Act;
+    CHECK(jspm4::leave_wait_applies(3, Act::LeaveClose, jspg::R_PEER_LEFT) && jspm4::leave_wait_applies(4, Act::PeerFroze, jspg::R_NONE));
+    CHECK(!jspm4::leave_wait_applies(2, Act::LeaveClose, jspg::R_PEER_LEFT) && !jspm4::leave_wait_applies(2, Act::PeerFroze, jspg::R_NONE));   // 2 players: as before
+    CHECK(!jspm4::leave_wait_applies(4, Act::LeaveClose, jspg::R_LINK_LOST) && !jspm4::leave_wait_applies(4, Act::Lost, jspg::R_NONE));
+    CHECK(!jspm4::leave_wait_applies(4, Act::LeaveGiveUp, jspg::R_SELF) && !jspm4::leave_wait_applies(4, Act::LeaveGiveUp, jspg::R_IDLE));
+    CHECK(jspm4::leave_wait_applies(3, Act::Froze, jspg::R_NONE) && !jspm4::leave_wait_applies(2, Act::Froze, jspg::R_NONE));   // REVIEW-MENU4 2: Froze holds like PeerFroze
+    jspm4::LeaveWait w;
+    CHECK(jspm4::leave_gate(w, 55, 4, 0) == jspm4::Gate::None);   // nothing to wait for
+    w = jspm4::leave_wait(55, 4, 1000);
+    CHECK(jspm4::leave_gate(w, 55, 4, 1000) == jspm4::Gate::Hold && jspm4::leave_gate(w, 55, 4, 1000 + jspm4::kLeaveWaitMs - 1) == jspm4::Gate::Hold);
+    CHECK(jspm4::leave_gate(w, 55, 3, 5000) == jspm4::Gate::Release && w.room == 0);   // 4 -> 3: the leaver is out, plan for 3
+    w = jspm4::leave_wait(55, 3, 0);
+    CHECK(jspm4::leave_gate(w, 55, 4, 10) == jspm4::Gate::Release);                    // REVIEW-MENU4 3: a join during the hold ends it too
+    CHECK(jspm4::leave_gate(w, 55, 3, 5100) == jspm4::Gate::None);                     // once
+    w = jspm4::leave_wait(55, 3, 0);
+    CHECK(jspm4::leave_gate(w, 55, 2, 10) == jspm4::Gate::Release);                    // 3 -> 2: the 2-player path
+    w = jspm4::leave_wait(55, 4, 0);
+    CHECK(jspm4::leave_gate(w, 55, 4, jspm4::kLeaveWaitMs) == jspm4::Gate::Release);   // the leaver stayed: after the wait, the plan as before
+    w = jspm4::leave_wait(55, 4, 0);
+    CHECK(jspm4::leave_gate(w, 56, 4, 10) == jspm4::Gate::None && w.room == 0);        // another room: forgotten
+    CHECK(jspm4::leave_gate(w, 55, 4, 20) == jspm4::Gate::None);
+    CHECK(jspm4::kLeaveWaitMs == jspg::kIdleMs);   // as long as the menu's own idle leave
+}
+
 int main()
 {
     test_ownership();
     test_ownership_mapper();
+    test_multi_ownership();
+    test_leave_gate();
     test_pad_gate();
     test_autopilot_pad();
     test_box_basic();
@@ -424,6 +545,6 @@ int main()
     test_join_ready();
     test_map1();
     if (fails) { std::printf("net pick drive: %d check(s) FAILED\n", fails); return 1; }
-    std::printf("net pick drive: pad gate (capture, late-pick start block, injected presses), the AUTO_ONLINE autopilot keeps the drive's press, notice-box Cross (timing, cap, gates, loading, by hand only after the room was seen), joiner's Ready, map1 timelines, ownership after the roster write (2000 rooms), ownership after Select character through the flow and the fighter map's planned seats (500 rooms + refusals) ok\n");
+    std::printf("net pick drive: pad gate (capture, late-pick start block, injected presses), the AUTO_ONLINE autopilot keeps the drive's press, notice-box Cross (timing, cap, gates, loading, by hand only after the room was seen), joiner's Ready, map1 timelines, ownership after the roster write (2000 rooms), ownership after Select character through the flow and the fighter map's planned seats (500 rooms + refusals), test13: 3-4 player ownership after Select character with the menu from each PC's own plan (300 rooms, peer != slot), the seat gap after a leave, the leave rule's gate ok\n");
     return 0;
 }

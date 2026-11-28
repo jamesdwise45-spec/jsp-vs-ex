@@ -102,6 +102,7 @@ void     ps3_load_prx_modules(void);
 
 extern const char* ppu_vfs_root;              /* host dir the PS3 mount points map into */
 void     ps3_host_quit(const char* why);      /* cellSysutil.c: REQUEST_EXITGAME, then exit 0 */
+void     jsp_net_quitting(void);              /* jsp_net_game.cpp: tells the other players at the after-match menu (no-op without rollback) */
 
 /* sys_ppu_thread.c: the main thread's stack, as sys_ppu_thread_get_stack_information
  * reports it. Left at 0 it names VM_STACK_BASE, the first created thread's stack. */
@@ -497,6 +498,7 @@ outer_cadence:
                 rsx_ok = 0;              /* window closed */
                 /* ...so quit, as the console's Quit Game does, instead of
                  * leaving the game running with no window. */
+                jsp_net_quitting();
                 ps3_host_quit("window closed");
                 continue;
             }

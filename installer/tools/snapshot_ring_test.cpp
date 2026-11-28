@@ -9,10 +9,13 @@
 // also checks the arena accounting (free + entry pages + shadow pages == arena, no page owned twice) after every operation.
 #include "../port/jsp/jsp_snapshot_ring.h"
 #include "../port/jsp/jsp_snapshot_sync.h"   // the gate precheck (test_gate_precheck)
+#include "../port/jsp/jsp_snapshot_flow.h"   // FIX (test13 review): a refused rollback in the scripted rounds (test_flow_refused)
 #include <chrono>
 #include <cstdio>
 #include <deque>
 #include <map>
+#include <string>
+#include <thread>
 using namespace jss;
 static int fails = 0;
 #define CHECK(c) do { if (!(c)) { std::printf("FAIL line %d: %s\n", __LINE__, #c); fails++; } } while (0)
@@ -342,6 +345,194 @@ static void test_gate_precheck()
     std::printf("gate precheck: off/on/frozen-only/budget/log cases checked\n");
 }
 
+// FIX (test13, room 34): the restore's site rule (jsy::Cfg::site_refuse_ms / site_safe_mask). A fake world with one helper thread (tid 5) parked at site A at the
+// save; until `back_at` it is away: parked at site B, or (running = true) running guest code; then at A again. `never` = it never comes back. The real clock
+// runs: yield / spin sleep 1 ms, as GateOps does.
+struct SiteOps {
+    std::chrono::steady_clock::time_point back_at; bool never = false, running = false; int stop_after = -1;   // stop(): true from the stop_after-th call on (-1 = never)
+    int suspends = 0, resumes = 0, presamples = 0, stops = 0; bool frozen = false;
+    bool moved_now() const { return never || std::chrono::steady_clock::now() < back_at; }
+    void fill(jsy::View* v) const
+    {
+        *v = jsy::View{}; v->t_alive[5] = 1; v->t_kind[5] = 2; v->t_id[5] = 130; v->t_lr[5] = 0xA0u;
+        if (moved_now()) { if (running) { v->t_kind[5] = 0; v->t_id[5] = 0; v->t_lr[5] = 0; } else v->t_lr[5] = 0xB0u; }
+    }
+    bool suspend() { suspends++; frozen = true; return true; }
+    bool resume() { resumes++; frozen = false; return true; }
+    void sample(jsy::View* v) { fill(v); }
+    void presample(jsy::View* v) { presamples++; fill(v); }
+    void yield() { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
+    void spin() { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
+    bool stop() { stops++; return stop_after >= 0 && stops > stop_after; }
+};
+static jsy::View site_saved() { jsy::View v; v.t_alive[5] = 1; v.t_kind[5] = 2; v.t_id[5] = 130; v.t_lr[5] = 0xA0u; return v; }
+static void test_gate_site()
+{
+    using SC = std::chrono::steady_clock;
+    const jsy::View saved = site_saved();
+    jsy::Cfg c; c.block_site = true; c.site_wait_ms = 10; c.site_refuse_ms = 80;
+    const uint64_t bit5 = jtb::thread_bit(5);
+    auto ms_since = [](SC::time_point t0) { return std::chrono::duration<double, std::milli>(SC::now() - t0).count(); };
+    {   // an unsafe thread RUNNING that never parks again: the long wait, refused after site_refuse_ms, threads suspended, nothing given up
+        SiteOps o; o.never = true; o.running = true; const auto t0 = SC::now();
+        const jsy::GateResult g = jsy::gate(o, jsy::Mode::Wait, &saved, 0, c, 15000);
+        const double ms = ms_since(t0);
+        CHECK(!g.ok && g.site_refused && !g.site_gave_up && g.site_waited && g.suspended && o.frozen && g.site_refuse_why == 2);
+        CHECK(g.site_unsafe == bit5 && g.site_mask == bit5 && g.verdict.site_running == bit5 && g.site_tid == 5 && g.site_lr_was == 0xA0u && g.site_lr_now == 0);
+        CHECK(ms >= 80.0 && ms < 2000.0 && g.site_refused_ms >= 80);
+        CHECK(g.site_settles > 0 && o.presamples > 0);   // it waited unfrozen between freezes
+    }
+    {   // FIX (test13 review): an unsafe thread PARKED at another site (its job ended: field tid 18 0x00538404 -> 0x0052E658) is refused at site_wait_ms, no long wait
+        SiteOps o; o.never = true; const auto t0 = SC::now();
+        const jsy::GateResult g = jsy::gate(o, jsy::Mode::Wait, &saved, 0, c, 15000);
+        const double ms = ms_since(t0);
+        CHECK(!g.ok && g.site_refused && !g.site_gave_up && g.site_refuse_why == 1 && g.verdict.site_running == 0 && g.site_lr_now == 0xB0u);
+        CHECK(ms >= 10.0 && ms < 80.0);
+    }
+    {   // ... and one that is back at its site before site_wait_ms is restored as before
+        SiteOps o; o.back_at = SC::now() + std::chrono::milliseconds(4);
+        const jsy::GateResult g = jsy::gate(o, jsy::Mode::Wait, &saved, 0, c, 15000);
+        CHECK(g.ok && !g.site_refused && !g.site_gave_up && g.verdict.site_moved == 0);
+    }
+    {   // the same thread in the safe mask: the 50 ms-style give-up (here 10 ms), restore goes ahead (parked elsewhere or running alike)
+        for (int run = 0; run < 2; run++) {
+            SiteOps o; o.never = true; o.running = run != 0; jsy::Cfg s = c; s.site_safe_mask = bit5; const auto t0 = SC::now();
+            const jsy::GateResult g = jsy::gate(o, jsy::Mode::Wait, &saved, 0, s, 15000);
+            CHECK(g.ok && g.site_gave_up && !g.site_refused && g.site_unsafe == 0 && ms_since(t0) < 80.0);
+        }
+    }
+    {   // refusal off (site_refuse_ms = 0): the old give-up for every thread
+        for (int run = 0; run < 2; run++) {
+            SiteOps o; o.never = true; o.running = run != 0; jsy::Cfg s = c; s.site_refuse_ms = 0;
+            const jsy::GateResult g = jsy::gate(o, jsy::Mode::Wait, &saved, 0, s, 15000);
+            CHECK(g.ok && g.site_gave_up && !g.site_refused);
+        }
+    }
+    {   // an unsafe running thread that parks back at its site after the short wait but before the refusal: restored, no give-up, no refusal
+        SiteOps o; o.running = true; o.back_at = SC::now() + std::chrono::milliseconds(35);
+        const jsy::GateResult g = jsy::gate(o, jsy::Mode::Wait, &saved, 0, c, 15000);
+        CHECK(g.ok && !g.site_gave_up && !g.site_refused && g.site_waited && g.suspended);
+        CHECK(g.verdict.site_moved == 0);   // the frozen judge that admitted it saw the thread back at its site
+    }
+    {   // the same with the precheck on: the precheck must not drop SiteMoved before the refusal time either
+        SiteOps o; o.never = true; o.running = true; jsy::Cfg s = c; s.precheck_us = 200000;
+        const jsy::GateResult g = jsy::gate(o, jsy::Mode::Wait, &saved, 0, s, 15000);
+        CHECK(!g.ok && g.site_refused && !g.site_gave_up && g.site_refuse_why == 2);
+        SiteOps o2; o2.running = true; o2.back_at = SC::now() + std::chrono::milliseconds(35);
+        const jsy::GateResult g2 = jsy::gate(o2, jsy::Mode::Wait, &saved, 0, s, 15000);
+        CHECK(g2.ok && !g2.site_gave_up && !g2.site_refused && g2.verdict.site_moved == 0);
+        SiteOps o3; o3.never = true;   // parked elsewhere: refused at site_wait_ms with the precheck too
+        const auto t3 = SC::now();
+        const jsy::GateResult g3 = jsy::gate(o3, jsy::Mode::Wait, &saved, 0, s, 15000);
+        CHECK(!g3.ok && g3.site_refused && g3.site_refuse_why == 1 && ms_since(t3) < 80.0);
+    }
+    {   // the gate's time budget (or its tries) runs out first with only the unsafe running thread blocking: still a refusal, never a capture failure
+        SiteOps o; o.never = true; o.running = true;
+        const jsy::GateResult g = jsy::gate(o, jsy::Mode::Wait, &saved, 0, c, 30);
+        CHECK(!g.ok && g.site_refused && g.suspended && g.site_refuse_why == 3 && g.site_refused_ms >= 30);
+        SiteOps o2; o2.never = true; o2.running = true;
+        const jsy::GateResult g2 = jsy::gate(o2, jsy::Mode::Wait, &saved, 3, c, 0);
+        CHECK(!g2.ok && g2.site_refused && g2.freezes <= 3);
+        // ... but not when something else blocks as well (a real gate failure, as before)
+        struct BothOps : SiteOps { void sample(jsy::View* v) { fill(v); v->mtx_held = 1; } } o3; o3.never = true; o3.running = true;
+        const jsy::GateResult g3 = jsy::gate(o3, jsy::Mode::Wait, &saved, 0, c, 30);
+        CHECK(!g3.ok && !g3.site_refused);
+    }
+    {   // a thread parked at the save that is still there: no site wait at all
+        SiteOps o; o.back_at = SC::now();
+        const jsy::GateResult g = jsy::gate(o, jsy::Mode::Wait, &saved, 0, c, 15000);
+        CHECK(g.ok && !g.site_waited && g.freezes == 1 && g.site_mask == 0);
+    }
+    {   // Log mode never refuses (one freeze, the note only)
+        SiteOps o; o.never = true;
+        const jsy::GateResult g = jsy::gate(o, jsy::Mode::Log, &saved, 0, c, 15000);
+        CHECK(g.ok && !g.site_refused && g.freezes == 1 && (g.verdict.notes & jsy::NSiteMoved));
+    }
+    {   // stop(): the gate gives up at once (a NULL-call loop), threads suspended, not a refusal
+        SiteOps o; o.never = true; o.running = true; o.stop_after = 0; const auto t0 = SC::now();
+        const jsy::GateResult g = jsy::gate(o, jsy::Mode::Wait, &saved, 0, c, 15000);
+        CHECK(!g.ok && g.stopped && !g.site_refused && g.suspended && ms_since(t0) < 50.0);
+        // a busy gate that is not about sites also stops (the commit gate of room 34 waited 15 s on JobServerBusy | RoleAbsent)
+        struct StopOps : FakeGateOps { int n = 0; bool stop() { return ++n > 3; } } so; so.busy_frozen = 1 << 30;
+        const jsy::GateResult g2 = jsy::gate(so, jsy::Mode::Wait, nullptr, 0, jsy::Cfg{}, 15000);
+        CHECK(!g2.ok && g2.stopped && g2.freezes == 4);
+    }
+    {   // site_step itself
+        const uint64_t bit18 = jtb::thread_bit(18);
+        jsy::Verdict d; d.site_mask = bit5 | bit18; d.site_running = bit18;
+        jsy::Cfg s = c; s.site_safe_mask = bit5;
+        CHECK(jsy::site_step(d, 5, s) == jsy::SiteStep::Wait && jsy::site_step(d, 10, s) == jsy::SiteStep::Wait && jsy::site_step(d, 80, s) == jsy::SiteStep::Refuse);
+        d.site_running = 0;   // tid 18 parked elsewhere now
+        CHECK(jsy::site_step(d, 9, s) == jsy::SiteStep::Wait && jsy::site_step(d, 10, s) == jsy::SiteStep::Refuse);
+        d.site_mask = bit5;
+        CHECK(jsy::site_step(d, 10, s) == jsy::SiteStep::Drop);
+        d.site_mask = bit18; s.site_refuse_ms = 0;
+        CHECK(jsy::site_step(d, 10, s) == jsy::SiteStep::Drop && jsy::site_step(d, 9, s) == jsy::SiteStep::Wait);
+    }
+    {   // judge marks a moved thread that is not parked now as running (kind 0: guest code; kind 3 id 1: in transit)
+        jsy::View now = saved; now.t_kind[5] = 0; now.t_lr[5] = 0;
+        const jsy::Cfg s = c;
+        CHECK(jsy::judge(now, &saved, s).site_running == bit5);
+        now.t_kind[5] = 3; now.t_id[5] = 1;
+        CHECK(jsy::judge(now, &saved, s).site_running == bit5);
+        now.t_kind[5] = 2; now.t_id[5] = 130; now.t_lr[5] = 0xB0u;
+        const jsy::Verdict v = jsy::judge(now, &saved, s);
+        CHECK(v.site_mask == bit5 && v.site_running == 0);
+    }
+    std::printf("gate site rule: running long wait / parked-elsewhere refusal / safe give-up / off / comes back / precheck / budget / still there / log / stop cases checked\n");
+}
+
+// FIX (test13 review, JSP_SNAPSHOT_SITE_SAFE): the safe-prefix name rule, ASCII case ignored ("CriThread" is a CRI thread), comma list, empty entries, "none".
+static void test_site_names()
+{
+    CHECK(jsy::name_has_prefix("CRI FS File Access 1", "CRI") && jsy::name_has_prefix("CriThread", "CRI") && jsy::name_has_prefix("cri server", "CRI"));
+    CHECK(!jsy::name_has_prefix("sp_file_server_load_thread", "CRI") && !jsy::name_has_prefix("CR", "CRI") && !jsy::name_has_prefix("", "CRI"));
+    CHECK(jsy::name_has_prefix("sp_job_cpu_thread_high", "CRI,sp_job") && jsy::name_has_prefix("CriThread", ",,sp_job,cri"));
+    CHECK(!jsy::name_has_prefix("CriThread", "") && !jsy::name_has_prefix("CriThread", "none") && !jsy::name_has_prefix("CriThread", "NONE,,"));
+    CHECK(!jsy::name_has_prefix("none of these", "none") && jsy::name_has_prefix("none of these", "none,non"));   // "none" means no thread, not a prefix
+    CHECK(!jsy::name_has_prefix(nullptr, "CRI") && !jsy::name_has_prefix("CRI", nullptr));
+    std::printf("site safe names: ok\n");
+}
+
+// FIX (test13 review): a refused rollback in the scripted rounds (jsf::ww_pass_end) closes the round as refused (aborted, never finished or compared), takes
+// the commit of the tick the rollback request came at, and the next round saves there; jsp_snapshot_ext_rollback's code (jsf::ext_rollback_code) is 3 for it.
+struct FlowEnv {
+    bool on_ = true, ring = true, refuse = false; std::vector<std::string> log; uint32_t saved_k = 0;
+    bool on() const { return on_; }
+    bool ring_valid() const { return ring; }
+    bool layout_changed(uint32_t) { return false; }
+    bool baseline(uint32_t k) { log.push_back("baseline " + std::to_string(k)); return true; }
+    bool rebaseline(uint32_t k) { log.push_back("rebaseline " + std::to_string(k)); return true; }
+    bool commit(uint32_t k) { log.push_back("commit " + std::to_string(k)); return true; }
+    bool rollback(uint32_t k, uint32_t to) { log.push_back("rollback " + std::to_string(k) + "->" + std::to_string(to)); return !refuse; }
+    bool refused() const { return refuse; }
+    void saved(uint32_t k) { saved_k = k; log.push_back("saved " + std::to_string(k)); }
+    void restored() { log.push_back("restored"); }
+    void flush_rounds() {}
+    void finish() { log.push_back("finish"); }
+    void note(const char* w, uint32_t k) { log.push_back(std::string("note ") + w + " " + std::to_string(k)); }
+    void rng(const char*, uint32_t) {}
+};
+static void test_flow_refused()
+{
+    CHECK(jsf::ext_rollback_code(true, false, true) == 1 && jsf::ext_rollback_code(false, true, true) == 3);
+    CHECK(jsf::ext_rollback_code(false, true, false) == 0 && jsf::ext_rollback_code(false, false, true) == 0 && jsf::ext_rollback_code(true, true, true) == 1);
+    jss::Driver d; d.configure(10, {3, 2});
+    FlowEnv e; e.refuse = true;
+    jss::Rec rec; rec.have = true;
+    for (uint32_t k = 1; k <= 13; k++) jsf::ww_pass_end(e, d, k, rec);   // save at 10, pass 1 11..13, rollback request at 13: refused
+    CHECK(d.round() == 1 && d.results()[0].done && d.results()[0].aborted && d.results()[0].refused && !d.results()[0].equal);
+    bool saw_rb = false, saw_note = false; size_t i_rb = 0;
+    for (size_t i = 0; i < e.log.size(); i++) { if (e.log[i] == "rollback 13->10") { saw_rb = true; i_rb = i; } if (e.log[i].rfind("note rollback refused", 0) == 0) saw_note = true; }
+    CHECK(saw_rb && saw_note && e.saved_k == 13);
+    CHECK(i_rb + 3 < e.log.size() && e.log[i_rb + 2] == "saved 13" && e.log[i_rb + 3] == "commit 13");   // the next round starts from tick 13, committed
+    e.refuse = false;
+    for (uint32_t k : {14u, 15u, 14u, 15u}) jsf::ww_pass_end(e, d, k, rec);   // round 2: 14..15, restore at 15, replay 14..15
+    CHECK(d.finished() && d.results()[1].done && !d.results()[1].refused && d.results()[1].equal);
+    CHECK(!e.log.empty() && e.log.back() == "finish");
+    std::printf("flow: refused rollback closes the round as refused, the next round starts at the request tick: ok\n");
+}
+
 // FIX (same-link rematch): two rollback sessions in one process. The second session's ticks restart at 1: without invalidate() its first commit is
 // refused (t <= newest()), which ended every rematch at once ("commit failed"). After invalidate() the next session baselines afresh and commits /
 // rolls back exactly as the first one (checked against full copies).
@@ -385,6 +576,9 @@ int main()
 {
     test_two_sessions(RingMode::Copy2); test_two_sessions(RingMode::PagePtr);
     test_gate_precheck();
+    test_gate_site();
+    test_site_names();
+    test_flow_refused();
     test_pagemap();
     test_extend(0xE17E0001ull, 400, 20); test_extend(0xE17E0002ull, 400, 3); test_extend(0xE17E0003ull, 600, 150);
     test_extend(0xE17E0001ull, 400, 20, true); test_extend(0xE17E0003ull, 600, 150, true);   // the ring growth with batched (reverse-order) copies

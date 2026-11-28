@@ -262,6 +262,10 @@ static const KV kDefaults[] = {
     // A restore waits (at most JSP_SNAPSHOT_SITE_MS, 50 ms) until every helper thread is parked where it was at the target's save (jsp_snapshot_sync.h, SiteMoved). Soak
     // 2026-11-21 (replay-driven depth 2, ~3,200 restores): a CRI loader worker was caught inside its file read at a restore; 0 desyncs, restore 10.7 ms avg (no cost).
     {"JSP_SNAPSHOT_SITE", "1"},
+    // FIX (test13, room 34): a moved thread whose name does not start with JSP_SNAPSHOT_SITE_SAFE ("CRI", any case: the sound library's threads, all of whose
+    // moves came back within the 50 ms in 12 field logs) is refused at 50 ms when it is parked at another wait site now (its job ended or changed), and waited for
+    // up to 1.5 s when it is running now; still away, the restore is refused before any memory is touched and the fight ends in order (the room stays). All 3 field give-ups were the file loader (tid 18), and 2 of them were followed by a broken match. 0 = the 50 ms give-up for every thread.
+    {"JSP_SNAPSHOT_SITE_REFUSE_MS", "1500"},
     // PSO_ASYNC is no longer set here (the backend's default, on, applies; PSO_ASYNC=0 still turns it off). History: with the asynchronous fragment-program
     // builds on, every depth-2 bench run on a cold pipeline cache (two runs, 2026-11-21) ended in heap corruption (0xC0000374 in D3DCompile's free on
     // vp_fp_async_worker), so rollback set PSO_ASYNC=0. The writer was found: d3dcompiler_47's blob AddRef/Release are not interlocked and the async workers

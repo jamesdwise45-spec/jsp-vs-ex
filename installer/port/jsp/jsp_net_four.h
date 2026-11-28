@@ -12,8 +12,8 @@
 //   - the leaver: a disconnect with 3-4 peers ends the match only when nobody else is left (leave_policy); its text;
 //   - the takeover (jsp_net_native_fight.h jnf::take_human): GekkoNet slot r = room record r for every human record of the room; the fighter's net slot
 //     is NOT r once teams are split (the builder numbers team 0 first), so the pad take maps net slot -> record by member id (jnf::net_ports, FIX swapped controls);
-//   - the teams: NOT here yet. The 3-4 human team split (versus_teams) needs jsp_net_pick.h's roster rule, which comes with the after-match menu (JSP_ROLLBACK_PICK);
-//     4 humans keep the game's own placement (a 4-copy run: already 2 v 2, nothing moved).
+//   - the teams: the room's own, as the players chose them (nothing here writes them). FIX (test13): after a Select character / Fight again the
+//     roster write keeps them too (jspk::ROOM in jsp_net_pick.h: kept when a valid 2 + 2, else the nearest valid layout), for 2..4 players.
 // JSP_NET_FOUR_RULES_ONLY: everything but the mesh part, without the network headers.
 #pragma once
 #ifndef JSP_NET_FOUR_RULES_ONLY

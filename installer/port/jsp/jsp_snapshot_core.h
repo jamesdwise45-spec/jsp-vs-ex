@@ -195,6 +195,7 @@ struct RoundResult {
     bool done = false, equal = false;
     bool layout_diverged = false;   // the layout changed during the replay (or at its verdict): a replay divergence, counted as MISMATCH
     bool aborted = false;     // the saved layout changed inside the window, the round has no verdict (never counted as equal)
+    bool refused = false;     // FIX (test13 review): with aborted: the round's rollback was refused by the site rule (nothing restored), not a layout change
     uint32_t aborted_at = 0;
     int first_bad_tick = 0;   // 0 = none (tick number k)
     int first_bad_comp = -1;  // index into kCompNameImpl of the first component that differs at first_bad_tick (-1 = none)
@@ -271,6 +272,8 @@ public:
     // verified. The round is closed as aborted (done, not equal) and the next round starts at tick k (the caller has just taken a new baseline there);
     // returns Act::Save for it, or None when it was the last round. Valid in any phase; ignored when finished.
     Act abort_round(uint32_t k) { return close_current(k, false); }
+    // FIX (test13 review): the round's rollback was refused (jsy site rule): closed as aborted and marked refused, the next round starts at k as after abort_round
+    Act refuse_round(uint32_t k) { const size_t r = round_; const Act a = close_current(k, false); if (r < res_.size()) res_[r].refused = true; return a; }
     // The layout changed in pass 2 (or at the rollback request): the replay cannot be compared, which is a divergence, never ABORTED and never EQUAL.
     Act diverge_round(uint32_t k) { return close_current(k, true); }
     // The layout change was found on the tick that ended the last round (after its verdict): the verdict is withdrawn.
