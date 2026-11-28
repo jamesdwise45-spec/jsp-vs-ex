@@ -250,6 +250,7 @@ __pycache__/
 !/installer/tools/fight_setup_rule_test.sh
 !/installer/tools/audio_lock_test.sh
 !/installer/tools/sys_net_test.sh
+!/installer/tools/np_nat_test.sh
 !/installer/patches/
 /installer/patches/*
 !/installer/patches/*.patch
