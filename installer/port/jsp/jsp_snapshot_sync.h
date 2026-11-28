@@ -157,6 +157,7 @@ struct Verdict {
     uint32_t role_away = 0, role_absent = 0, role_queue = 0, role_at = 0, rsx_pending = 0;
     uint32_t site_moved = 0, site_tid = 0, site_lr_was = 0, site_lr_now = 0;   // threads parked elsewhere than at the save (first one for the log)
     uint64_t site_mask = 0;   // every moved thread (bit tid - 1): the refusal rule and the log's full list
+    uint64_t site_running = 0;   // FIX (test13 review): of site_mask, the threads NOT parked now (running guest code, in transit): only these can still come back
     uint32_t host_drift = 0;   // fb_total / jc_total / spurs_inst that differ from the saved view (host objects created or destroyed in the window)
     uint32_t jobsrv = 0;   // (js_bits != 0) + job records in state 2
     uint32_t jobs = 0, fibers_away = 0, flip_pending = 0;   // jobs in flight (+ HLE queue pending); fibers running elsewhere + scheduler lock held; flip outstanding (status WAITING, command ahead of the drain, direct flip, undelivered flip pump, flip lock)
@@ -209,6 +210,7 @@ inline Verdict judge(const View& v, const View* saved, const Cfg& c)
             if (saved->t_kind[t] == v.t_kind[t] && saved->t_id[t] == v.t_id[t] && saved->t_lr[t] == v.t_lr[t]) continue;
             if (!d.site_moved) { d.site_tid = (uint32_t)t; d.site_lr_was = saved->t_lr[t]; d.site_lr_now = v.t_lr[t]; }
             d.site_moved++; d.site_mask |= jtb::thread_bit((uint32_t)t);
+            if (classify_thread(v.t_kind[t], v.t_id[t], c) != TC::Parked) d.site_running |= jtb::thread_bit((uint32_t)t);
         }
     if (d.site_moved) { d.notes |= NSiteMoved; if (c.block_site) d.reasons |= SiteMoved; }
     if (c.roles) {   // park points
@@ -291,6 +293,9 @@ struct GateResult {
     // site_mask / site_unsafe = the moved threads of the last frozen sample that saw any, and of them the ones not in Cfg::site_safe_mask (bit tid - 1);
     // site_settles = unfrozen waits for a moved thread to come back (presample + yield) between two freezes.
     bool site_refused = false; uint64_t site_mask = 0, site_unsafe = 0; unsigned site_settles = 0;
+    // FIX (test13 review): why and when the refusal came: 1 = an unsafe thread is parked at ANOTHER site (it finished or changed its job: it cannot come back),
+    // 2 = an unsafe thread still running after Cfg::site_refuse_ms, 3 = the gate's time budget or tries ran out with only the site blocking; site_refused_ms = gate time then.
+    unsigned site_refuse_why = 0; long long site_refused_ms = 0;
     // FIX (test13, NULL-call loop): the Ops' stop() asked the gate to give up (a guest thread loops on NULL calls: nothing it waits for will come). ok = false.
     bool stopped = false;
     // DIAGNOSTIC (test12, rollback cost): what the UNFROZEN precheck waited for (Cfg::precheck_us spins, Cfg::prewait_ms waits, gate_ev precheck waits).
@@ -316,11 +321,33 @@ template<class O> bool stop_(O&, long) { return false; }
 // FIX (test13, Cfg::site_refuse_ms): what a gate does with a SiteMoved sample `since_ms` after it started. Wait = keep blocking; Drop = go ahead with the note (the
 // old give-up: every moved thread is in site_safe_mask, or the refusal is off); Refuse = an unsafe thread is still away after site_refuse_ms.
 enum class SiteStep { Wait, Drop, Refuse };
+// FIX (test13 review, JSP_SNAPSHOT_SITE_SAFE): does the thread `name` start with one of the comma-separated `prefixes`, ignoring ASCII case ("CRI" covers the
+// sound library's "CRI FS File Access 1" and its "CriThread")? Empty entries match nothing; "none" (or an empty list) makes no thread safe.
+inline bool name_has_prefix(const char* name, const char* prefixes)
+{
+    if (!name || !prefixes) return false;
+    auto low = [](char ch) { return (ch >= 'A' && ch <= 'Z') ? (char)(ch - 'A' + 'a') : ch; };
+    for (const char* p = prefixes; *p;) {
+        const char* e = p; while (*e && *e != ',') e++;
+        const size_t n = (size_t)(e - p);
+        bool none = n == 4 && low(p[0]) == 'n' && low(p[1]) == 'o' && low(p[2]) == 'n' && low(p[3]) == 'e';
+        if (n && !none) {
+            size_t i = 0; while (i < n && name[i] && low(name[i]) == low(p[i])) i++;
+            if (i == n) return true;
+        }
+        p = *e ? e + 1 : e;
+    }
+    return false;
+}
+// FIX (test13 review): an unsafe thread that is PARKED at another site now (2 of the 3 field give-ups: tid 18 mid-job at the save, idle now) has finished or
+// changed its job and cannot return to the save's wait: refused at site_wait_ms. Only a thread that is running now (it may finish and park where it was) gets
+// the long wait up to site_refuse_ms.
 inline SiteStep site_step(const Verdict& d, long long since_ms, const Cfg& c)
 {
     const uint64_t unsafe = d.site_mask & ~c.site_safe_mask;
     if (since_ms < (long long)c.site_wait_ms) return SiteStep::Wait;
     if (!unsafe || !c.site_refuse_ms) return SiteStep::Drop;
+    if (unsafe & ~d.site_running) return SiteStep::Refuse;
     return since_ms < (long long)c.site_refuse_ms ? SiteStep::Wait : SiteStep::Refuse;
 }
 // FIX (test13): between two freezes of a restore blocked by SiteMoved, wait UNFROZEN (presample + yield) until the moved threads are back where the save saw them
@@ -416,15 +443,17 @@ template<class Ops> GateResult gate(Ops& ops, Mode mode, const View* saved, unsi
         if (g.verdict.site_moved && !g.site_tid) { g.site_tid = g.verdict.site_tid; g.site_lr_was = g.verdict.site_lr_was; g.site_lr_now = g.verdict.site_lr_now; }
         if (g.reasons & SiteMoved) {
             g.site_waited = true; g.site_mask = g.verdict.site_mask; g.site_unsafe = g.verdict.site_mask & ~cfg.site_safe_mask;
-            const SiteStep s = site_step(g.verdict, std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t_start).count(), cfg);
+            const long long since = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t_start).count();
+            const SiteStep s = site_step(g.verdict, since, cfg);
             if (s == SiteStep::Drop) { g.reasons &= ~(unsigned)SiteMoved; g.verdict.reasons = g.reasons; g.site_gave_up = true; }
-            else if (s == SiteStep::Refuse && mode == Mode::Wait) { g.site_refused = true; g.ok = false; return g; }   // suspended, nothing copied: the caller resumes and ends the fight
+            else if (s == SiteStep::Refuse && mode == Mode::Wait) {   // suspended, nothing copied: the caller resumes and ends the fight
+                g.site_refused = true; g.ok = false; g.site_refused_ms = since; g.site_refuse_why = (g.site_unsafe & ~g.verdict.site_running) ? 1u : 2u; return g; }
         }
         if (mode == Mode::Log || g.reasons == 0) { g.ok = true; return g; }
         // out of tries or time with an unsafe moved thread the ONLY blocker: a refusal (the fight ends, nothing was copied), not a capture failure
         const bool site_only = g.reasons == (unsigned)SiteMoved && (g.verdict.site_mask & ~cfg.site_safe_mask) && cfg.site_refuse_ms;
-        if (t == limit) { g.site_refused = site_only; break; }
-        if (max_ms && std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t_start).count() >= (long long)max_ms) { g.site_refused = site_only; break; }
+        const long long since_end = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t_start).count();
+        if (t == limit || (max_ms && since_end >= (long long)max_ms)) { if (site_only) { g.site_refused = true; g.site_refuse_why = 3; g.site_refused_ms = since_end; } break; }
         if (stop_(ops, 0)) { g.stopped = true; break; }   // suspended, as a gate that ran out of tries
         if (!ops.resume()) { g.ok = false; g.reasons |= PauseFailed; g.verdict.reasons = g.reasons; return g; }
         g.suspended = false;

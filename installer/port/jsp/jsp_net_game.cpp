@@ -984,7 +984,7 @@ bool regs_skip_fail_on() { static const bool v = [] { char b[8] = {}; return jsp
 // An indirect-call hook (patch 0500, chained in front of the hooks already set) counts NULL calls per thread between two tick boundaries; at kNullCallsPerTick
 // it raises a flag. The commit / restore gate gives up on it at once (jsp_snapshot_ext_set_stop_hook) and the boundary ends the match with one log line.
 extern "C" int (*g_ppu_icall_hook)(uint32_t target, uint64_t* gpr);   // patch 0500
-int (*g_nc_prev)(uint32_t, uint64_t*) = nullptr; bool g_nc_installed = false;
+std::atomic<int (*)(uint32_t, uint64_t*)> g_nc_prev{nullptr}; bool g_nc_installed = false;
 std::atomic<bool> g_nc_armed{false}; std::atomic<uint32_t> g_nc_epoch{0}; std::atomic<int> g_nc_storm{0}; bool g_nc_said = false;
 std::atomic<DWORD> g_nc_host_tid{0}; std::atomic<uint32_t> g_nc_r3{0};
 const char* const kNullCallEnd = "a game thread is stuck calling a NULL function (game state error after a rollback)";
@@ -998,14 +998,22 @@ int nc_icall(uint32_t target, uint64_t* gpr)
             g_nc_storm.store(1);
         }
     }
-    return g_nc_prev ? g_nc_prev(target, gpr) : 0;
+    int (*const prev)(uint32_t, uint64_t*) = g_nc_prev.load(std::memory_order_acquire);
+    return prev ? prev(target, gpr) : 0;
 }
 bool nullcall_guard_on() { static const bool v = [] { char b[8] = {}; return !(jsp_setting_get("JSP_NET_NULLCALL_GUARD", b, sizeof b) && b[0] == '0'); }(); return v; }
 void nullcall_start()
 {
     g_nc_storm.store(0); g_nc_said = false;
     if (!nullcall_guard_on() || g.bench) return;
-    if (!g_nc_installed) { g_nc_prev = g_ppu_icall_hook; g_ppu_icall_hook = nc_icall; g_nc_installed = true; }   // stays installed (a hook set after it may chain to it)
+    // stays installed (a hook set after it may chain to it). FIX (test13 review): installed again when something cleared the hook (the test-only
+    // ICALL_OFF_IN_FIGHT); the chained hook is published before the hook itself (release), so a guest thread never sees ours with a stale chain
+    int (*const cur)(uint32_t, uint64_t*) = __atomic_load_n(&g_ppu_icall_hook, __ATOMIC_ACQUIRE);
+    if (!g_nc_installed || cur == nullptr) {
+        g_nc_prev.store(cur == nc_icall ? nullptr : cur, std::memory_order_relaxed);
+        __atomic_store_n(&g_ppu_icall_hook, &nc_icall, __ATOMIC_RELEASE);
+        g_nc_installed = true;
+    }
     g_nc_armed.store(true);
     jsp_snapshot_ext_set_stop_hook([] { return g_nc_storm.load(); });
 }
@@ -1555,7 +1563,8 @@ public:
         const uint32_t regs_skips = regs_restore(tick);   // FIX (helper thread registers): back to what they held at that save
         if (regs_skips) {   // FIX (test13): logged per thread in regs_restore; the report keeps the first ones
             if (g_regs_skip_lines <= 4) g_rep.note("helper thread registers: " + std::to_string(regs_skips) + " not written back at the rollback to session tick " + std::to_string(tick - g.base) + " (see the log)");
-            if (regs_skip_fail_on()) { g.sess.abort("helper thread registers could not be written back after a rollback (JSP_NET_REGS_SKIP_FAIL=1)"); return false; }
+            // FIX (test13 review): the memory is already at `tick`: the end (stepper replay off, the local continuation) must see that tick
+            if (regs_skip_fail_on()) { g.done_now = tick; g.sess.abort("helper thread registers could not be written back after a rollback (JSP_NET_REGS_SKIP_FAIL=1)"); return false; }
         }
         g.done_now = tick;
         if (!g.bench && tick_log()) std::fprintf(stderr, "[net] rollback to tick=%u (longest game-thread stretch without a session call since the last rollback: %u ms, keepalive polls so far: %llu)\n", tick, g.sess.take_max_gap_ms(), (unsigned long long)g.sess.keepalive_polls());

@@ -419,9 +419,10 @@ server's polling thread caught awake. A few were a loader worker caught inside i
 2026-11-27) the give-up above let a restore go ahead while the file loader (`sp_file_server_load_thread`, tid 18) was inside a job; the job
 queue went back, the loader did not, both job workers then called through garbage descriptors, one looped, and the commit gate waited its
 15 s budget, which ended the match for all 4 PCs. Now only threads whose name starts with a prefix in `JSP_SNAPSHOT_SITE_SAFE` (default `CRI`:
-every CRI move in 12 field logs came back within the 50 ms) keep the short give-up. Any other moved thread is waited for, unfrozen between
-freezes, up to `JSP_SNAPSHOT_SITE_REFUSE_MS`; if it is still away the restore is refused before any memory is touched (`[snap] site ...
-REFUSED`), the session ends with "rollback refused", and the snapshot is NOT failed, so the next match in the process can roll back and the
+matched in any case, so `CriThread` counts; every CRI move in 12 field logs came back within the 50 ms) keep the short give-up. Any other moved
+thread that is parked at another wait site now has finished or changed its job and cannot come back: it is refused at `JSP_SNAPSHOT_SITE_MS`.
+One that is running now is waited for, unfrozen between freezes, up to `JSP_SNAPSHOT_SITE_REFUSE_MS`. Either way the restore is refused before
+any memory is touched (`[snap] site ... REFUSED after N ms`, with the reason), the session ends with "rollback refused", and the snapshot is NOT failed, so the next match in the process can roll back and the
 room re-arms as after any failure on another player. `0` restores the old give-up for every thread.
 
 **Fail fast on a NULL-call loop (test13, `JSP_NET_NULLCALL_GUARD`, on).** A guest thread that makes 32 NULL indirect calls between two tick

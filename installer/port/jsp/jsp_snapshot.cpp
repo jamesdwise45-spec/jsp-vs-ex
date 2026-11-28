@@ -1502,7 +1502,9 @@ struct WwOps {
             g_layout_redo_count++; g_gate_used_ms += ms_since(t_redo);   // the walk and the re-discovery count against the gate budget
         }
         g_last_gate_reasons = gr.reasons;
-        if (g_ext && gr.suspended) rsx_write_guard(k, restore_to, saved, gr.view);   // threads frozen: the ring of RSX-side writes is stable
+        // threads frozen: the ring of RSX-side writes is stable. FIX (test13 review): not for a gate that captures nothing (a refused restore, a stopped or failed
+        // gate): its view would become the guard's previous capture, and a hazard it set is sticky (the next match's first commit would fail on it)
+        if (g_ext && gr.suspended && gr.ok) rsx_write_guard(k, restore_to, saved, gr.view);
         census_ms = gop.sample_ms; presample_ms = gop.presample_ms; gate_wait_ms = gop.wait_ms; spin_ms = gop.spin_ms; freeze_call_ms = gop.freeze_call_ms; quick_ms = gop.quick_ms;
         t_frozen = gop.t_frozen; frozen = gr.suspended;
         no_saved = restore_to != kNoTick && !saved;
@@ -1796,17 +1798,10 @@ bool ww_layout_changed_full()
 uint64_t site_safe_mask()
 {
     uint64_t m = 0;
-    if (g_site_safe.empty() || g_site_safe == "none") return 0;
+    if (g_site_safe.empty()) return 0;
     for (uint32_t t = 1; t < (uint32_t)jsy::kThr; t++) {
         uint64_t o[5] = {}; char nm[64] = {0};
-        if (!ps3_ppu_thread_view(t, o, nm)) continue;
-        size_t a = 0;
-        while (a <= g_site_safe.size()) {
-            size_t b = g_site_safe.find(',', a); if (b == std::string::npos) b = g_site_safe.size();
-            const std::string p = g_site_safe.substr(a, b - a);
-            if (!p.empty() && !std::strncmp(nm, p.c_str(), p.size())) { m |= jtb::thread_bit(t); break; }
-            a = b + 1;
-        }
+        if (ps3_ppu_thread_view(t, o, nm) && jsy::name_has_prefix(nm, g_site_safe.c_str())) m |= jtb::thread_bit(t);   // ASCII case ignored (review: "CriThread")
     }
     return m;
 }
@@ -1886,8 +1881,11 @@ bool ww_transaction(uint32_t k, ppu_context* c, uint32_t restore_to)
     // Not a capture failure (rollback stays usable for the next match in this process); the caller ends this fight.
     if (restore_to != kNoTick && op.gr.site_refused && !(result.failures & ~(unsigned)jso::Pause)) {
         g_rb_refused = true; g_rb_refusals++;
-        std::fprintf(stderr, "[snap] site k=%u -> tick %u REFUSED: thread(s) %s still away from their wait site at the save after %u ms (first: tid=%u lr 0x%08X -> 0x%08X; all moved %s; safe prefixes \"%s\"): nothing restored, the fight ends (JSP_SNAPSHOT_SITE_REFUSE_MS=0 restores anyway)\n",
-                     k, restore_to, tid_list(op.gr.site_unsafe).c_str(), g_cfg.site_refuse_ms, op.gr.site_tid, op.gr.site_lr_was, op.gr.site_lr_now, tid_list(op.gr.site_mask).c_str(), g_site_safe.c_str());
+        static const char* const kWhy[4] = {"?", "parked at another wait site (its job ended or changed: it cannot come back)", "still running after JSP_SNAPSHOT_SITE_REFUSE_MS",
+                                            "the gate's time budget or tries ran out with only the site blocking"};
+        std::fprintf(stderr, "[snap] site k=%u -> tick %u REFUSED after %lld ms: thread(s) %s away from their wait site at the save, %s (first: tid=%u lr 0x%08X -> 0x%08X; all moved %s, running %s; safe prefixes \"%s\"): nothing restored, the fight ends (JSP_SNAPSHOT_SITE_REFUSE_MS=0 restores anyway)\n",
+                     k, restore_to, op.gr.site_refused_ms, tid_list(op.gr.site_unsafe).c_str(), kWhy[op.gr.site_refuse_why & 3], op.gr.site_tid, op.gr.site_lr_was, op.gr.site_lr_now,
+                     tid_list(op.gr.site_mask).c_str(), tid_list(op.gr.verdict.site_running).c_str(), g_site_safe.c_str());
         return false;
     }
     if (op.gr.stopped) {   // FIX (test13): the session's stop hook (a guest NULL-call loop): the guest state is broken, fail now instead of after the gate budget
@@ -1995,7 +1993,7 @@ void flush_rounds()
     for (; reported < g_drv.round() && reported < g_drv.results().size(); reported++) {
         const jss::RoundResult& rr = g_drv.results()[reported];
         std::fprintf(stderr, "[snap] round %zu done: S=%u K=%u %s bad_ticks=%u missing=%u first_bad_tick=%d first_bad_component=%s%s\n", reported, rr.S, rr.K,
-                     rr.aborted ? "ABORTED-LAYOUT-CHANGE" : rr.equal ? "EQUAL" : "MISMATCH", rr.bad_ticks, rr.missing, rr.first_bad_tick,
+                     rr.aborted ? (rr.refused ? "ABORTED-ROLLBACK-REFUSED" : "ABORTED-LAYOUT-CHANGE") : rr.equal ? "EQUAL" : "MISMATCH", rr.bad_ticks, rr.missing, rr.first_bad_tick,
                      rr.first_bad_comp >= 0 ? jss::kCompNameImpl[rr.first_bad_comp] : (rr.first_bad_tick ? "all-only" : "-"), rr.layout_diverged ? " layout-changed-in-replay" : "");
         if (!g_soak) continue;
         g_ss.rounds++; g_ss.k_sum += rr.K; if (rr.K > g_ss.k_max) g_ss.k_max = rr.K;
@@ -2023,6 +2021,7 @@ struct WwEnv {
     bool rebaseline(uint32_t kk) { ww_baseline(kk, c, false); return g_on; }
     bool commit(uint32_t kk) { return ww_transaction(kk, c, kNoTick); }
     bool rollback(uint32_t kk, uint32_t to) { g_t_rb = Clock::now(); g_t_rb_valid = true; return ww_transaction(kk, c, to); }
+    bool refused() const { return g_rb_refused; }   // FIX (test13 review): the last rollback was refused by the site rule (nothing restored, nothing failed)
     void saved(uint32_t kk) { g_save_k = kk; g_pass1 = true; }
     void restored() { g_pass1 = false; }
     void flush_rounds() { ::flush_rounds(); }
@@ -2043,7 +2042,7 @@ void report()
         const jss::RoundResult& r = g_drv.results()[i];
         if (g_soak && r.done && r.equal) continue;   // soak: the equal rounds were printed as they finished; the end lists only the rest
         std::fprintf(stderr, "[snap] round %zu S=%u K=%u %s bad_ticks=%u missing=%u first_bad_tick=%d first_bad_component=%s\n", i, r.S, r.K,
-                     !r.done ? "NOT-FINISHED" : r.aborted ? "ABORTED-LAYOUT-CHANGE" : r.equal ? "EQUAL" : "MISMATCH", r.bad_ticks, r.missing, r.first_bad_tick,
+                     !r.done ? "NOT-FINISHED" : r.aborted ? (r.refused ? "ABORTED-ROLLBACK-REFUSED" : "ABORTED-LAYOUT-CHANGE") : r.equal ? "EQUAL" : "MISMATCH", r.bad_ticks, r.missing, r.first_bad_tick,
                      r.first_bad_comp >= 0 ? jss::kCompNameImpl[r.first_bad_comp] : (r.first_bad_tick ? "all-only" : "-"));
     }
     if (g_soak) soak_line(g_drv.results().size());
@@ -2311,8 +2310,7 @@ extern "C" int jsp_snapshot_ext_rollback(uint32_t k, uint32_t to, ppu_context* c
     g_cw.rollback_begin(k, to);   // ENHANCEMENT (measurement): the recovery runs until the save of tick k (cost window)
     const bool ok = env.rollback(k, to);
     if (!ok) g_cw.rollback_failed();
-    if (!ok && g_rb_refused && g_on) return 3;
-    return ok ? 1 : 0;
+    return jsf::ext_rollback_code(ok, g_rb_refused, g_on);
 }
 extern "C" void jsp_snapshot_ext_set_stop_hook(int (*fn)()) { g_stop_hook = fn; }   // FIX (test13): see g_stop_hook
 // Entries the ring evicted because its page POOL was short while an entry slot was free (the reachable depth shrank). 0 = fine; > 0 = the pool is too small
@@ -2353,5 +2351,7 @@ extern "C" void jsp_snapshot_ext_session_end(void)
     g_ext_hash = 0; g_ext_hash_tick = 0;
     g_cw.rollback_failed();   // no recovery is open across sessions
     g_gate_used_ms = 0;
+    // FIX (test13 review): the RSX write guard's hazard is about this session's saved memory, which is gone; sticky, it would fail the next match's first commit
+    g_rsx_hazard = false; g_rsx_hazard_logged = false; g_rsx_prev_set = false; g_rsx_prev_pending = false;
 }
 extern "C" int jsp_snapshot_ext_rsx_write_hazard(void) { return g_rsx_hazard ? 1 : 0; }   // an RSX-side write into guest memory happened with commands pending at a commit (write guard)
