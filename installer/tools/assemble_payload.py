@@ -44,6 +44,15 @@ if not exist "%PY%" (
   if not defined JSP_NOPAUSE pause
   exit /b 2
 )
+rem FIX (test11 field, 2026-11-24): a bundle made mid-fight has no end of the match (the host's log stopped at 30 s). Ask to close first.
+rem System32 by full path (test13): with Git's or MSYS's find.exe first on PATH, the check never matched.
+"%SystemRoot%\\System32\\tasklist.exe" /fi "imagename eq jsp.exe" 2>nul | "%SystemRoot%\\System32\\find.exe" /i "jsp.exe" >nul
+if not errorlevel 1 (
+  echo The game is still running. Please finish the match and close the game first,
+  echo so the bundle has the end of the match. Then press a key here.
+  echo ^(If the game is frozen, just press a key: the bundle is made anyway.^)
+  if not defined JSP_NOPAUSE pause >nul
+)
 set "ZIP="
 for /f "usebackq delims=" %%L in (`""%PY%" -X utf8 "%~dp0support_bundle.py" --root "%~dp0." --quiet"`) do set "ZIP=%%L"
 if not defined ZIP (

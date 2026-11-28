@@ -2233,7 +2233,7 @@ namespace JStarsLauncher
 
                 Status("Starting the game...");
                 game = Process.Start(psi);
-                Thread o = Pump(game.StandardOutput.BaseStream, Path.Combine(runDir, "play_stdout.txt"));
+                Thread o = Pump(game.StandardOutput.BaseStream, KeepPrevious(Path.Combine(runDir, "play_stdout.txt")));   // FIX (test13): stdout's [psnr] lines too
                 Thread e = Pump(game.StandardError.BaseStream, KeepPrevious(Path.Combine(runDir, "play_stderr.txt")));
                 Status("Game running (disc on " + drive + ":). Close the game window or press Exit to stop.");
                 // Once the game's window is up the launcher hides; this thread stays to

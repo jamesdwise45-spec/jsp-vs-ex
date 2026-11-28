@@ -163,6 +163,9 @@ def main():
         w(app3 / "game/run/play_stderr.txt", head + ticks + tail)
         w(app3 / "game/run/play_stderr.prev.txt", "[net] env decision: REFUSED (static constructors arrived: online boot first, EnvInit last)\n[net] REFUSED: JSP_ROLLBACK=1 and the game's own online (re-psn or a community server) are both on; only one multiplayer method may be active, neither runs\n")
         w(app3 / "game/run/play_stdout.txt", f"[online] re-psn enabled: server {srv}:36100\n[online] online id {nm}\n[D3D12] adapter: Test GPU (VRAM 8 MB)\n")
+        # FIX (test13): the launchers keep the launch before's stdout too (its [psnr] NAT lines); it is collected and cleaned like the others
+        w(app3 / "game/run/play_stdout.prev.txt", f"[online] re-psn enabled: server {srv}:36100\n[online] online id {nm}\n"
+                                                  "[psnr] user 38 punches from port 1369, not its announced 3658 (its router remapped the port)\n")
         zp3 = sb.make(app3, out, ad3, None, cap=200000)
         z3 = zipfile.ZipFile(zp3)
         n3 = set(z3.namelist())
@@ -170,7 +173,10 @@ def main():
         err3 = z3.read("game/run/play_stderr.txt").decode()
         f3 = z3.read("facts.txt").decode()
         all3 = b"".join(z3.read(n) for n in n3).decode()
+        out3p = z3.read("game/run/play_stdout.prev.txt").decode() if "game/run/play_stdout.prev.txt" in n3 else ""
         z3.close()
+        check("user 38 punches from port 1369" in out3p and srv not in out3p and nm not in out3p,
+              "net: the launch before's stdout (play_stdout.prev.txt) is in the zip, its [psnr] line kept, server and name removed")
         check(err3.startswith("[support_bundle: the oldest ") and "rollback opt-in" not in err3, "net: the cap cut the start of play_stderr.txt (the test's premise)")
         check("mode: Rollback re-psn host, relay allowed: yes" in f3, "net facts: the mode from play_settings.txt")
         check("re-psn server: set   online name: set   rollback join address: not set" in f3, "net facts: server and name only as set / not set")

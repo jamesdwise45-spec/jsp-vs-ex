@@ -326,6 +326,10 @@ int WINAPI WinMain(HINSTANCE h, HINSTANCE p, LPSTR cmd, int show)
     snprintf(cl, sizeof cl, "\"%s\" \"%s\\game\\%s\"", path, here, elf);
 
     snprintf(path, sizeof path, "%s\\play_stdout.txt", run);
+    /* FIX (test13 field: the launch before the last one had the toolkit's [psnr] NAT lines, and they were gone): stdout is kept the same
+       way, as play_stdout.prev.txt. */
+    snprintf(bfile, sizeof bfile, "%s\\play_stdout.prev.txt", run);
+    MoveFileExA(path, bfile, MOVEFILE_REPLACE_EXISTING);
     out = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     snprintf(path, sizeof path, "%s\\play_stderr.txt", run);
     /* ENHANCEMENT: the previous launch's stderr (the game's [net] lines, a freeze's last lines) becomes play_stderr.prev.txt, one kept, so a
