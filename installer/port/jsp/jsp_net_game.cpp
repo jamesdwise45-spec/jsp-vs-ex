@@ -103,6 +103,7 @@ static_assert(jspf::kTagPostgame == jspnet::kLinkTagPostgame && jspf::kTagPick =
 #include "jsp_mods_glue.h"   // rollback_gate, kModsNotAsListed (ENHANCEMENT, mods)
 #include "jsp_version_line.h"   // parse_version_txt (ENHANCEMENT, version mismatch message)
 #include "jsp_thread_bit.h"   // jtb::thread_bit: guest thread id 1..64 -> mask bit t - 1 (helper-thread register save / restore)
+#include "jsp_rb_guard.h"     // FIX (test13): NULL-call loop count, desync-first order, register write-back skips, loader boundary wait (pure, host-tested)
 
 extern "C" {
 int jsp_online_repsn_identity(char* server, int sn, char* name, int nn, char* comm, int cn, int* report_rtt);   // jsp_online.cpp: repsn.ini even with enabled=0
@@ -114,6 +115,8 @@ uint64_t jsp_snapshot_ext_pool_evicted(void);
 void jsp_snapshot_ext_set_budget_ms(unsigned ms);   // the commit gate's wall-time budget
 void jsp_snapshot_ext_budget_reset(void);           // after every session update: one budget from the last update across all gates
 void jsp_snapshot_ext_set_idle_hook(void (*fn)());
+void jsp_snapshot_ext_set_stop_hook(int (*fn)());   // FIX (test13): the gate gives up at once while this returns nonzero (a guest NULL-call loop)
+int jsp_snapshot_ext_parts(uint32_t k, uint64_t* out8);   // DIAGNOSTIC (test13): the 8 hash parts of tick k, for the match report
 void jsp_snapshot_ext_guard_summary(void);
 void jsp_snapshot_ext_session_end(void);           // FIX (same-link rematch): the next session starts with a full baseline at its tick 1
 int jsp_snapshot_ext_rsx_write_hazard(void);      // write guard: the previous capture had RSX commands pending and an RSX-side write into saved memory landed after it
@@ -951,22 +954,136 @@ void regs_save(uint32_t tick)
     }
     g_regs_saved++;
 }
-void regs_restore(uint32_t tick)
+// DIAGNOSTIC (test13, room 38: three PCs each skipped one write-back at the rollback that preceded the desync, and the log could not say which thread): every skip
+// is logged (the first kRegsSkipLines of a match, then a count) with the tick, the depth, the thread and its marker kind and caller lr at the save and now.
+constexpr uint32_t kRegsSkipLines = 16;
+uint32_t g_regs_skip_lines = 0;
+void regs_skip_line(uint32_t tick, uint32_t t, jrg::RegSkip why, uint32_t kind_was, uint32_t lr_was, uint32_t kind_now, uint32_t lr_now)
 {
-    if (!g_regs || g.bench) return;
+    if (g_regs_skip_lines++ >= kRegsSkipLines) { if (g_regs_skip_lines == kRegsSkipLines + 1) std::fprintf(stderr, "[net] helper thread registers: further skips in this match not shown (count in the end line)\n"); return; }
+    char nm[64] = "-"; uint64_t o[5] = {};
+    if (t && !ps3_ppu_thread_view(t, o, nm)) std::snprintf(nm, sizeof nm, "(gone)");
+    std::fprintf(stderr, "[net] helper thread registers NOT written back: rollback to tick %u (session tick %u, %u deep), tid %u \"%s\": %s; at the save kind %u lr 0x%08X, now kind %u lr 0x%08X\n",
+                 tick, tick - g.base, g.done_now - tick, t, nm, jrg::regs_skip_name(why), kind_was, lr_was, kind_now, lr_now);
+}
+uint32_t regs_restore(uint32_t tick)   // returns the write-backs skipped by this rollback (FIX test13: JSP_NET_REGS_SKIP_FAIL acts on it)
+{
+    if (!g_regs || g.bench) return 0;
     TickRegs& R = g_regs[tick % kRegRing];
-    if (R.tick != tick) { g_regs_skipped++; return; }
+    if (R.tick != tick) { g_regs_skipped++; regs_skip_line(tick, 0, jrg::RegSkip::NoSave, 0, 0, 0, 0); return 1; }
     static uint32_t kind[65], id[65], obj[65], lr[65]; static uint8_t alive[65], unrel[65]; uint32_t ov = 0, ub = 0;
     ps3_hle_thread_census(kind, id, obj, lr, alive, unrel, &ov, &ub);
+    uint32_t skipped = 0;
     for (uint32_t t = 1; t < 65; t++) {
         if (!jtb::has_thread(R.mask, t)) continue;
         const ThrRegs& r = R.t[t];
-        if (!alive[t] || kind[t] != r.kind || lr[t] != r.lr) { g_regs_skipped++; continue; }   // not parked in the same wait: leave it
+        const jrg::RegSkip why = jrg::regs_skip_kind(true, alive[t] != 0, r.kind, r.lr, kind[t], lr[t]);
+        if (why != jrg::RegSkip::None) { g_regs_skipped++; skipped++; regs_skip_line(tick, t, why, r.kind, r.lr, kind[t], lr[t]); continue; }   // not parked in the same wait: leave it
         ppu_context* c = ps3_ppu_thread_ctx(t); if (!c) continue;
         std::memcpy(c->gpr, r.gpr, sizeof r.gpr); std::memcpy(c->fpr, r.fpr, sizeof r.fpr); std::memcpy(c->vr, r.vr, sizeof r.vr);
         c->cr = r.cr; c->xer = r.xer; c->fpscr = r.fpscr; c->vscr = r.vscr; c->lr = r.lrr; c->ctr = r.ctr;
         g_regs_restored++;
     }
+    return skipped;
+}
+// FIX (test13, JSP_NET_REGS_SKIP_FAIL=1, off by default): a skipped write-back ends the fight (as a refused restore) instead of going on with a helper thread that
+// keeps registers of the undone timeline. Off by default: it is found AFTER the memory went back (it cannot be refused before), its cause (a race with a thread
+// woken after the gate, or a real move) is not known yet, and in 7 field match ends it happened only in room 38 (once on 3 PCs). The log lines above come first.
+bool regs_skip_fail_on() { static const bool v = [] { char b[8] = {}; return jsp_setting_get("JSP_NET_REGS_SKIP_FAIL", b, sizeof b) && b[0] == '1'; }(); return v; }
+
+// FIX (test13, room 34; JSP_NET_NULLCALL_GUARD=0 turns it off): after a rollback a job worker looped on NULL indirect calls (the toolkit's guard returns from each
+// with r3 untouched, so the loop never ends), the commit gate then waited its whole 15 s budget for a worker that never parks, and the session ended for all 4 PCs.
+// An indirect-call hook (patch 0500, chained in front of the hooks already set) counts NULL calls per thread between two tick boundaries; at kNullCallsPerTick
+// it raises a flag. The commit / restore gate gives up on it at once (jsp_snapshot_ext_set_stop_hook) and the boundary ends the match with one log line.
+extern "C" int (*g_ppu_icall_hook)(uint32_t target, uint64_t* gpr);   // patch 0500
+std::atomic<int (*)(uint32_t, uint64_t*)> g_nc_prev{nullptr}; bool g_nc_installed = false;
+std::atomic<bool> g_nc_armed{false}; std::atomic<uint32_t> g_nc_epoch{0}; std::atomic<int> g_nc_storm{0}; bool g_nc_said = false;
+std::atomic<DWORD> g_nc_host_tid{0}; std::atomic<uint32_t> g_nc_r3{0};
+const char* const kNullCallEnd = "a game thread is stuck calling a NULL function (game state error after a rollback)";
+int nc_icall(uint32_t target, uint64_t* gpr)
+{
+    if (target == 0 && g_nc_armed.load(std::memory_order_relaxed)) {
+        static thread_local jrg::NcThread me;
+        const uint32_t ep = g_nc_epoch.load(std::memory_order_relaxed);
+        if (jrg::nc_count(me, ep) && !g_nc_storm.load(std::memory_order_relaxed)) {
+            g_nc_host_tid.store(GetCurrentThreadId()); g_nc_r3.store((uint32_t)gpr[3]);
+            g_nc_storm.store(1);
+        }
+    }
+    int (*const prev)(uint32_t, uint64_t*) = g_nc_prev.load(std::memory_order_acquire);
+    return prev ? prev(target, gpr) : 0;
+}
+bool nullcall_guard_on() { static const bool v = [] { char b[8] = {}; return !(jsp_setting_get("JSP_NET_NULLCALL_GUARD", b, sizeof b) && b[0] == '0'); }(); return v; }
+void nullcall_start()
+{
+    g_nc_storm.store(0); g_nc_said = false;
+    if (!nullcall_guard_on() || g.bench) return;
+    // stays installed (a hook set after it may chain to it). FIX (test13 review): installed again when something cleared the hook (the test-only
+    // ICALL_OFF_IN_FIGHT); the chained hook is published before the hook itself (release), so a guest thread never sees ours with a stale chain
+    int (*const cur)(uint32_t, uint64_t*) = __atomic_load_n(&g_ppu_icall_hook, __ATOMIC_ACQUIRE);
+    if (!g_nc_installed || cur == nullptr) {
+        g_nc_prev.store(cur == nc_icall ? nullptr : cur, std::memory_order_relaxed);
+        __atomic_store_n(&g_ppu_icall_hook, &nc_icall, __ATOMIC_RELEASE);
+        g_nc_installed = true;
+    }
+    g_nc_armed.store(true);
+    jsp_snapshot_ext_set_stop_hook([] { return g_nc_storm.load(); });
+}
+void nullcall_end() { g_nc_armed.store(false); jsp_snapshot_ext_set_stop_hook(nullptr); }
+// At every boundary of a running match: a new epoch; true when a thread hit the limit (the line is printed once per match).
+bool nullcall_tick()
+{
+    g_nc_epoch.fetch_add(1, std::memory_order_relaxed);
+    if (!g_nc_storm.load()) return false;
+    if (!g_nc_said) {
+        g_nc_said = true;
+        const DWORD ht = g_nc_host_tid.load(); uint32_t gt = 0; char nm[64] = "(not a guest thread)";
+        for (uint32_t t = 1; t < 65; t++) { uint64_t o[5] = {}; char n2[64] = {}; if (ps3_ppu_thread_view(t, o, n2) && (DWORD)o[0] == ht) { gt = t; std::snprintf(nm, sizeof nm, "%s", n2); break; } }
+        std::fprintf(stderr, "[net] NULL-call loop: guest tid %u \"%s\" (host tid %lu) made %u NULL indirect calls within one tick (r3=0x%08X, at tick %u): the game state is broken, the match ends now (JSP_NET_NULLCALL_GUARD=0 turns this off)\n",
+                     gt, nm, (unsigned long)ht, jrg::kNullCallsPerTick, g_nc_r3.load(), g.done_now);
+    }
+    return true;
+}
+
+// STRUCTURAL (test13, JSP_NET_LOADER_WAIT=1, OFF by default): the file loader thread (guest "sp_file_server_load_thread", tid 18 in the field logs) is in no
+// boundary barrier: a rollback in room 34 found it inside a job that the restored memory had not yet given it. With the switch, the boundary waits (at most
+// jrg::kLoaderWaitMs) before the session iteration until the loader sits in its idle wait (lr 0x0052E658) on two samples in a row, so the saves and restores of
+// that iteration see it idle; after jrg::kLoaderMissesOff timeouts in a row the wait is off for the match. Off by default: the idle site was confirmed in 2 matches
+// only, a loader that the main thread must feed would cost every boundary its timeout, and the waits add hitches during loads (KO cut-ins, the fight end).
+uint32_t g_ld_tid = 0; jrg::LoaderGate g_ld; double g_ld_wait_ms = 0, g_ld_wait_max = 0;
+bool loader_wait_on() { static const bool v = [] { char b[8] = {}; return jsp_setting_get("JSP_NET_LOADER_WAIT", b, sizeof b) && b[0] == '1'; }(); return v; }
+void loader_start()
+{
+    g_ld_tid = 0; g_ld = jrg::LoaderGate(); g_ld_wait_ms = g_ld_wait_max = 0;
+    if (!loader_wait_on() || g.bench) return;
+    for (uint32_t t = 1; t < 65; t++) { uint64_t o[5] = {}; char nm[64] = {}; if (ps3_ppu_thread_view(t, o, nm) && !std::strcmp(nm, "sp_file_server_load_thread")) { g_ld_tid = t; break; } }
+    std::fprintf(stderr, "[net] loader boundary wait (JSP_NET_LOADER_WAIT=1): %s\n", g_ld_tid ? ("guest tid " + std::to_string(g_ld_tid)).c_str() : "the loader thread was not found, no wait");
+}
+bool loader_idle_once()
+{
+    static uint32_t kind[65], id[65], obj[65], lr[65]; static uint8_t alive[65], unrel[65]; uint32_t ov = 0, ub = 0;
+    ps3_hle_thread_census(kind, id, obj, lr, alive, unrel, &ov, &ub);
+    return jrg::loader_idle(alive[g_ld_tid] != 0, kind[g_ld_tid], lr[g_ld_tid]);
+}
+void loader_wait()
+{
+    if (!g_ld_tid || g_ld.off) return;
+    const int64_t t0 = qpc_now(); bool idle = false;
+    for (int spins = 0;; spins++) {
+        if (loader_idle_once()) { YieldProcessor(); if (loader_idle_once()) { idle = true; break; } }
+        if (qpc_ms(t0, qpc_now()) > jrg::kLoaderWaitMs) break;
+        if (spins > 20) { Sleep(0); if ((spins & 63) == 0) g.sess.poll(); }
+    }
+    const double ms = qpc_ms(t0, qpc_now()); g_ld_wait_ms += ms; if (ms > g_ld_wait_max) g_ld_wait_max = ms;
+    if (!idle && g_ld.timeouts < 5) std::fprintf(stderr, "[net] loader still busy after %.0f ms at tick %u\n", jrg::kLoaderWaitMs, g.done_now);
+    if (g_ld.result(idle)) std::fprintf(stderr, "[net] loader boundary wait off for this match: %d timeouts in a row\n", jrg::kLoaderMissesOff);
+}
+void loader_end()
+{
+    if (!g_ld_tid) return;
+    std::fprintf(stderr, "[net] loader boundary waits: %llu, mean %.3f ms, max %.1f ms, %llu timeouts%s\n", (unsigned long long)g_ld.waits, g_ld.waits ? g_ld_wait_ms / (double)g_ld.waits : 0.0,
+                 g_ld_wait_max, (unsigned long long)g_ld.timeouts, g_ld.off ? " (turned off)" : "");
+    g_ld_tid = 0;
 }
 // DIAGNOSTIC (JSP_NET_PAGE_DUMP=N, test runs only): every N session ticks of a CONFIRMED tick (a save of a final frame, hash_only), a fingerprint of every committed
 // 4 KB guest page below 0x40000000 is appended to pagedump-<host|join>.bin in the run folder: u32 tick, u32 count, then count x (u32 page index, u64 hash).
@@ -1006,9 +1123,22 @@ void report_start()
     char b[16]; std::snprintf(b, sizeof b, "%08x", build_id()); g_rep.set_build(b);
     for (const jpno::KV& e : jpno::kDefaults) { char v[128] = {}; if (jsp_setting_get(e.k, v, sizeof v)) g_rep.add_setting(e.k, v); }
     { char v[16] = {}; g_rep.add_setting("JSP_SHAREPAD_WATCHDOG", jsp_setting_get("JSP_SHAREPAD_WATCHDOG", v, sizeof v) && v[0] ? v : "1 (default)"); }   // FIX (rematch black screen)
+    // FIX (test13): the rollback guards in effect (jsp_rb_guard.h)
+    for (const char* k : {"JSP_NET_NULLCALL_GUARD", "JSP_NET_REGS_SKIP_FAIL", "JSP_NET_LOADER_WAIT"}) {
+        char v[16] = {}; const bool set = jsp_setting_get(k, v, sizeof v) && v[0];
+        g_rep.add_setting(k, set ? v : !std::strcmp(k, "JSP_NET_NULLCALL_GUARD") ? "1 (default)" : "0 (default)");
+    }
     jsnr::SessionFacts f; f.local_slot = (int)g.plan.local_first; f.players = (int)g.plan.total_players; f.input_delay = g.bv.delay; f.base_tick = g.base;
     f.link = path_word(); g_rep.set_session(f);
     g_rep.add_machine_redactions();
+}
+// DIAGNOSTIC (test13, room 38: the desync tick could not name its part): every committed tick goes to the report with the 8 hash parts of that tick
+// (all rng glob seed setup cam fi pad, jsp_fight_hash.cpp), when the snapshot still holds them.
+std::string jsx_hex8(uint32_t v) { char b[12]; std::snprintf(b, sizeof b, "%08x", v); return b; }
+void report_commit(uint32_t tick, uint32_t hash, uint32_t raw)
+{
+    uint64_t parts[8];
+    g_rep.commit(tick - g.base, hash, raw, jsp_snapshot_ext_parts(tick, parts) ? parts : nullptr);
 }
 void report_write(const std::string& why)
 {
@@ -1084,7 +1214,7 @@ void reset_match()
     g_hz = jph::Match(); g_hz_exit = 0; g_hz_after_rerun = false;   // DIAGNOSTIC (per-hitch line): per match
     g_audio_waits = g_audio_timeouts = 0; g_audio_wait_ms = 0;
     g_hold_ms = 0; g_holds = g_hold_renders = 0;
-    g_regs_saved = g_regs_restored = g_regs_skipped = 0;
+    g_regs_saved = g_regs_restored = g_regs_skipped = 0; g_regs_skip_lines = 0;
     if (g_regs) for (int i = 0; i < kRegRing; i++) { g_regs[i].tick = 0xFFFFFFFFu; g_regs[i].mask = 0; }   // tick numbers repeat in the next fight
     g_ko_track = 0;   // the offline game as before (set again by start_session)
     // ENHANCEMENT (native fight takeover): the game's own online fight code runs as before (arm(0) is a no-op when not armed). DECISION (changed by the native
@@ -1107,6 +1237,8 @@ void end_with(const std::string& text, bool quiet = false)
     jsp_stepper_lockstep(0);
     cri_lock_end();
     guest_clock_end();
+    nullcall_end();   // FIX (test13)
+    loader_end();     // STRUCTURAL (test13): its end line (only when it ran)
     save_replay();   // before the stepper is torn down; the session object still holds the recording after a failure
     if (g.glue) std::fprintf(stderr, "[net] saves %llu, of which without a snapshot (final frame) %llu\n", (unsigned long long)g.glue->commits(), (unsigned long long)g.glue->skipped());
     // DIAGNOSTIC (test12, rollback cost): the re-run saves of rollbacks apart (the ones a replay pays), and the snapshots of exactly the final frame
@@ -1390,6 +1522,7 @@ public:
         const int64_t t0 = g.bench ? qpc_now() : 0;
         const int r = jsp_snapshot_ext_commit(tick, g.ctx, hash);
         if (g.bench) g.bs.save.add(qpc_ms(t0, qpc_now()));
+        if (r == 0 && g_nc_storm.load()) { log("snapshot commit stopped", kNullCallEnd); g.sess.abort(kNullCallEnd); return false; }   // FIX (test13): the end names the loop
         if (r == 0) { log("snapshot commit failed", std::to_string(tick)); return false; }
         if (r == 2) { log("snapshot layout changed", "older rollback targets are gone: ending the session"); return false; }
         const uint32_t raw = *hash;
@@ -1402,7 +1535,7 @@ public:
         regs_save(tick);
         if ((int)(tick - g.base) - 1 < g.sess.final_frame()) page_dump(tick);   // DIAGNOSTIC (JSP_NET_PAGE_DUMP): only a confirmed tick (its save frame is final)
         ko_record(tick);   // FIX (a missed KO): every save, predicted or not (ko_scan ends the match once the tick is confirmed)
-        g_rep.commit(tick - g.base, *hash, raw);
+        report_commit(tick, *hash, raw);
         if (!g.bench && tick_log()) std::fprintf(stderr, "[net] commit tick=%u hash=%08x raw=%08x\n", tick, *hash, raw);   // a two-instance test compares the LAST commit line per tick across the two peers (the bench: no per-tick lines, they would be timed)
         return true;
     }
@@ -1413,7 +1546,7 @@ public:
         if (raw == 0) return false;   // no hash for this tick: the full commit runs (and reports it)
         *hash = raw ^ ((tick - g.base) * 2654435761u);
         if (*hash == 0) *hash = 1;
-        g_rep.commit(tick - g.base, *hash, raw);
+        report_commit(tick, *hash, raw);
         regs_save(tick);
         page_dump(tick);   // DIAGNOSTIC (JSP_NET_PAGE_DUMP): a confirmed tick
         ko_record(tick);
@@ -1427,8 +1560,19 @@ public:
         // (the depth-1 bench stalled before every fight). Kept as it is, at no cost.
         if (tick == g.done_now) return true;
         const int64_t t0 = g.bench ? qpc_now() : 0;
-        const bool ok = jsp_snapshot_ext_rollback(g.done_now, tick, g.ctx) == 1;
+        const int rr = jsp_snapshot_ext_rollback(g.done_now, tick, g.ctx);
+        const bool ok = rr == 1;
         if (g.bench) g.bs.restore.add(qpc_ms(t0, qpc_now()));
+        // FIX (test13, room 34): refused before any memory was touched (a helper thread is still away from where the save saw it): this fight ends in order, the
+        // snapshot is not failed, so the room and the link go on (the other PCs are told by the failure Cancel and re-arm, as after any failure on another player)
+        if (rr == 3) {
+            std::fprintf(stderr, "[net] rollback to tick %u (session tick %u, %u deep) refused: a game helper thread was busy; nothing was restored, this fight ends, the room stays\n",
+                         tick, tick - g.base, g.done_now - tick);
+            g_rep.note("rollback to session tick " + std::to_string(tick - g.base) + " (" + std::to_string(g.done_now - tick) + " deep) refused: a helper thread was away from its save-time wait site");
+            g.sess.abort("rollback refused (a game helper thread was busy at the restore; nothing was restored)");
+            return false;
+        }
+        if (!ok && g_nc_storm.load()) { log("snapshot rollback stopped", kNullCallEnd); g.sess.abort(kNullCallEnd); return false; }
         if (!ok) { log("snapshot rollback failed", std::to_string(tick)); return false; }
         jpnb::note_rollback(g.bv, (int64_t)g.done_now - (int64_t)tick);
         adapt_note_rollback((int64_t)g.done_now - (int64_t)tick);   // ENHANCEMENT (adaptive input delay, rule 2): the depth trigger
@@ -1440,7 +1584,12 @@ public:
         // (voices ended later on the copy with more rollbacks). The boundary that follows mixes them again.
         if (g_ps3_audio_lock_target >= 0) ps3_audio_lock_rewind(tick > g.base ? audio_blocks_at(tick - 1) : 0);
         g_ko.drop_after(tick);   // FIX (a missed KO): those ticks run again; their re-saves record them anew
-        regs_restore(tick);   // FIX (helper thread registers): back to what they held at that save   // the audio goes back with the tick (the mix thread is idle here)   // the ticks gone back and run again (status badge and status line)
+        const uint32_t regs_skips = regs_restore(tick);   // FIX (helper thread registers): back to what they held at that save
+        if (regs_skips) {   // FIX (test13): logged per thread in regs_restore; the report keeps the first ones
+            if (g_regs_skip_lines <= 4) g_rep.note("helper thread registers: " + std::to_string(regs_skips) + " not written back at the rollback to session tick " + std::to_string(tick - g.base) + " (see the log)");
+            // FIX (test13 review): the memory is already at `tick`: the end (stepper replay off, the local continuation) must see that tick
+            if (regs_skip_fail_on()) { g.done_now = tick; g.sess.abort("helper thread registers could not be written back after a rollback (JSP_NET_REGS_SKIP_FAIL=1)"); return false; }
+        }
         g.done_now = tick;
         if (!g.bench && tick_log()) std::fprintf(stderr, "[net] rollback to tick=%u (longest game-thread stretch without a session call since the last rollback: %u ms, keepalive polls so far: %llu)\n", tick, g.sess.take_max_gap_ms(), (unsigned long long)g.sess.keepalive_polls());
         return true;
@@ -1800,6 +1949,8 @@ void start_session(ppu_context* c)
     jsp_stepper_lockstep(1);   // FIX (rollback determinism): 2 vblanks per flip in the live ticks too (jsp_stepper.cpp)
     guest_clock_start();
     cri_lock_start();
+    nullcall_start();   // FIX (test13): the NULL-call loop guard (JSP_NET_NULLCALL_GUARD)
+    loader_start();     // STRUCTURAL (test13): the loader boundary wait (JSP_NET_LOADER_WAIT=1 only)
     jsp_sound_preload_fight_start();   // FIX (test8 sound-barrier hitches): logs how much of the sound archive is still in RAM, reads the rest again
     show("Connecting to opponent...");
 }
@@ -2012,6 +2163,9 @@ void boundary(ppu_context* c)
         jpperf::on_frame(g_perf, pn, !g.was_replaying, g.bv.delay);
         if (jpperf::wants_ack(g_perf)) jpperf::on_ack(g_perf, pn, g.sess.stats().acked_frame);
     }
+    // FIX (test13, room 34): a guest thread loops on NULL calls (the guest state is broken): end now, the other PCs are told why (the gate gave up on it already)
+    if (nullcall_tick()) { g.sess.abort(kNullCallEnd); send_failure_cancel(); end_with(std::string("Match ended: ") + kNullCallEnd); return; }
+    if (loader_wait_on() && !g.bench) loader_wait();   // STRUCTURAL (test13, off by default): the saves / restores of this iteration see the loader idle
     const int64_t hz_s0 = hz.armed ? qpc_now() : 0;   // DIAGNOSTIC (per-hitch line): the session part (GekkoNet update, the save or restore it calls, the time-sync stretch)
     const uint64_t u0 = g.glue->updates();
     jsx::Op op = g.glue->iteration(true);   // update is called whenever the stepper has nothing queued (skipping it for pacing stalled both peers in a two-copy test)
@@ -2041,6 +2195,7 @@ void boundary(ppu_context* c)
         const int64_t h0 = qpc_now();
         while (op.kind != jsx::OpKind::Run && qpc_ms(h0, qpc_now()) < 400.0 && !g.sess.failed()) {
             Sleep(1); g.sess.poll();
+            if (loader_wait_on()) loader_wait();   // STRUCTURAL (test13, off by default): as before the first iteration
             const uint64_t u1 = g.glue->updates();
             const int64_t hu0 = hz.armed ? qpc_now() : 0;   // DIAGNOSTIC (per-hitch line): the update and any save it calls are session time, not hold
             op = g.glue->iteration(true);
@@ -2051,7 +2206,10 @@ void boundary(ppu_context* c)
         g_jsp_main_stage = 5;
     }
     int events_ff = -1;   // FIX (review of PR 248): GekkoNet's final frame read with the events, under the session lock (the live watermark below)
-    for (const SessionEvent& e : g.sess.take_events(&events_ff)) {
+    std::vector<SessionEvent> evs = g.sess.take_events(&events_ff);
+    // FIX (test13, room 38): a Desync in the same batch as a Disconnected (the PC that found the split leaves right after it) is handled first, so this PC names it
+    jrg::desync_first(evs, [](const SessionEvent& x) { return x.kind == SessionEventKind::Desync; });
+    for (const SessionEvent& e : evs) {
         switch (e.kind) {
         case SessionEventKind::Started: log("gekko session synchronized", ""); if (!g.path_line.empty()) { show(g.path_line); g.path_until = GetTickCount64() + 6000; } else show(""); break;
         case SessionEventKind::Disconnected:   // GekkoNet fires it after the disconnect timeout = the grace window: the match is over
@@ -2083,8 +2241,14 @@ void boundary(ppu_context* c)
                 if (g.bs.desyncs++ < 20) std::fprintf(stderr, "[bench] RE-RUN DIFFERS at tick %d (session-relative; base %u): first run %08x, re-run %08x\n", e.tick, g.base, e.remote_hash, e.local_hash);
                 break;
             }
-            std::fprintf(stderr, "[net] DESYNC at tick %u (stepper tick numbering, session-relative; add the base %u): local=%08x remote=%08x\n", (unsigned)e.tick, g.base, e.local_hash, e.remote_hash);
+            std::fprintf(stderr, "[net] DESYNC at tick %u (stepper tick numbering, session-relative; add the base %u): local=%08x remote=%08x (player %d)\n", (unsigned)e.tick, g.base, e.local_hash, e.remote_hash, e.handle + 1);
             if (e.tick <= 3) std::fprintf(stderr, "[net] base mismatch suspected: the desync is at the first compared ticks; the two peers probably armed at different ticks (local base %u; the base is part of the per-tick hash, it is not exchanged)\n", g.base);
+            // FIX (test13, room 38: only 3 of 4 PCs logged the desync): GekkoNet queues this PC's checksum of the compared frame in the same update that found
+            // the split and sends it at the next poll. The abort below leaves the session (gekko_disconnect_actor), which marks every peer disconnected BEFORE it
+            // flushes, and a disconnected peer gets no broadcast (backend.cpp SendDataToAll): the checksum never left. One poll first sends it to every peer while
+            // they are still connected, so each of them finds the same split and logs DESYNC with both hashes (instead of "Connection lost").
+            g.sess.poll();
+            g_rep.note("desync at session tick " + std::to_string(e.tick) + ": local " + jsx_hex8(e.local_hash) + ", remote " + jsx_hex8(e.remote_hash) + " (player " + std::to_string(e.handle + 1) + ")");
             g.sess.abort("desync detected"); end_with("Desync detected: match ended"); return;
         default: break;
         }

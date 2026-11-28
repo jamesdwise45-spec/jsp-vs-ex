@@ -1,7 +1,7 @@
 // Host test of installer/port/jsp/jsp_net_report.h, the online match report: ring wraparound order (oldest first), the size bound with every
 // field at its limit, the sanitiser (IPv4 with and without a port, IPv6 forms, home folders in Windows, WSL and POSIX spellings, redaction
 // words, things that must stay: times, versions, loopback), the file name and the "-2" name of a second report in the same second, the file
-// written byte for byte, and the report of a match that never started. Run: installer/tools/net_report_test.sh [SCRATCH_DIR].
+// written byte for byte, the report of a match that never started, and the 8 hash parts of a commit line (FIX test13). Run: installer/tools/net_report_test.sh [SCRATCH_DIR].
 #include "../port/jsp/jsp_net_report.h"
 #include <algorithm>
 #include <cstdio>
@@ -121,7 +121,8 @@ static void test_size()
     rep.add_redaction("nnn");   // every note expands ~3.7x before the cut
     rep.set_end_reason(std::string(100000, 'e'));
     rep.set_session(SessionFacts{0, 4, 9, 0xFFFFFFFFu, std::string(5000, 'l')});
-    for (uint32_t t = 0; t < 100000; t++) { rep.commit(0xFFFFFFF0u + t, ~0ull, ~0ull); rep.rollback(0xFFFFFFFFu, 0xFFFFFFFFu); }
+    const uint64_t parts[kParts] = {1, 2, 3, 4, 5, 6, 7, 8};   // FIX (test13): every kept commit line with its 8 parts (the widest line)
+    for (uint32_t t = 0; t < 100000; t++) { rep.commit(0xFFFFFFF0u + t, ~0ull, ~0ull, parts); rep.rollback(0xFFFFFFFFu, 0xFFFFFFFFu); }
     const std::string txt = rep.render(kWhen);
     std::printf("size: worst case %zu bytes (limit %zu)\n", txt.size(), kMaxBytes);
     CHECK(txt.size() < kMaxBytes);
@@ -166,11 +167,32 @@ static void test_file_and_empty(const std::string& dir)
     std::printf("file: ok\n");
 }
 
+// DIAGNOSTIC (test13, room 38): a commit with its 8 hash parts gets them as 8 more columns (each 64-bit part folded to 32 bits, hi ^ lo); one without keeps three.
+static void test_parts()
+{
+    Report rep;
+    const uint64_t parts[kParts] = {0x5c1de8c456a4bb35ull, 0x1af7eedaf3969e31ull, 0xd0e95901ull, 0xed6d627295bf0e25ull, 0x9dfb20e5ull << 32, 1, 0, 0xFFFFFFFFFFFFFFFFull};
+    rep.commit(3589, 0xdb69cb1f, 0xc4d4c56a);
+    rep.commit(3590, 0xd7f0a6fa, 0x6a042edc, parts);
+    rep.commit(3591, 0x1, 0x2, nullptr);
+    CHECK(rep.commits().at(1).has_parts && !rep.commits().at(0).has_parts && !rep.commits().at(2).has_parts);
+    CHECK(fold_part(0x5c1de8c456a4bb35ull) == (0x5c1de8c4u ^ 0x56a4bb35u) && fold_part(0xFFFFFFFFFFFFFFFFull) == 0);
+    const std::string txt = rep.render(kWhen);
+    char want[200];
+    std::snprintf(want, sizeof want, "\n3590 %016llx %016llx %08x %08x %08x %08x %08x %08x %08x %08x\n", 0xd7f0a6faull, 0x6a042edcull, 0x5c1de8c4u ^ 0x56a4bb35u,
+                  0x1af7eedau ^ 0xf3969e31u, 0xd0e95901u, 0xed6d6272u ^ 0x95bf0e25u, 0x9dfb20e5u, 1u, 0u, 0u);
+    CHECK(has(txt, want));
+    CHECK(has(txt, "\n3589 00000000db69cb1f 00000000c4d4c56a\n") && has(txt, "\n3591 0000000000000001 0000000000000002\n"));
+    CHECK(has(txt, "count: 3  kept: 3 (oldest first: tick hash raw, hex; then, when known, the parts all rng glob seed setup cam fi pad, each folded to 32 bits)\n"));
+    std::printf("parts: ok\n");
+}
+
 int main(int argc, char** argv)
 {
     test_ring();
     test_sanitize();
     test_size();
+    test_parts();
     const char* tmp = std::getenv("TMPDIR") ? std::getenv("TMPDIR") : std::getenv("TEMP") ? std::getenv("TEMP") : "/tmp";
     test_file_and_empty(argc > 1 ? argv[1] : tmp);   // write() goes to SCRATCH_DIR, else the temp folder (removed again)
     std::printf("%s (%d failures)\n", fails ? "FAIL" : "PASS", fails);

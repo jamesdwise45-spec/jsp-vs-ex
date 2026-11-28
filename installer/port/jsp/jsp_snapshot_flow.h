@@ -9,13 +9,17 @@
 //   * when the driver finishes (including when the last round was just aborted or diverged) the run is reported and cleaned up exactly once.
 // Env interface (all return false on a fatal failure that already ran capture_failed):
 //   bool on();  bool ring_valid();  bool layout_changed(k)   (logs the diff)   bool baseline(k)  bool rebaseline(k)
-//   bool commit(k)  bool rollback(k, to)  void saved(k)  (a round starts at k: save bookkeeping)  void restored()  void flush_rounds()  void finish()
+//   bool commit(k)  bool rollback(k, to)  bool refused()  (the last rollback was refused by the site rule: nothing restored, nothing failed)  void saved(k)  (a round starts at k: save bookkeeping)  void restored()  void flush_rounds()  void finish()
 //   void note(const char*, k)  void rng(const char* what, k)
 #pragma once
 #include <cstdint>
 #include "jsp_snapshot_core.h"
 
 namespace jsf {
+
+// FIX (test13): jsp_snapshot_ext_rollback's result: 1 restored, 3 refused by the site rule before any memory was touched (nothing failed: the snapshot is still on),
+// 0 failed (capture_failed ran, or nothing to roll back).
+inline int ext_rollback_code(bool ok, bool refused, bool still_on) { return ok ? 1 : (refused && still_on) ? 3 : 0; }
 
 template<class Env>
 void ww_pass_end(Env& e, jss::Driver& d, uint32_t k, const jss::Rec& rec)
@@ -60,7 +64,21 @@ void ww_pass_end(Env& e, jss::Driver& d, uint32_t k, const jss::Rec& rec)
         if (d.finished()) e.finish();
         return;
     }
-    if (a == jss::Act::Restore) { if (e.rollback(k, d.rewind_to())) e.restored(); e.flush_rounds(); return; }
+    if (a == jss::Act::Restore) {
+        if (e.rollback(k, d.rewind_to())) e.restored();
+        else if (e.on() && e.refused()) {   // FIX (test13 review): nothing was restored, so the replay cannot be compared: the round is refused (aborted), not run on
+            e.note("rollback refused by the site rule: round aborted, nothing rolled back", k);
+            const jss::Act next = d.refuse_round(k);
+            if (!d.finished()) {
+                if (next == jss::Act::Save) e.saved(k);
+                if (!e.commit(k)) { e.flush_rounds(); return; }   // tick k was not committed (the rollback request came instead); the next round starts from it
+            }
+            e.flush_rounds();
+            if (d.finished()) e.finish();
+            return;
+        }
+        e.flush_rounds(); return;
+    }
     if (ended) { e.flush_rounds(); e.finish(); return; }
     if (a == jss::Act::Save) e.saved(k);               // the next round starts here; the ring already holds this tick
     if (!e.commit(k)) { e.flush_rounds(); return; }
