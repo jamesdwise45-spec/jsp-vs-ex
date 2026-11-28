@@ -2720,7 +2720,7 @@ void pick_frame()
     static const int native_page = native_sel ? 0 : native_page_set;   // JSP_PICK_NATIVE_SELECT=1 replaces the host-only page
     bool page_give_up = false;
     jspf::Act act = jspf::Act::None;
-    bool open = false, host = false, picking = false, start_ok = false, rematch = false, capture = false, block = false; int nplayers = 2;
+    bool open = false, host = false, picking = false, start_ok = false, rematch = false, capture = false, block = false, room_teams = true; int nplayers = 2;
     std::string outcome_text, round_status; jspg::View v; int lock_secs = -1;
     std::vector<std::string> who;   // one line per player's pick (Select character), for everyone to see
     jpskin::View pn;
@@ -2876,7 +2876,7 @@ void pick_frame()
             }
             if (f.pick_on() && !rematch)
                 for (int p = 0; p < f.players(); p++) who.push_back(jspf::pick_line(p, f.me(), f.round().pick_of(p), f.round().locked_of(p)));
-            start_ok = f.start_ok(); nplayers = f.players();
+            start_ok = f.start_ok(); nplayers = f.players(); room_teams = f.room_teams();
             // FIX (review): the host's own Cross on the room page cannot start the fight before every PC committed the round (by hand, in the
             // by-hand drive, with JSP_PICK_HOST_START=0); outside the room it stays free (the auto-skip and the player go through the screens with it).
             // TODO-MAPPING (U4): relies on the room-page targets (JSP_PICK_ROOM_TG) being seen while the room page is up.
@@ -2979,6 +2979,7 @@ void pick_frame()
             const char* t = nplayers == 2 ? (u.together ? "P1 + P2 vs 2 COMs" : "P1 + COM vs P2 + COM")
                           : nplayers == 3 ? (u.together ? "P1 + P2 vs P3 + COM" : "P1 + P3 vs P2 + COM")
                           : (u.together ? "P1 + P2 vs P3 + P4" : "P1 + P3 vs P2 + P4");
+            if (room_teams && !u.together) t = "As chosen in the room";   // FIX (test13): jspk::ROOM keeps the room's own teams (JSP_PICK_ROOM_TEAMS)
             pn.rows.push_back({ "Teams", t });
         }
         pn.lines.push_back(Line{ round_status, jpskin::WHITE });

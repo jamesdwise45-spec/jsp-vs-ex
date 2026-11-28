@@ -6,7 +6,9 @@
 // 1. The pick message (link tag kTag 'C'; the net code puts the tag byte in front, like the 'P' post-game message). kMsgLen = 18 bytes:
 //      [0] kMagic 0xC5  [1] kVersion 1  [2..5] session tag (u32 LE, session_tag() of the link's plan session id, never 0)
 //      [6..7] seq (u16 LE, the post-game seq = the match number that ended)  [8..9] rev (u16 LE)  [10..11] fighter id (u16 LE)
-//      [12..13] support id (u16 LE)  [14] flags: bit 0 locked, bit 1 in room, bit 2 team mode Together (0 = Versus), bits 3-7 zero
+//      [12..13] support id (u16 LE)  [14] flags: bit 0 locked, bit 1 in room, bit 2 team mode Together (0 = Versus), bit 3 room teams
+//      (test13: the sender keeps the room's own teams, JSP_PICK_ROOM_TEAMS; an older build refuses the bit, so a mixed-build round is LOST,
+//      never applied two ways), bits 4-7 zero
 //      [15] sender's player index 0..3 (0 = the room owner / host), bits 2-7 zero  [16] saw: bit i = I hold player i's locked pick
 //      (bits 4-7 zero)  [17] check: XOR of bytes 0..16 with 0x3C.
 //    decode() refuses a wrong length, magic, version, reserved bit, check byte or a zero session tag. A message of another link
@@ -23,15 +25,28 @@
 //    "Connection lost" (the net code then ends the round for everyone, as a LEAVE); locked but not READY idle_ms + wait_ms after start ->
 //    LOST. take() resends every resend_ms until stop() (the net code stops it when the next fight runs or the link closes), and for
 //    linger_ms after LOST.
-//    Team mode: each player's pick carries a wish (Versus / Together); the HOST's wish (player 0) decides (agreed_mode()). The others'
-//    wishes are only shown ("Host chose Together"). Rule picked because it is one source, needs no extra round, and is the same on every PC.
+//    Team mode: each player's pick carries a wish (Versus / Together) and the room-teams bit; the HOST's pick (player 0) decides
+//    (agreed_mode(): Together if it wished Together, else ROOM if its room bit is set, else Versus). The others' wishes are only shown
+//    ("Host chose Together"). Rule picked because it is one source, needs no extra round, and is the same on every PC.
+//    FIX (test13, testers: "doesn't let us be in teams ... 2 players vs cpu"): ROOM is the default (Pick::room = true; the host's
+//    JSP_PICK_ROOM_TEAMS=0 turns it off for the link): the teams the players chose in the room stand after Select character / Fight again.
 //
 // 3. roster_apply(): the roster write at the battle builder's entry (0x002EEE90), the same code on every PC. Input: the room's 4 fighter
 //    records and team fields as the host's broadcast left them (equal on all PCs), the N human picks with their room member ids, and the
 //    agreed team mode. Output: the 4 records and the 2 team supports. A fight is always 2 against 2 (4 records, empty ones COM).
 //      - The records with the COM flag (+0x1A) 0 are the humans: there must be exactly N, and their member ids must be exactly the picks'
 //        member ids (distinct, non-zero). Anything else is refused (Result) and the native roster stands.
-//      - Humans per team: Versus splits them evenly (N = 2: 1 + 1, N = 3: 2 + 1, N = 4: 2 + 2); Together puts them on one team where they
+//      - FIX (test13) ROOM (the default agreed mode): the records' own team bytes are the players' choice in the room (the host's broadcast,
+//        the same bytes the game's own builder places from). VALID = every one of the 4 records has team byte 0 or 1 and each team has
+//        exactly 2 records (a fight is 2 against 2). Any human split is then kept as it is: N = 2: 1 + 1 or 2 + 0 (both humans against two
+//        COMs); N = 3: 2 + 1; N = 4: 2 + 2 in any pairing. No team byte changes (moved = 0).
+//        NOT VALID (a byte 2 = unset or junk, 3 + 1, 4 + 0): the nearest valid layout, keeping as many choices as fit, humans first:
+//        (1) humans in member-id order keep their team while it has room (< 2 records); (2) the humans left (unset byte, or their team
+//        was full) go to the team with room that has fewer humans so far (a tie: team 0), so unset humans are spread out; (3) COMs in
+//        record order keep their team while it has room; (4) the COMs left fill the team with room (team 0 first). E.g. all 4 on team 0
+//        with 2 humans: the humans stay together on 0, the COMs go to 1; 4 humans on team 0: members 1, 2 stay, 3, 4 go to team 1;
+//        3 humans on 0 + a COM on 1: the two lowest member ids stay, the third joins the COM. Same function of R and the picks on every PC.
+//      - Humans per team (VERSUS / TOGETHER): Versus splits them evenly (N = 2: 1 + 1, N = 3: 2 + 1, N = 4: 2 + 2); Together puts them on one team where they
 //        fit (N = 2: 2 + 0, N = 3: 2 + 1, N = 4: 2 + 2). If the records already have that split (and every team byte is 0/1, 2 per team),
 //        no team byte changes. Otherwise: the anchor team A = the team of the lowest member id human (0 if its byte is not 0/1), humans in
 //        member-id order go Versus: A, B, A, B; Together: A, A, B, B. COMs fill the rest: in record order a COM keeps its team while that
@@ -62,17 +77,20 @@ inline constexpr uint16_t kRandom = 0x133;                     // the game's "Ra
 inline constexpr uint16_t kHostMember = 1, kJoinMember = 2;    // room member ids of the owner and the first joiner (U5: always 1 / 2?)
 inline constexpr int kMaxPlayers = 4;
 
-enum TeamMode : uint8_t { VERSUS = 0, TOGETHER = 1 };
+// ROOM (test13): keep the room's own teams (see 3.); only agreed_mode() gives it, a Pick's own wish is VERSUS / TOGETHER plus Pick::room.
+enum TeamMode : uint8_t { VERSUS = 0, TOGETHER = 1, ROOM = 2 };
+inline const char* team_mode_text(TeamMode m) { return m == TOGETHER ? "together" : m == ROOM ? "room teams" : "versus"; }
 
 // ---- 1. the message ----
 inline constexpr uint8_t kTag = 'C';
 inline constexpr uint8_t kMagic = 0xC5, kVersion = 1;
 inline constexpr size_t kMsgLen = 18;
-inline constexpr uint8_t kFlagLocked = 1, kFlagInRoom = 2, kFlagTogether = 4;
+inline constexpr uint8_t kFlagLocked = 1, kFlagInRoom = 2, kFlagTogether = 4, kFlagRoomTeams = 8;
 
 struct Pick {
     uint16_t fighter = kRandom, support = kRandom;
-    TeamMode mode = VERSUS;   // this player's wish; only the host's counts (agreed_mode)
+    TeamMode mode = VERSUS;   // this player's wish (VERSUS / TOGETHER); only the host's counts (agreed_mode)
+    bool room = true;         // FIX (test13): keep the room's teams unless Together (jspf::Flow stamps its JSP_PICK_ROOM_TEAMS); only the host's counts
     bool operator==(const Pick&) const = default;
 };
 struct Msg {
@@ -96,7 +114,8 @@ inline void encode(const Msg& m, uint8_t out[kMsgLen])
     out[8] = (uint8_t)m.rev; out[9] = (uint8_t)(m.rev >> 8);
     out[10] = (uint8_t)m.pick.fighter; out[11] = (uint8_t)(m.pick.fighter >> 8);
     out[12] = (uint8_t)m.pick.support; out[13] = (uint8_t)(m.pick.support >> 8);
-    out[14] = (uint8_t)((m.locked ? kFlagLocked : 0) | (m.in_room ? kFlagInRoom : 0) | (m.pick.mode == TOGETHER ? kFlagTogether : 0));
+    out[14] = (uint8_t)((m.locked ? kFlagLocked : 0) | (m.in_room ? kFlagInRoom : 0) | (m.pick.mode == TOGETHER ? kFlagTogether : 0) |
+                        (m.pick.room ? kFlagRoomTeams : 0));
     out[15] = (uint8_t)(m.player & 3);
     out[16] = (uint8_t)(m.saw & 0x0F);
     uint8_t x = 0x3C; for (size_t i = 0; i < kMsgLen - 1; i++) x ^= out[i];
@@ -104,7 +123,7 @@ inline void encode(const Msg& m, uint8_t out[kMsgLen])
 }
 inline bool decode(const uint8_t* p, size_t n, Msg* m)
 {
-    if (!p || !m || n != kMsgLen || p[0] != kMagic || p[1] != kVersion || (p[14] & 0xF8) || (p[15] & 0xFC) || (p[16] & 0xF0)) return false;
+    if (!p || !m || n != kMsgLen || p[0] != kMagic || p[1] != kVersion || (p[14] & 0xF0) || (p[15] & 0xFC) || (p[16] & 0xF0)) return false;
     uint8_t x = 0x3C; for (size_t i = 0; i < kMsgLen - 1; i++) x ^= p[i];
     if (x != p[17]) return false;
     Msg r;
@@ -113,6 +132,7 @@ inline bool decode(const uint8_t* p, size_t n, Msg* m)
     r.seq = (uint16_t)(p[6] | p[7] << 8); r.rev = (uint16_t)(p[8] | p[9] << 8);
     r.pick.fighter = (uint16_t)(p[10] | p[11] << 8); r.pick.support = (uint16_t)(p[12] | p[13] << 8);
     r.pick.mode = (p[14] & kFlagTogether) ? TOGETHER : VERSUS;
+    r.pick.room = (p[14] & kFlagRoomTeams) != 0;
     r.locked = (p[14] & kFlagLocked) != 0; r.in_room = (p[14] & kFlagInRoom) != 0;
     r.player = p[15]; r.saw = p[16];
     *m = r;
@@ -136,8 +156,26 @@ inline uint32_t idle_ms_from(const char* v)
     return s >= 30 && s <= 600 ? s * 1000 : kIdleMs;
 }
 
-// The agreed team mode: the host's (player 0) wish.
-inline TeamMode agreed_mode(const Pick* by_player) { return by_player[0].mode; }
+// The agreed team mode: the host's (player 0) pick. Together wins (the port picker's explicit row, JSP_ONLINE_TEAMS=together); else its room bit.
+inline TeamMode agreed_mode(const Pick* by_player)
+{
+    const Pick& h = by_player[0];
+    return h.mode == TOGETHER ? TOGETHER : h.room ? ROOM : VERSUS;
+}
+
+// FIX (test13): JSP_PICK_ROOM_TEAMS, read by jspf::Flow::open and carried in this PC's pick (only the host's counts, so every PC applies the
+// same mode whatever the joiners' settings). "0" = off (the old Versus rebuild after a pick), "1" = on; unset / other = on, except when this
+// PC turned the versus safeguard back on (JSP_ONLINE_VERSUS_DEFAULT=1, versus_on): then the old rebuild, which the safeguard was built with.
+inline constexpr const char* kRoomTeamsKey = "JSP_PICK_ROOM_TEAMS";
+inline constexpr const char* kVersusKey = "JSP_ONLINE_VERSUS_DEFAULT";
+// The 2-human versus safeguard (jsp_net_native.cpp versus_apply): FIX (test13) off unless exactly "1" (it was on unless "0").
+inline bool versus_on(const char* v) { return v && v[0] == '1' && !v[1]; }
+inline bool room_teams_from(const char* v, const char* versus)
+{
+    if (v && v[0] == '0' && !v[1]) return false;
+    if (v && v[0] == '1' && !v[1]) return true;
+    return !versus_on(versus);
+}
 
 enum State : uint8_t { IDLE = 0, PICKING = 1, LOCKED = 2, READY = 3, LOST = 4 };
 enum Reason : uint8_t { R_NONE = 0, R_LINK_LOST = 1, R_PEER_TIMEOUT = 2 };
@@ -404,7 +442,41 @@ inline const char* result_text(Result r)
 struct ApplyInfo {
     int human_rec[kMaxPlayers] = { -1, -1, -1, -1 };   // record index of each human, in member-id order
     int moved = 0;                                       // records whose team changed
+    bool room_fixed = false;                             // ROOM: the room's teams were not a valid 2 + 2 and were brought to the nearest one
 };
+
+// FIX (test13): the ROOM rule's "valid": every record's team byte is 0 or 1 and each team has exactly 2 records.
+inline bool room_teams_valid(const Roster& in)
+{
+    int c[2] = { 0, 0 };
+    for (int i = 0; i < 4; i++) { const uint8_t t = in.rec[i].team(); if (t > 1) return false; c[t]++; }
+    return c[0] == 2 && c[1] == 2;
+}
+// The nearest valid layout of a non-valid one (see 3. at the top). hum[0..n-1] = the human records in member-id order. Writes the teams of r.
+inline void room_teams_fix(const Roster& in, const int* hum, int n, Roster& r)
+{
+    int room[2] = { 2, 2 }, humans[2] = { 0, 0 };
+    bool placed[4] = {};
+    for (int i = 0; i < n; i++) {   // (1) a human keeps its team while it has room
+        const uint8_t t = in.rec[hum[i]].team();
+        if (t <= 1 && room[t] > 0) { r.rec[hum[i]].set_team(t); room[t]--; humans[t]++; placed[hum[i]] = true; }
+    }
+    for (int i = 0; i < n; i++) {   // (2) the other humans: the team with room and fewer humans (a tie: team 0)
+        if (placed[hum[i]]) continue;
+        const uint8_t t = room[0] == 0 ? 1 : room[1] == 0 ? 0 : humans[1] < humans[0] ? 1 : 0;
+        r.rec[hum[i]].set_team(t); room[t]--; humans[t]++; placed[hum[i]] = true;
+    }
+    for (int i = 0; i < 4; i++) {   // (3) a COM keeps its team while it has room
+        if (placed[i]) continue;
+        const uint8_t t = in.rec[i].team();
+        if (t <= 1 && room[t] > 0) { r.rec[i].set_team(t); room[t]--; placed[i] = true; }
+    }
+    for (int i = 0; i < 4; i++) {   // (4) the rest fill the team with room
+        if (placed[i]) continue;
+        const uint8_t t = room[0] > 0 ? 0 : 1;
+        r.rec[i].set_team(t); room[t]--; placed[i] = true;
+    }
+}
 
 // How many humans go on the anchor team / the other team.
 inline void human_split(int n, TeamMode mode, int* on_a, int* on_b)
@@ -437,14 +509,23 @@ inline Result roster_apply(const Roster& in, const HumanPick* picks, int n, Team
     if (nh != n) return Result::HumansMismatch;
 
     Roster r = in;
-    // teams: keep them when they already give the mode's split, else rebuild from the anchor team
+    if (mode == ROOM && !room_teams_valid(in)) {   // FIX (test13): the room's own teams when they are a valid 2 + 2, else the nearest valid layout
+        room_teams_fix(in, ai.human_rec, n, r);
+        ai.room_fixed = true;
+        for (int i = 0; i < 4; i++) {
+            if (r.rec[i].team() == in.rec[i].team()) continue;
+            ai.moved++;
+            if (in.slot_team[i] <= 1) r.slot_team[i] = r.rec[i].team();
+        }
+    }
+    // teams (VERSUS / TOGETHER): keep them when they already give the mode's split, else rebuild from the anchor team
     int on_a = 0, on_b = 0;
     human_split(n, mode, &on_a, &on_b);
     int hum_team[2] = { 0, 0 }, all_team[2] = { 0, 0 };
     bool bytes_ok = true;
     for (int i = 0; i < 4; i++) { const uint8_t t = in.rec[i].team(); if (t > 1) bytes_ok = false; else { all_team[t]++; if (!in.rec[i].com()) hum_team[t]++; } }
-    const bool split_ok = bytes_ok && all_team[0] == 2 && all_team[1] == 2 &&
-                          ((hum_team[0] == on_a && hum_team[1] == on_b) || (hum_team[1] == on_a && hum_team[0] == on_b));
+    const bool split_ok = mode == ROOM || (bytes_ok && all_team[0] == 2 && all_team[1] == 2 &&
+                          ((hum_team[0] == on_a && hum_team[1] == on_b) || (hum_team[1] == on_a && hum_team[0] == on_b)));
     if (!split_ok) {
         const uint8_t t0 = in.rec[ai.human_rec[0]].team();
         const uint8_t A = t0 <= 1 ? t0 : 0, B = (uint8_t)(A ^ 1);

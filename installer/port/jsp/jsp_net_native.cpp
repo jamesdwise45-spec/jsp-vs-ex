@@ -213,7 +213,14 @@ bool plausible_obj(uint32_t r3) { return r3 >= 0x10000u && r3 < 0xF0000000u && !
 void per_second_and_scene();
 uint32_t share_pad_obj();
 
-/* ---- JSP_ONLINE_VERSUS_DEFAULT (on unless 0; only with the game's own online on): two humans fight each other ----
+/* ---- JSP_ONLINE_VERSUS_DEFAULT (FIX test13: OFF unless exactly 1; only with the game's own online on): two humans fight each other ----
+ * FIX (test13, testers: "doesn't let us be in teams ... in 2 players vs cpu"): the Friendly Match room DOES let each player pick a team
+ * colour, and this safeguard swapped a human with a COM on every room / loading update whenever both humans chose one colour, so two
+ * friends could never team up against the COMs. Off by default now: the room's own teams stand (the builder places from them and the
+ * rollback fighter map pairs pads and fighters by member id, jnf::net_ports, so any layout keeps each pad on its own fighter). After a
+ * Select character / Fight again the roster write keeps them too (jspk::ROOM, JSP_PICK_ROOM_TEAMS). JSP_ONLINE_VERSUS_DEFAULT=1 brings the
+ * swap back; it is this PC's own setting, so it must be the same on both PCs (a PC that swaps while the other does not builds another fight).
+ * The original note:
  * The Friendly Match battle settings (Square in the room) hold only character, stage and BGM; there is no team, COM-count or
  * 1v1 option: a fight is always 2v2 (4 fighter slots, empty ones COM). The room data R = *(0x0095839C) (0x14C bytes, ctor
  * 0x0029FB20) has one team byte a slot at R+0x56..0x59 (2 = not set) and 4 fighter records R+0x68 + 0x24*i (read by 0x0029ED60):
@@ -267,7 +274,8 @@ void pick_roster_apply(const char* where, bool quiet_if_same)
     int written = 0;
     for (uint32_t i = 0; i < jspk::kRoomSize; i++) if (img[i] != before[i]) { vm_write8(R + i, img[i]); written++; }
     if (quiet_if_same && !written) return;
-    NLOG("[online] pick roster (%s): %d players, %s, members %s, %d record(s) moved, %d byte(s) written\n", where, p.n, p.mode() == jspk::TOGETHER ? "together" : "versus",
+    NLOG("[online] pick roster (%s): %d players, %s%s, members %s, %d record(s) moved, %d byte(s) written\n", where, p.n, jspk::team_mode_text(p.mode()),
+         p.mode() != jspk::ROOM ? "" : ai.room_fixed ? " (the room's teams were not 2 + 2: nearest valid layout)" : " (the room's teams kept)",
          jspf::member_map_text(how), ai.moved, written);
     for (int r = 0; r < 4; r++) {
         const uint8_t* q = img + jspk::kOffRecords + jspk::kRecSize * (uint32_t)r;
@@ -805,12 +813,13 @@ extern "C" void jsp_register_native_online(void)
         const char* dd = std::getenv("JSP_DISCORD");
         g_discord_nav = !(dn && dn[0] == '0') && !(dd && dd[0] == '0') && std::getenv("PS3_NET_ONLINE") != nullptr;
     }
-    {   /* players-versus safeguard: ON by default when the game's own online is on (JSP_ONLINE_VERSUS_DEFAULT=0 turns it off). FIX (2026-11-21):
-         * runs native-rm5 and native-gin3 put both humans on one team against two COMs in every match (4 of 4), so the swap is needed; the
-         * runs native-vs1/vs2 had them apart by chance. */
-        const char* vd = std::getenv("JSP_ONLINE_VERSUS_DEFAULT");
-        g_versus = !(vd && vd[0] == '0') && std::getenv("PS3_NET_ONLINE") != nullptr;
-        if (g_versus) NLOG("[online] versus safeguard on: 2 humans in a Friendly Match fight each other, each with a COM partner (JSP_ONLINE_VERSUS_DEFAULT=0 turns it off)\n");
+    {   /* players-versus safeguard. FIX (test13): OFF by default, the room's own teams stand (JSP_ONLINE_VERSUS_DEFAULT=1 turns it on, jspk::versus_on).
+         * Its 2026-11-21 reason: runs native-rm5 and native-gin3 put both humans on one team against two COMs in every match (4 of 4) under AUTO_ONLINE,
+         * which picks no colour; players who pick colours in the room were overruled by it (test13 report). */
+        const bool online = std::getenv("PS3_NET_ONLINE") != nullptr;
+        g_versus = jspk::versus_on(std::getenv(jspk::kVersusKey)) && online;
+        if (g_versus) NLOG("[online] versus safeguard on (JSP_ONLINE_VERSUS_DEFAULT=1): 2 humans in a Friendly Match fight each other, each with a COM partner; set it the same on both PCs\n");
+        else if (online) NLOG("[online] room teams: the teams chosen in the room stand (versus safeguard off; JSP_ONLINE_VERSUS_DEFAULT=1 turns it on)\n");
     }
     {   /* ENHANCEMENT (post-game / pick, JSP_ROLLBACK_PICK=1, default 0): only with the game's own online on (a native room) */
         g_pick = jsp_pick_enabled() && std::getenv("PS3_NET_ONLINE") != nullptr;
