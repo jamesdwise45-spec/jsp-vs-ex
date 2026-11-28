@@ -470,6 +470,20 @@ static void test_multi_ownership()
         rooms++;
     }
     CHECK(rooms == 300);
+    // The seat gap after a leave (REVIEW-MENU4): 4 -> 3 with the last fight's humans on records 0, 2, 3. The re-plan's claims are then the member order
+    // (jsp4::room_claim: not packed in 0..n-1 -> Claim::Rank, net_four_test), so the plan's slots are 0, 1, 2 and the menu opens (seats_ok). If the game
+    // has NOT repacked the records by the next fight, the session start's map with seats 0b111 refuses (no wrong ownership; the link is planned again
+    // from the records that fight filled); if it has, every pad drives its own fighter.
+    {
+        const uint8_t rank_slots[3] = { 0, 1, 2 };   // members 1, 3, 4 in member order
+        CHECK(jspo::seats_ok(rank_slots, 3, 3));
+        uint8_t gap[jspk::kRoomSize] = {}, packed[jspk::kRoomSize] = {};
+        put_rec(gap, 0, 1, false, 0, 3); put_rec(gap, 1, 0, true, 0, 4); put_rec(gap, 2, 3, false, 1, 5); put_rec(gap, 3, 4, false, 1, 6);
+        CHECK(jspo::predict_map(gap, jspo::plan_seats(3)).err != jnf::MAP_OK);
+        put_rec(packed, 0, 1, false, 0, 3); put_rec(packed, 1, 3, false, 0, 5); put_rec(packed, 2, 4, false, 1, 6); put_rec(packed, 3, 0, true, 1, 4);
+        const jspo::Map pm = jspo::predict_map(packed, jspo::plan_seats(3));
+        CHECK(pm.err == jnf::MAP_OK && jspo::own_ok(pm, 0) && jspo::own_ok(pm, 1) && jspo::own_ok(pm, 2));
+    }
 }
 
 // (b) The leave rule's gate in native_poll (jspm4::leave_gate): hold while the room still has the link's player count, release when it drops or
@@ -480,12 +494,15 @@ static void test_leave_gate()
     CHECK(jspm4::leave_wait_applies(3, Act::LeaveClose, jspg::R_PEER_LEFT) && jspm4::leave_wait_applies(4, Act::PeerFroze, jspg::R_NONE));
     CHECK(!jspm4::leave_wait_applies(2, Act::LeaveClose, jspg::R_PEER_LEFT) && !jspm4::leave_wait_applies(2, Act::PeerFroze, jspg::R_NONE));   // 2 players: as before
     CHECK(!jspm4::leave_wait_applies(4, Act::LeaveClose, jspg::R_LINK_LOST) && !jspm4::leave_wait_applies(4, Act::Lost, jspg::R_NONE));
-    CHECK(!jspm4::leave_wait_applies(4, Act::LeaveGiveUp, jspg::R_SELF) && !jspm4::leave_wait_applies(4, Act::Froze, jspg::R_NONE));
+    CHECK(!jspm4::leave_wait_applies(4, Act::LeaveGiveUp, jspg::R_SELF) && !jspm4::leave_wait_applies(4, Act::LeaveGiveUp, jspg::R_IDLE));
+    CHECK(jspm4::leave_wait_applies(3, Act::Froze, jspg::R_NONE) && !jspm4::leave_wait_applies(2, Act::Froze, jspg::R_NONE));   // REVIEW-MENU4 2: Froze holds like PeerFroze
     jspm4::LeaveWait w;
     CHECK(jspm4::leave_gate(w, 55, 4, 0) == jspm4::Gate::None);   // nothing to wait for
     w = jspm4::leave_wait(55, 4, 1000);
     CHECK(jspm4::leave_gate(w, 55, 4, 1000) == jspm4::Gate::Hold && jspm4::leave_gate(w, 55, 4, 1000 + jspm4::kLeaveWaitMs - 1) == jspm4::Gate::Hold);
     CHECK(jspm4::leave_gate(w, 55, 3, 5000) == jspm4::Gate::Release && w.room == 0);   // 4 -> 3: the leaver is out, plan for 3
+    w = jspm4::leave_wait(55, 3, 0);
+    CHECK(jspm4::leave_gate(w, 55, 4, 10) == jspm4::Gate::Release);                    // REVIEW-MENU4 3: a join during the hold ends it too
     CHECK(jspm4::leave_gate(w, 55, 3, 5100) == jspm4::Gate::None);                     // once
     w = jspm4::leave_wait(55, 3, 0);
     CHECK(jspm4::leave_gate(w, 55, 2, 10) == jspm4::Gate::Release);                    // 3 -> 2: the 2-player path
@@ -511,6 +528,6 @@ int main()
     test_join_ready();
     test_map1();
     if (fails) { std::printf("net pick drive: %d check(s) FAILED\n", fails); return 1; }
-    std::printf("net pick drive: pad gate (capture, late-pick start block, injected presses), the AUTO_ONLINE autopilot keeps the drive's press, notice-box Cross (timing, cap, gates, loading, by hand only after the room was seen), joiner's Ready, map1 timelines, ownership after the roster write (2000 rooms), ownership after Select character through the flow and the fighter map's planned seats (500 rooms + refusals), test13: 3-4 player ownership after Select character with the menu from each PC's own plan (300 rooms, peer != slot), the leave rule's gate ok\n");
+    std::printf("net pick drive: pad gate (capture, late-pick start block, injected presses), the AUTO_ONLINE autopilot keeps the drive's press, notice-box Cross (timing, cap, gates, loading, by hand only after the room was seen), joiner's Ready, map1 timelines, ownership after the roster write (2000 rooms), ownership after Select character through the flow and the fighter map's planned seats (500 rooms + refusals), test13: 3-4 player ownership after Select character with the menu from each PC's own plan (300 rooms, peer != slot), the seat gap after a leave, the leave rule's gate ok\n");
     return 0;
 }

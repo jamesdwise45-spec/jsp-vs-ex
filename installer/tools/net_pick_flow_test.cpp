@@ -678,14 +678,18 @@ struct MPc {
     Flow f; jspm4::Seats s; bool alive = true; uint64_t dead_at = ~0ull, choose_at = ~0ull, room_at = 0, pick_at = 0;
     jspg::Choice want = jspg::NONE; jspk::Pick pick; Act act = Act::None; jspg::Reason why = jspg::R_NONE; uint64_t act_at = 0; bool ready = false;
     bool submit = true;   // false: this PC never locks (the pick round's idle lock does it)
+    uint64_t freeze_from = ~0ull, freeze_to = 0;   // this PC's game makes no flip in [from, to) (its pump thread runs on)
 };
 struct MNet {
     struct Pkt { uint64_t t; int to, from; std::vector<uint8_t> d; };
-    std::deque<Pkt> q; std::mt19937 r; uint64_t sent_to[4] = {};
+    std::deque<Pkt> q; std::mt19937 r; uint64_t sent_to[4] = {}; bool cut[4][4] = {};   // cut[a][b]: nothing from a reaches b
     explicit MNet(uint32_t s) : r(s) {}
     void send(MPc* pc, int from, const uint8_t* b, size_t len, uint64_t t)
     {
-        for (int k = 0; k < pc[from].s.nto; k++) { const int to = pc[from].s.to[k]; sent_to[to]++; q.push_back({ t + 5 + r() % 60, to, from, std::vector<uint8_t>(b, b + len) }); }
+        for (int k = 0; k < pc[from].s.nto; k++) {
+            const int to = pc[from].s.to[k]; sent_to[to]++;
+            if (!cut[from][to]) q.push_back({ t + 5 + r() % 60, to, from, std::vector<uint8_t>(b, b + len) });
+        }
     }
     void deliver(MPc* pc, uint64_t t)
     {
@@ -724,7 +728,7 @@ struct MRun {
             MPc& p = pc[i];
             if (t >= p.dead_at) p.alive = false;
             if (!p.alive) continue;
-            p.f.game_alive(t);
+            if (t < p.freeze_from || t >= p.freeze_to) p.f.game_alive(t);
             if (t % 100 == 0) p.f.pump(t, [&](const uint8_t* b, size_t len) { net.send(pc, i, b, len, t); });   // pump_tick: every 100 ms
             if (t >= p.choose_at) { p.choose_at = ~0ull; p.f.choose(p.want, t); }
             const Act a = p.f.poll(t);   // the game thread: every frame
@@ -861,6 +865,36 @@ static void test_multi_flow()
             for (int i = 0; i < n - 1; i++) {
                 CHECK(m.pc[i].act == Act::LeaveClose && m.pc[i].why == jspg::R_LINK_LOST && m.pc[i].act_at >= at + 7000 && m.pc[i].act_at <= at + 9000);
                 CHECK(!jspm4::leave_wait_applies(n, m.pc[i].act, m.pc[i].why));
+            }
+        }
+        {   // FIX (REVIEW-MENU4 1): nobody has chosen and ONE path is cut (PC0 <-> PC1; PC 2.. hear both): every PC decides "link lost" and none holds
+            for (int cut_b = 1; cut_b < n; cut_b++) {
+                MRun m; m.n = n; CHECK(m.open(9050u + (uint64_t)(n * 10 + cut_b)));
+                m.match_end(1);
+                m.run_for(1000);
+                m.net.cut[0][cut_b] = m.net.cut[cut_b][0] = true;
+                m.run_for(30000);
+                bool hold0 = false;
+                for (int i = 0; i < n; i++) {
+                    CHECK(m.pc[i].act == Act::LeaveClose && m.pc[i].why == jspg::R_LINK_LOST);
+                    const bool h = jspm4::leave_wait_applies(n, m.pc[i].act, m.pc[i].why);
+                    if (!i) hold0 = h;
+                    CHECK(h == hold0 && !h);   // the same hold decision on every PC
+                    CHECK(m.pc[i].f.postgame().mine() == jspg::NONE);   // no LEAVE was written for a silence
+                }
+            }
+        }
+        {   // FIX (REVIEW-MENU4 2): PC 1's game makes no flip for 60 s at the prompt and then comes back: it gets Froze, the others hear its gone
+            // hello (+ its Leave: LeaveClose, or PeerFroze); every PC holds the same way
+            MRun m; m.n = n; CHECK(m.open(9070u + (uint64_t)n));
+            m.match_end(1);
+            m.pc[1].freeze_from = m.t; m.pc[1].freeze_to = m.t + jspf::kFreezeMs + 5000;
+            for (int i = 0; i < n; i++) if (i != 1) { m.pc[i].want = jspg::REMATCH; m.pc[i].choose_at = m.t + 100; }
+            m.run_for(jspf::kFreezeMs + 10000);
+            CHECK(m.pc[1].act == Act::Froze && jspm4::leave_wait_applies(n, m.pc[1].act, m.pc[1].why));
+            for (int i = 0; i < n; i++) if (i != 1) {
+                CHECK(m.pc[i].act == Act::LeaveClose || m.pc[i].act == Act::PeerFroze);
+                CHECK(jspm4::leave_wait_applies(n, m.pc[i].act, m.pc[i].why));
             }
         }
         {   // idle: PC 1 never chooses (prompt idle 20 s): it leaves for itself (gives the room up), the others hear its Leave and wait for it to go
@@ -1015,6 +1049,6 @@ int main()
     int fbad = 0, runs = 0;
     for (int n = 2; n <= 4; n++) for (uint32_t s = 1; s <= 60; s++, runs++) if (!flow_random(s * 7919u + (uint32_t)n * 13u, n)) { if (fbad++ < 3) std::printf("FAIL flow run n=%d seed %u\n", n, s); fails++; }
     if (fails) { std::printf("net pick flow: %d failure(s)\n", fails); return 1; }
-    std::printf("net pick flow: switch handshake (one PC on, a lost last hello, an early decline, old link, forged sender), freeze owner (prompt, chosen, picking, READY; no false trip), group choice (900 random runs), 2-player path, routing, spoofed senders, late lock vs the host's start, member map, team bytes, picker texts, leave / silence / idle / lost, %d flow runs of 8 post-games (n = 2..4); test13: window close at the menu (n = 2..4, 4 stages, inert poll, sent at once), 3-4 player glue (seats from each PC's own plan, peer != slot, send to every peer, refusals), 3-4 players: all Fight again, one Select character, one leaves (+ leave rule), mixed, silence, prompt idle, pick idle lock, lost pick round; 2-player menu byte for byte as before ok\n", runs);
+    std::printf("net pick flow: switch handshake (one PC on, a lost last hello, an early decline, old link, forged sender), freeze owner (prompt, chosen, picking, READY; no false trip), group choice (900 random runs), 2-player path, routing, spoofed senders, late lock vs the host's start, member map, team bytes, picker texts, leave / silence / idle / lost, %d flow runs of 8 post-games (n = 2..4); test13: window close at the menu (n = 2..4, 4 stages, inert poll, sent at once), 3-4 player glue (seats from each PC's own plan, peer != slot, send to every peer, refusals), 3-4 players: all Fight again, one Select character, one leaves (+ leave rule), mixed, silence, one cut path with no choice made (same outcome and hold on every PC), a 60 s freeze that comes back (every PC holds), prompt idle, pick idle lock, lost pick round; 2-player menu byte for byte as before ok\n", runs);
     return 0;
 }

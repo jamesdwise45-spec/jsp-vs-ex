@@ -2397,7 +2397,8 @@ void conn_close()
 {
     g.pump.stop();                    // joins the pump thread: nothing touches the handshake objects, the rendezvous or the re-psn client after this
     g.ev.clear();                     // a settings layer still installed (closed mid-handshake) is removed; restored() tells the settings reader
-    g.mh.reset(); g.mc.reset(); g.link.reset();
+    g.mh.reset(); g.mc.reset();
+    { std::lock_guard<std::mutex> lk(g.pump.mutex()); g.link.reset(); g.flow.close(); g.menu_nto = 0; }   // FIX (test13 review 4): jsp_net_quitting (main thread) reads them under it
     g.rz.reset(); g.rrz = nullptr;    // the rendezvous uses the re-psn client and the hub: first
     g.rp.reset();                     // leaves the room, closes the server connection, takes its hooks off the mux
     g.hub.reset();
@@ -2925,7 +2926,7 @@ void pick_frame()
     if (act == jspf::Act::LeaveGiveUp || act == jspf::Act::LeaveClose || act == jspf::Act::Lost || act == jspf::Act::Froze || act == jspf::Act::PeerFroze) {
         const bool self = act == jspf::Act::LeaveGiveUp;   // FIX (pick7): a freeze (here or there) closes the link without giving the room up
         u.notice = act == jspf::Act::Froze ? "This game stopped for a minute: the rollback link was closed"
-                 : act == jspf::Act::PeerFroze ? (nplayers > 2 ? "A player's game stopped responding: back to the room" : "The other player's game stopped responding: back to the room")
+                 : act == jspf::Act::PeerFroze ? (nplayers > 2 ? "A player left or their game stopped responding: back to the room" : "The other player left or their game stopped responding: back to the room")
                  : act == jspf::Act::Lost ? round_status : self ? "Match left: press Circle in the room to go back to the lobby" : outcome_text;
         u.notice_until = now + 6000;
         pk_drive(PkDrive::Off); g_pk_capture = 0; u.ps.stop();
@@ -2937,8 +2938,9 @@ void pick_frame()
             // link is planned again for them once the leaver is out of the room (native_poll, jspm4::leave_gate; at most jspm4::kLeaveWaitMs)
             else if (jspm4::leave_wait_applies(nplayers, act, pg_reason)) {
                 g_nat_leave = jspm4::leave_wait(room, nplayers, now);
-                std::fprintf(stderr, "[net] postgame: a player left the %d-player link: back to the room; the link is planned again for the players who stay once the room "
-                             "has fewer than %d players (at most %llu s)\n", nplayers, nplayers, (unsigned long long)(jspm4::kLeaveWaitMs / 1000));
+                std::fprintf(stderr, "[net] postgame: a player left the %d-player link (%s): back to the room; the link is planned again once the room's player count "
+                             "changes (at most %llu s; after that the plan counts every member still in the room, the one who left included)\n", nplayers, jspf::act_name(act),
+                             (unsigned long long)(jspm4::kLeaveWaitMs / 1000));
             }
         }
         open = false;

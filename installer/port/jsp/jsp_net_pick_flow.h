@@ -141,11 +141,12 @@ public:
     void tick(uint64_t now)
     {
         if (!started_ || outcome_ != jspg::PENDING) return;
+        // FIX (test13 review of the 3-4 player menu, REVIEW-MENU4 1): a silent player ends the round as "link lost" WITHOUT writing a LEAVE into this
+        // PC's own choice. Before, that LEAVE went out and every PC that still heard this one took it for a player who chose to leave (R_PEER_LEFT)
+        // while this PC had R_LINK_LOST: the PCs split on the leave rule's hold (jsp_net_menu4.h). Now the others reach R_LINK_LOST by their own
+        // silence check once this PC's messages stop (linger_ms after its decision). Same wire; the 2-player jspg::Agreement is untouched.
         for (int i = 0; i < n_; i++)
-            if (i != me_ && now - heard_[i] >= cfg_.silence_ms) {
-                if (choice_[me_] == jspg::NONE) { choice_[me_] = jspg::LEAVE; bump(); }
-                decide(jspg::O_LEAVE, jspg::R_LINK_LOST, now); return;
-            }
+            if (i != me_ && now - heard_[i] >= cfg_.silence_ms) { decide(jspg::O_LEAVE, jspg::R_LINK_LOST, now); return; }
         if (choice_[me_] == jspg::NONE && now - t0_ >= cfg_.idle_ms) { choice_[me_] = jspg::LEAVE; bump(); decide(jspg::O_LEAVE, jspg::R_IDLE, now); return; }
         if (choice_[me_] != jspg::NONE && now - t0_ >= (uint64_t)cfg_.idle_ms + cfg_.silence_ms) decide(jspg::O_LEAVE, jspg::R_LINK_LOST, now);
     }
@@ -472,7 +473,13 @@ public:
     {
         if (peer_off_ && !peer_off_said_) { peer_off_said_ = true; return Act::PeerOff; }   // FIX (pick7): another PC declined this match
         if (frozen_ && !froze_said_) { froze_said_ = true; end_round(); return Act::Froze; }             // FIX (pick7): the freeze owner left for this PC
-        if (peer_gone_ && !peer_gone_said_) { peer_gone_said_ = true; end_round(); return Act::PeerFroze; }
+        if (peer_gone_ && !peer_gone_said_) {
+            peer_gone_said_ = true;
+            // FIX (test13 review, REVIEW-MENU4 5 / REVIEW-QUIT 3): the gone hello came with that player's Leave (a window closed, or a freeze with no
+            // choice made): the normal outcome below says "Opponent left" / "A player left" (Act::LeaveClose); the link closes the same way
+            const bool left = pg_.on() && !acted_ && pg_.outcome() == jspg::O_LEAVE && pg_.reason() == jspg::R_PEER_LEFT;
+            if (!left) { end_round(); return Act::PeerFroze; }
+        }
         if (!is_open() || !pg_.on()) return Act::None;
         const jspg::Outcome o = pg_.outcome();
         if (o == jspg::PENDING) return Act::None;

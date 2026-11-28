@@ -16,8 +16,11 @@
 //                (then no rollback in this room at all). So these PCs hold the re-plan (leave_gate) until the room's count drops below the
 //                link's, or kLeaveWaitMs passed (then the plan is made as before). A re-plan that follows the drop starts with fresh tries.
 //                4 -> 3 players: a 3-player link, the menu again; 3 -> 2: the 2-player path. The same hold follows Act::PeerFroze (another
-//                PC's game froze or its window closed at the menu: that process is gone or going). A lost link (silence) or a lost pick
-//                round does not hold: nobody chose to leave, so the re-plan runs at once, as today.
+//                PC's game froze or its window closed at the menu: that process is gone or going) and Act::Froze (this PC's own game froze
+//                and came back: it holds like the others, so all of them plan again together; review REVIEW-MENU4 2). A lost link (silence:
+//                every PC decides R_LINK_LOST on its own, review 1) or a lost pick round does not hold: nobody chose to leave, so the re-plan
+//                runs at once, as today. The hold ends on ANY change of the room's player count (review 3: a join during the hold must not
+//                keep it the whole time), or after kLeaveWaitMs; a player who gave the room up but stayed in it is still counted then.
 #pragma once
 #include <cstddef>
 #include <cstdint>
@@ -88,18 +91,18 @@ inline constexpr uint64_t kLeaveWaitMs = 180000;   // = the after-match menu's o
 // The menu closed this PC's link because another player chose to go (its Leave or its idle timeout) or its game froze / closed, on a link of n > 2.
 inline bool leave_wait_applies(int n, jspf::Act a, jspg::Reason r)
 {
-    return n > 2 && (a == jspf::Act::PeerFroze || (a == jspf::Act::LeaveClose && r == jspg::R_PEER_LEFT));
+    return n > 2 && (a == jspf::Act::PeerFroze || a == jspf::Act::Froze || (a == jspf::Act::LeaveClose && r == jspg::R_PEER_LEFT));
 }
 struct LeaveWait { uint64_t room = 0; int players = 0; uint64_t until = 0; };
 inline LeaveWait leave_wait(uint64_t room, int players, uint64_t now) { LeaveWait w; w.room = room; w.players = players; w.until = now + kLeaveWaitMs; return w; }
 enum class Gate : uint8_t { None = 0, Hold, Release };
-// native_poll, before it plans a link for `room` with `want` players: Hold = not yet; Release = the wait is over (the count dropped, or the
+// native_poll, before it plans a link for `room` with `want` players: Hold = not yet; Release = the wait is over (the count changed, or the
 // time ran out): plan now, with the room's tries counted afresh; None = no wait (another room forgets it).
 inline Gate leave_gate(LeaveWait& w, uint64_t room, int want, uint64_t now)
 {
     if (!w.room) return Gate::None;
     if (room != w.room) { w = LeaveWait(); return Gate::None; }
-    if (want >= w.players && now < w.until) return Gate::Hold;
+    if (want == w.players && now < w.until) return Gate::Hold;
     w = LeaveWait();
     return Gate::Release;
 }
