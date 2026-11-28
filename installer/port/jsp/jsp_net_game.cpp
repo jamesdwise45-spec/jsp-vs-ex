@@ -1275,6 +1275,13 @@ void end_with(const std::string& text, bool quiet = false)
             else std::fprintf(stderr, "[net] postgame: off for match %u on every PC: %s\n", g.match_k, g.flow.decline_why() == 2 ? "another PC did not open its menu for this match"   // ENHANCEMENT (test13): 3-4 players
                               : "another PC has not confirmed JSP_ROLLBACK_PICK=1 and JSP_ROLLBACK_PICK_MULTI=1 (every PC needs both)");
         }
+    } else if (g.started_ms) {   // FIX (test13 integration review 1): an abnormal end of a match that ran: the other PCs' prompts for it close at once (Flow::decline)
+        std::lock_guard<std::mutex> lk(g.pump.mutex());
+        if (g.flow.is_open()) {
+            g.flow.decline((uint16_t)g.match_k);
+            std::fprintf(stderr, "[net] postgame: match %u did not end normally here: no after-match menu for it, the other PC%s told at once\n", g.match_k,
+                         g.flow.players() > 2 ? "s are" : " is");
+        }
     }
     if (quiet) set_text(""); else show(text);   // quiet: the rendezvous texts are on the main menu's notice (jsp_net_notice); the message line stays empty so it does not clear that layer
     g.ended_ms = GetTickCount64();   // ENHANCEMENT (lobby): the session is stopped kLingerMs from now (boundary)
@@ -2804,6 +2811,9 @@ void match_poll()
     const Phase ph = g.phase.load();
     if (ph == Phase::Off || ph == Phase::Running || (ph == Phase::Ended && !g_nat.link)) return;
     if (ph == Phase::Ended && g_nat.away_since) return;   // leaving the native room: native_poll closes the link
+    // FIX (test13 integration review 1): never arm the next match under this PC's open after-match menu (native_maintain holds the same way); a
+    // decline from the other PC closes the prompt first (Act::PeerOff), then this follows
+    { std::lock_guard<std::mutex> lk(g.pump.mutex()); if (g.flow.hold()) return; }
     log("rematch", "the other player is at match " + std::to_string(j) + " (this side " + std::to_string(g.match_k) + "): following");
     if (match_arm(j)) g_nat.rearm_at = 0;
 }
