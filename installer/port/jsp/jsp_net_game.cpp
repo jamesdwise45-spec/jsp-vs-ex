@@ -2701,7 +2701,7 @@ struct PkUi {
     uint32_t ps_blk[14] = {};                  // R+0x08..+0x3C before the Square (the log of what the page changed: TODO-MAPPING P3)
     uint32_t ps_of = 0, ps_os = 0, ps_o2c = 0; // the pick block (raw fighter / support, word +0x2C) when the page last opened: unchanged at the lock = not saved
     uint64_t ps_unsaved_t = 0;                 // test8: when the page closed with nothing saved (the notice shows for 6 s)
-    size_t fi = 0, si = 0; bool together = false;   // the picker's values
+    size_t fi = 0, si = 0; jspk::TeamChoice team = jspk::CHOICE_ROOM;   // the picker's values (FIX test13 review L3: the Teams row, reset every round)
     std::vector<uint16_t> fighters, supports;       // Random first, then the stock fighter list (0x00756C64); supports: Random, ids only with JSP_PICK_SUPPORT_IDS=1
     std::string notice; uint64_t notice_until = 0;
 } g_pk;
@@ -2728,7 +2728,7 @@ size_t pk_index(const std::vector<uint16_t>& v, uint16_t id) { for (size_t i = 0
 jspk::Pick pk_current(const PkUi& u)
 {
     jspk::Pick p; p.fighter = u.fighters.empty() ? jspk::kRandom : u.fighters[u.fi]; p.support = u.supports.empty() ? jspk::kRandom : u.supports[u.si];
-    p.mode = u.together ? jspk::TOGETHER : jspk::VERSUS; return p;
+    jspk::set_choice(p, u.team); return p;
 }
 bool pk_plausible(uint32_t a) { return a >= 0x10000u && a < 0xF0000000u && !(a & 3); }
 
@@ -2753,7 +2753,7 @@ void pick_frame()
     static const int native_page = native_sel ? 0 : native_page_set;   // JSP_PICK_NATIVE_SELECT=1 replaces the host-only page
     bool page_give_up = false;
     jspf::Act act = jspf::Act::None;
-    bool open = false, host = false, picking = false, start_ok = false, rematch = false, capture = false, block = false; int nplayers = 2;
+    bool open = false, host = false, picking = false, start_ok = false, rematch = false, capture = false, block = false, room_teams = true; int nplayers = 2;
     jspg::Reason pg_reason = jspg::R_NONE;   // ENHANCEMENT (test13): why the prompt decided Leave (the 3-4 player leave rule, jspm4::leave_wait_applies)
     std::string outcome_text, round_status; jspg::View v; int lock_secs = -1;
     std::vector<std::string> who;   // one line per player's pick (Select character), for everyone to see
@@ -2771,7 +2771,7 @@ void pick_frame()
                 pk_drive(PkDrive::ToRoom); u.room_since = 0; u.room_seen = false; u.page = 0; u.joined = false; u.start_failed = false; u.prow = 0;
                 pk_lists(u);
                 const jspk::Pick m = f.round().mine();
-                u.fi = pk_index(u.fighters, m.fighter); u.si = pk_index(u.supports, m.support); u.together = m.mode == jspk::TOGETHER;
+                u.fi = pk_index(u.fighters, m.fighter); u.si = pk_index(u.supports, m.support); u.team = jspk::choice_of(m);   // the room's teams: Flow resets it every round
                 u.ps.stop(); u.ps_f = u.ps_s = 0xFFFFFFFFu;
                 if (native_sel && act == jspf::Act::CharSelect) {   // the page step: its deadline is the round's own (idle lock + wait: then the round is lost anyway)
                     jsps::Cfg pc; pc.deadline_ms = (uint64_t)jspk::idle_ms_from(std::getenv(jspk::kIdleKey)) + jspk::kWaitMs;
@@ -2820,7 +2820,7 @@ void pick_frame()
                     bool odd = false;
                     jsps::read_pick(rf, rsp, [](int id) { return jnames::fighter_name(id) != nullptr; },
                                     [](int id) { return sup_ids && id != jnames::kSupportStub && jnames::support_name(id) != nullptr; }, &p->fighter, &p->support, &odd);
-                    p->mode = u.together ? jspk::TOGETHER : jspk::VERSUS;   // no team row on the page (U8): the previous round's mode
+                    jspk::set_choice(*p, u.team);   // no team row on the page (U8): this round's start choice, the room's teams (test13)
                     if (rf == u.ps_f && rsp == u.ps_s) return false;
                     if (odd) std::fprintf(stderr, "[net] postgame: page pick block fighter %08X support %08X: a fighter the port does not know, sent as Random\n", rf, rsp);
                     u.ps_f = rf; u.ps_s = rsp;
@@ -2854,7 +2854,7 @@ void pick_frame()
                     const bool took = f.picking() && f.submit(p, true);
                     const jspk::Pick m = f.round().mine();
                     std::fprintf(stderr, "[net] postgame: pick locked from the Battle settings page: fighter %03X support %03X (%s)%s\n", m.fighter, m.support,
-                                 m.mode ? "together" : "versus", took ? "" : " (it was locked already: the round's idle lock or a script)");
+                                 jspk::team_mode_text(jspk::agreed_mode(&m)), took ? "" : " (it was locked already: the round's idle lock or a script)");
                     if (pk_plausible(R)) {   // TODO-MAPPING (P3): what else the page changed in this PC's own pick block (the stage / music words on a joiner)
                         std::string d;
                         for (uint32_t k = 0; k < 14; k++) {
@@ -2885,9 +2885,14 @@ void pick_frame()
                             const uint32_t R = vm_read32(0x0095839Cu);
                             jspk::Pick p;
                             if (pk_plausible(R)) { const uint32_t pf = vm_read32(R + jspk::kOffSelfFighter), ps = vm_read32(R + jspk::kOffSelfSupport); if (pf <= 0xFFFF) p.fighter = (uint16_t)pf; if (ps <= 0xFFFF) p.support = (uint16_t)ps; }
-                            char t[16] = {}; p.mode = jsp_setting_get("JSP_ONLINE_TEAMS", t, sizeof t) && !std::strcmp(t, "together") ? jspk::TOGETHER : jspk::VERSUS;
+                            // FIX (test13 review L3): JSP_ONLINE_TEAMS=together used to force Together here; the players' room teams stand instead
+                            // (this path runs only in a rollback room's pick round; nothing else reads the key)
+                            char t[16] = {};
+                            if (jsp_setting_get("JSP_ONLINE_TEAMS", t, sizeof t) && t[0])
+                                std::fprintf(stderr, "[net] postgame: JSP_ONLINE_TEAMS=%s is IGNORED: the teams chosen in the room stand\n", t);
+                            jspk::set_choice(p, u.team);
                             f.submit(p, true); u.page = 3;
-                            std::fprintf(stderr, "[net] postgame: host's pick from the Battle settings page: fighter %03X support %03X (%s)\n", p.fighter, p.support, p.mode ? "together" : "versus");
+                            std::fprintf(stderr, "[net] postgame: host's pick from the Battle settings page: fighter %03X support %03X (%s)\n", p.fighter, p.support, jspk::team_mode_text(jspk::agreed_mode(&p)));
                         }
                     }
                 } else {   // the port picker: Up / Down row, Left / Right value, Cross locks (Ready)
@@ -2900,18 +2905,18 @@ void pick_frame()
                         auto step = [dir](size_t i, size_t n) { return n ? (i + (dir > 0 ? 1 : n - 1)) % n : 0; };
                         if (u.prow == 0) u.fi = step(u.fi, u.fighters.size());
                         else if (u.prow == 1) u.si = step(u.si, u.supports.size());
-                        else if (u.prow == 2) u.together = !u.together;
+                        else if (u.prow == 2) u.team = jspk::next_choice(u.team, dir, f.room_teams());   // an explicit choice for this round only
                         changed = true;
                     }
                     if (changed) f.submit(pk_current(u), false);
-                    if (edges & kBtnCross) { const jspk::Pick p = pk_current(u); f.submit(p, true); std::fprintf(stderr, "[net] postgame: pick locked: fighter %03X support %03X (%s)\n", p.fighter, p.support, p.mode ? "together" : "versus"); }
+                    if (edges & kBtnCross) { const jspk::Pick p = pk_current(u); f.submit(p, true); std::fprintf(stderr, "[net] postgame: pick locked: fighter %03X support %03X (%s)\n", p.fighter, p.support, jspk::team_mode_text(jspk::agreed_mode(&p))); }
                     capture = f.picking();
                     lock_secs = f.round().seconds_left(nm);
                 }
             }
             if (f.pick_on() && !rematch)
                 for (int p = 0; p < f.players(); p++) who.push_back(jspf::pick_line(p, f.me(), f.round().pick_of(p), f.round().locked_of(p)));
-            start_ok = f.start_ok(); nplayers = f.players();
+            start_ok = f.start_ok(); nplayers = f.players(); room_teams = f.room_teams();
             // FIX (review): the host's own Cross on the room page cannot start the fight before every PC committed the round (by hand, in the
             // by-hand drive, with JSP_PICK_HOST_START=0); outside the room it stays free (the auto-skip and the player go through the screens with it).
             // TODO-MAPPING (U4): relies on the room-page targets (JSP_PICK_ROOM_TG) being seen while the room page is up.
@@ -3023,10 +3028,8 @@ void pick_frame()
         pn.rows = { { "Battle Character", jspf::fighter_text(pk_current(u).fighter) }, { "Support Character", jspf::support_text(pk_current(u).support) } };
         if (host) {   // what jspk::roster_apply makes of the mode (humans in join order): 2 players: 1 + 1 or 2 against the COMs; 3: 2 + 1 (with a COM); 4: 2 + 2.
             // Written with the P numbers of the pick lines below (jspf::pick_line: P1 = the first to join).
-            const char* t = nplayers == 2 ? (u.together ? "P1 + P2 vs 2 COMs" : "P1 + COM vs P2 + COM")
-                          : nplayers == 3 ? (u.together ? "P1 + P2 vs P3 + COM" : "P1 + P3 vs P2 + COM")
-                          : (u.together ? "P1 + P2 vs P3 + P4" : "P1 + P3 vs P2 + P4");
-            pn.rows.push_back({ "Teams", t });
+            // FIX (test13): the room's teams by default every round (jspk::ROOM), or the host's explicit Versus / Together for this round
+            pn.rows.push_back({ "Teams", jspk::choice_text(room_teams || u.team != jspk::CHOICE_ROOM ? u.team : jspk::CHOICE_VERSUS, nplayers) });
         }
         pn.lines.push_back(Line{ round_status, jpskin::WHITE });
         if (!host) pn.lines.push_back(Line{ "Teams: the host decides", jpskin::GREY });
@@ -3255,7 +3258,9 @@ extern "C" int jsp_pick_submit(unsigned fighter, unsigned support, int together,
     if (!pick_on() || fighter > 0xFFFF || support > 0xFFFF) return 0;
     std::lock_guard<std::mutex> lk(g.pump.mutex());
     if (!g.flow.picking()) return 0;
-    jspk::Pick p; p.fighter = (uint16_t)fighter; p.support = (uint16_t)support; p.mode = together ? jspk::TOGETHER : jspk::VERSUS;
+    // FIX (test13): together 0 = the room's teams (the default), 1 = Together, 2 = Versus (an explicit choice for this round)
+    jspk::Pick p; p.fighter = (uint16_t)fighter; p.support = (uint16_t)support;
+    jspk::set_choice(p, together == 1 ? jspk::CHOICE_TOGETHER : together == 2 ? jspk::CHOICE_VERSUS : jspk::CHOICE_ROOM);
     return g.flow.submit(p, lock != 0) ? 1 : 0;
 }
 

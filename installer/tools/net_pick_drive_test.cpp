@@ -307,6 +307,9 @@ static void test_ownership()
         for (int k = 0; k < 2; k++) { p.pick[k].fighter = r() % 3 == 0 ? jspk::kRandom : (uint16_t)(r() % 42); p.pick[k].support = jspk::kRandom; }
         p.pick[0].mode = (r() & 1) ? jspk::TOGETHER : jspk::VERSUS;   // the host's mode wins
         p.pick[1].mode = (r() & 1) ? jspk::TOGETHER : jspk::VERSUS;
+        // FIX (test13): per-PC swapped team bytes come only from the versus safeguard (JSP_ONLINE_VERSUS_DEFAULT=1), which turns the room-teams
+        // bit off (jspk::room_teams_from): this is the old Versus / Together rebuild. The room-teams path is checked in test_ownership_mapper.
+        p.pick[0].room = false; p.pick[1].room = (r() & 1) != 0;   // the joiner's bit never counts
         bool ok = true;
         for (int me = 0; me < 2; me++) { p.self_slot = (uint8_t)me; ok = ok && jspf::apply_pair(pc[me], p) == jspk::Result::Ok; }
         CHECK(ok);
@@ -347,10 +350,12 @@ static void test_ownership_mapper()
     CHECK(jspo::seats_ok(s01, 2, 2) && jspo::seats_ok(s10, 2, 2));
     CHECK(!jspo::seats_ok(s02, 2, 2) && !jspo::seats_ok(s11, 2, 2) && !jspo::seats_ok(s01, 2, 3) && !jspo::seats_ok(s01, 1, 1));
     std::mt19937 r(20261122u + 7u);
-    int rooms = 0, together = 0, swapped = 0;
+    int rooms = 0, together = 0, swapped = 0, kept = 0;
     for (int it = 0; it < 500; it++) {
         jspf::Flow h, j;
         CHECK(h.open(5000u + (uint64_t)it, 0, 2, s01) && j.open(5000u + (uint64_t)it, 1, 2, s01));
+        const bool room = it % 2 == 0;   // FIX (test13): the host's room-teams bit (the default on); off = the versus safeguard's old rebuild
+        h.set_room_teams(room); j.set_room_teams((r() & 1) != 0);
         uint64_t t = 0;
         auto step = [&] {
             h.pump(t, [&](const uint8_t* d, size_t n) { j.route(0, d, n, t); });
@@ -378,7 +383,8 @@ static void test_ownership_mapper()
         put_rec(img, 2, 0, true, (uint8_t)(r() % 2), 0x20); put_rec(img, 3, 0, true, (uint8_t)(r() % 2), 0x21);
         uint8_t pc[2][jspk::kRoomSize];
         std::memcpy(pc[0], img, sizeof img); std::memcpy(pc[1], img, sizeof img);
-        if (r() & 1) { std::swap(pc[1][jspk::kOffRecords + jspk::kRecSize + jspk::kRecTeam], pc[1][jspk::kOffRecords + jspk::kRecSize * 2 + jspk::kRecTeam]); swapped++; }
+        // a PC's own versus_apply swap exists only with the safeguard on (room teams off); with room teams both PCs hold the host's broadcast
+        if (!room && (r() & 1)) { std::swap(pc[1][jspk::kOffRecords + jspk::kRecSize + jspk::kRecTeam], pc[1][jspk::kOffRecords + jspk::kRecSize * 2 + jspk::kRecTeam]); swapped++; }
         for (int me = 0; me < 2; me++) CHECK(jspf::apply_pair(pc[me], pa[me]) == jspk::Result::Ok);
         const jspo::Map m0 = jspo::predict_map(pc[0], jspo::plan_seats(2)), m1 = jspo::predict_map(pc[1], jspo::plan_seats(2));
         CHECK(m0.err == jnf::MAP_OK && m1.err == jnf::MAP_OK);
@@ -386,9 +392,14 @@ static void test_ownership_mapper()
         CHECK(!std::memcmp(m0.port, m1.port, sizeof m0.port) && !std::memcmp(m0.net_of_rec, m1.net_of_rec, sizeof m0.net_of_rec));   // one map
         for (int rc = 0; rc < 2; rc++) CHECK(m0.net_of_rec[rc] >= 0 && m0.port[m0.net_of_rec[rc]] == rc);
         CHECK(m0.net_of_rec[2] < 0 && m0.net_of_rec[3] < 0);                                     // the COMs get no net slot
-        const bool tog = jspk::agreed_mode(pa[0].pick) == jspk::TOGETHER;
+        const jspk::TeamMode mode = jspk::agreed_mode(pa[0].pick);
+        CHECK(mode == jspk::agreed_mode(pa[1].pick) && mode == (ph.mode == jspk::TOGETHER ? jspk::TOGETHER : room ? jspk::ROOM : jspk::VERSUS));
+        const bool tog = mode == jspk::TOGETHER;
         const uint8_t t0 = pc[0][jspk::kOffRecords + jspk::kRecTeam], t1 = pc[0][jspk::kOffRecords + jspk::kRecSize + jspk::kRecTeam];
-        CHECK(tog ? t0 == t1 : t0 != t1);
+        if (mode == jspk::ROOM) {   // the room's teams stand when they are a valid 2 + 2 (the bytes are random here, so sometimes not)
+            if (jspk::room_teams_valid(jspk::roster_read(img))) { for (int rc = 0; rc < 4; rc++) CHECK(pc[0][jspk::kOffRecords + jspk::kRecSize * rc + jspk::kRecTeam] == img[jspk::kOffRecords + jspk::kRecSize * rc + jspk::kRecTeam]); kept++; }
+            CHECK(!std::memcmp(pc[0], pc[1], sizeof img));   // one roster on both PCs
+        } else CHECK(tog ? t0 == t1 : t0 != t1);
         together += tog;
         if (ph.fighter != jspk::kRandom) CHECK(jspk::be16(pc[0] + jspk::kOffRecords + jspk::kRecFighter) == ph.fighter);
         if (pj.fighter != jspk::kRandom) CHECK(jspk::be16(pc[1] + jspk::kOffRecords + jspk::kRecSize + jspk::kRecFighter) == pj.fighter);
@@ -396,12 +407,18 @@ static void test_ownership_mapper()
         h.fight_running(); j.fight_running();
         CHECK(h.match_end(2, t) && j.match_end(2, t) && h.choose(jspg::REMATCH, t) && j.choose(jspg::REMATCH, t));
         for (int k = 0; k < 30 && !(h.round().state() == jspk::READY && j.round().state() == jspk::READY); k++) step();
-        jspf::PairOut again; CHECK(h.pair(&again) && again.pick[0] == pa[0].pick[0] && again.pick[1] == pa[0].pick[1]);
+        jspf::PairOut again; CHECK(h.pair(&again));
+        for (int k = 0; k < 2; k++) CHECK(again.pick[k].fighter == pa[0].pick[k].fighter && again.pick[k].support == pa[0].pick[k].support);
+        // FIX (test13 review L3): the team choice is not kept: a Fight again plays the room's teams (Versus without room teams)
+        CHECK(again.mode() == (room ? jspk::ROOM : jspk::VERSUS));
         uint8_t re[jspk::kRoomSize]; std::memcpy(re, img, sizeof img);
-        CHECK(jspf::apply_pair(re, again) == jspk::Result::Ok && !std::memcmp(re + jspk::kOffRecords, pc[0] + jspk::kOffRecords, 4 * jspk::kRecSize));
+        CHECK(jspf::apply_pair(re, again) == jspk::Result::Ok);
+        if (again.mode() == mode) CHECK(!std::memcmp(re + jspk::kOffRecords, pc[0] + jspk::kOffRecords, 4 * jspk::kRecSize));
+        const jspo::Map ma = jspo::predict_map(re, jspo::plan_seats(2));
+        CHECK(jspo::own_ok(ma, 0) && jspo::own_ok(ma, 1));
         rooms++;
     }
-    CHECK(rooms == 500 && together > 50 && swapped > 50);
+    CHECK(rooms == 500 && together > 50 && swapped > 50 && kept > 30);
     // what the session start refuses stays refused: a stale third member (the roster write refuses it, and the native roster maps MAP_EXTRA) ...
     uint8_t img[jspk::kRoomSize] = {};
     put_rec(img, 0, 1, false, 0, 3); put_rec(img, 1, 2, false, 1, 4); put_rec(img, 2, 3, false, 0, 5); put_rec(img, 3, 0, true, 1, 6);

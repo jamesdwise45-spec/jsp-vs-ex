@@ -39,6 +39,19 @@ int main()
         const int32_t net[6] = {0, 1, 2, 3, -1, -1}; const uint16_t pm[6] = {11, 13, 12, 14, 0, 0}, rm[4] = {11, 12, 13, 14};
         int8_t port[4]; CHECK(net_ports(net, pm, rm, com, 0xFu, port) == MAP_OK && port[0] == 0 && port[1] == 2 && port[2] == 1 && port[3] == 3);
     }
+    // FIX (test13): the room's own teams stand (no versus safeguard), so the humans may be teammates; the map stays by member id
+    {   // 2 humans together on team 1 against 2 COMs on team 0 (teams 1,1,0,0): the COMs are placed first but get no net slot, humans net 0, 1
+        const uint8_t team[4] = {1, 1, 0, 0}, com[4] = {0, 0, 1, 1};
+        CHECK(placement_net_slot(team, com, 0) == 0 && placement_net_slot(team, com, 1) == 1 && placement_net_slot(team, com, 2) == -1 && placement_net_slot(team, com, 3) == -1);
+        const int32_t net[6] = {-1, -1, 0, 1, -1, -1}; const uint16_t pm[6] = {0, 0, 1, 2, 0, 0}, rm[4] = {1, 2, 0, 0};
+        int8_t port[4]; CHECK(net_ports(net, pm, rm, com, 0x3u, port) == MAP_OK && port[0] == 0 && port[1] == 1 && port[2] == -1);
+    }
+    {   // 4 humans, records 1 + 2 vs 0 + 3 (teams 1,0,0,1, as room 38 had it): net slots 2,0,1,3 for records 0,1,2,3
+        const uint8_t team[4] = {1, 0, 0, 1}, com[4] = {0, 0, 0, 0};
+        CHECK(placement_net_slot(team, com, 1) == 0 && placement_net_slot(team, com, 2) == 1 && placement_net_slot(team, com, 0) == 2 && placement_net_slot(team, com, 3) == 3);
+        const int32_t net[6] = {0, 1, 2, 3, -1, -1}; const uint16_t pm[6] = {2, 3, 1, 4, 0, 0}, rm[4] = {1, 2, 3, 4};
+        int8_t port[4]; CHECK(net_ports(net, pm, rm, com, 0xFu, port) == MAP_OK && port[0] == 1 && port[1] == 2 && port[2] == 0 && port[3] == 3);
+    }
     {   // refusals: a member in no human record, one member twice, a net slot used twice, a net slot out of range
         const uint8_t com[4] = {0, 0, 1, 1}; const uint16_t rm[4] = {1, 2, 0, 0}; int8_t port[4];
         { const int32_t net[6] = {0, 1, -1, -1, -1, -1}; const uint16_t pm[6] = {1, 9, 0, 0, 0, 0}; CHECK(net_ports(net, pm, rm, com, 0x3u, port) == MAP_MEMBER); }

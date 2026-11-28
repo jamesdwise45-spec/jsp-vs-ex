@@ -808,6 +808,13 @@ int main(int argc, char** argv)
         CHECK(first_debug_switch(only("SPURS_GUARD_EVENT", "1")) == nullptr && first_debug_switch(only("SPURS_GUARD_EVENT", "0")) != nullptr);
         CHECK(first_debug_switch(only("SPURS_CTX_PAD", "0")) != nullptr && first_debug_switch(only("SPURS_CTX_PAD", "1")) == nullptr);
         for (const char* n : { "JSP_PROBE_ROOT_NUDGE", "JSP_PROBE_SPURS_PHASE", "LATE_VBLANK_MS", "JSP_FIGHT_PROBE" }) CHECK(first_debug_switch(only(n, "1")) != nullptr && first_debug_switch(only(n, nullptr)) == nullptr);
+        // FIX (test13 review M1): the versus safeguard, exactly "1" like jspk::versus_on; anything else (unset, 0, 10, yes) is the default (off)
+        CHECK(!std::strcmp(first_debug_switch(only("JSP_ONLINE_VERSUS_DEFAULT", "1")), "JSP_ONLINE_VERSUS_DEFAULT"));
+        for (const char* v : { "0", "10", "yes", "", "2" }) CHECK(first_debug_switch(only("JSP_ONLINE_VERSUS_DEFAULT", v)) == nullptr);
+        CHECK(first_debug_switch(only("JSP_ONLINE_VERSUS_DEFAULT", nullptr)) == nullptr);
+        // ... and the handshake refuses it on both PCs when only the client has it (the host's propose sees the client's Hello flag)
+        Room v(0x03); v.make_host(); v.make_client(1, v.caps); v.p[1].rd.dbg = first_debug_switch(only("JSP_ONLINE_VERSUS_DEFAULT", "1")); v.p[0].host->begin(77, 3, 1, 0); v.join_all();
+        CHECK(v.p[0].host->propose(rb_values(), 0) == Reason::DebugSwitch && v.p[0].host->bad_peer() == 1 && !v.p[0].ev.active());
     }
     // a failed restore is sticky until the process ends (by design); a fresh session does not report it as its own failure
     {
