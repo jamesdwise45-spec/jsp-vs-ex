@@ -28,13 +28,15 @@ Review fixes (REVIEW-NAT.md):
   room was used in the next even after the remap cleared.
 - The punch is not authenticated, so a port is learned only from the announced IP, only while the announced address has
   not been heard, once per listing, within 10 s of the listing. Signing punches with the PEER_KEY pair key is a follow-up.
-- np_psnr_request_after_probe: CREATE_ROOM and JOIN_ROOM wait (at most 1.5 s, sent from np_psnr_pump) while the title's
-  P2P socket is bound and its probe not yet answered, so the server announces this player at the endpoint its probe came
-  from (re-psn endpoint()), not the HELLO port. The answer is read by the title's own recvfrom, so it helps only when its
-  receive thread runs before the join (J-Stars binds 3658 before JoinRoom). PSNR_JOIN_AFTER_PROBE=0: sent at once.
+- np_psnr_request_after_probe, OFF by default (PSNR_JOIN_AFTER_PROBE=1): CREATE_ROOM and JOIN_ROOM wait (at most 1.5 s,
+  sent from np_psnr_pump) while the title's P2P socket is bound and its probe not yet answered, so the server would announce
+  the probed endpoint. Off because the answer is read only by the title's own recvfrom and J-Stars reads its P2P socket only
+  after the join reply (the hold always ran 1.5 s), and a LeaveRoom or newer CreateRoom sent meanwhile went out first.
+  Off, it is np_psnr_request exactly: sent at once, in order.
 - Relay datagrams are unwrapped only from the server's UDP address (psnr_relay_unwrap_from, under the lock); a probe reply
   counts only from there too, and any other "PSNR" packet is dropped. Before, anyone could inject a datagram as any member.
-- An unheard peer is punched every 500 ms after the first 5, until 10 s after its first punch.
+- After the first 5 punches, every listed peer is punched every 500 ms until 10 s after its first punch, heard or not (a NAT
+  that picks a port per destination may let us hear it while it never learns our side's view of it).
 - A member that left (MEMBER_LEFT) has its slot freed after its counter line, every peer on KICKED and after our LeaveRoom
   (np_psnr_peer_gone); a full table reuses the slot listed longest ago.
 - GET_CAPS unanswered after 5 s: no relay, one log line. A peer on the relay goes direct again when its announced address
@@ -43,7 +45,10 @@ Review fixes (REVIEW-NAT.md):
   when its send fails. libs/network/sysNet.c: sendto checks would_block before the route too and returns the host error on
   -1. J-Stars does not connect() its P2P socket (field logs: bind and sendto/recvfrom only), so send()/recv() bypassing
   the route does not matter for it.
-- Limit: relay_ok() knows only this player's pass; the server also needs the peer's.
+- Limits: relay_ok() knows only this player's pass; the server also needs the peer's. Punches are not signed: within the
+  learning window the first punch naming a peer from its public IP wins, so someone on the same public IP (a CGNAT
+  neighbour) or spoofing it can break a remapped player's match; PEER_KEY-signed punches are the follow-up.
+  np_psnr_stream_connect still reads s_client after unlocking (older; psnr_client is opaque here, so not copied).
 libs/network/sceNpMatching2.c: MEMBER_LEFT logs that member's counters, KICKED and the LeaveRoom reply log every peer's. MEMBER_LEFT
 and KICKED now take the np_psnr peer lock before the state lock, as MEMBER_JOINED does; the LeaveRoom reply logs after the state lock
 is released.
@@ -56,7 +61,7 @@ built and run on Windows by installer/tools/np_nat_test.sh. test_np_matching2.c 
 server or router (no two-router test); matching2_context_test.py (posix only) not run.
 
 diff --git a/libs/network/np_psnr.c b/libs/network/np_psnr.c
-index 17c958b..9fb60c7 100644
+index 17c958b..5da6be8 100644
 --- a/libs/network/np_psnr.c
 +++ b/libs/network/np_psnr.c
 @@ -61,6 +61,8 @@ static int clean_online_id(const char* in, char out[17])
@@ -86,7 +91,7 @@ index 17c958b..9fb60c7 100644
  
  #define PUNCHES      5      /* per peer */
  #define PUNCH_MS     200
-+#define SLOW_PUNCH_MS 500   /* after those, toward a peer still unheard ... */
++#define SLOW_PUNCH_MS 500   /* after those, toward every listed peer ... */
 +#define SLOW_PUNCH_FOR 10000 /* ... until this long after its first punch (the title gives a join about 15 s) */
  #define PROBE_MS     500    /* until psnr answers */
  #define REPROBE_MS   20000  /* after: routers forget idle UDP mappings */
@@ -269,19 +274,22 @@ index 17c958b..9fb60c7 100644
  void np_psnr_set_p2p_sender(np_psnr_p2p_send_fn fn)
  {
      s_p2p_send = fn;
-@@ -262,6 +410,119 @@ void np_psnr_set_stream_sink(np_psnr_stream_sink_fn fn)
+@@ -262,6 +410,122 @@ void np_psnr_set_stream_sink(np_psnr_stream_sink_fn fn)
      s_stream_sink = fn;
  }
  
 +/* FIX (test13 field): the server announces a member at the endpoint its P2P socket's probe came from, but only once
 + * that probe has landed; the joiner's MEMBER_JOINED went out before, with the HELLO port 3658 instead of the remapped
 + * 1369. So CREATE_ROOM and JOIN_ROOM wait until our probe is answered, at most HOLD_MS, when the title's P2P socket
-+ * is bound and not yet probed. The title gets its usual asynchronous reply, just later. PSNR_JOIN_AFTER_PROBE=0: sent
-+ * at once, as before. */
++ * is bound and not yet probed. The title gets its usual asynchronous reply, just later.
++ * OFF by default (PSNR_JOIN_AFTER_PROBE=1 turns it on): the answer is read only by the title's own recvfrom, and J-Stars
++ * reads its P2P socket only after the join reply, so the hold always ran its full 1.5 s; and a LeaveRoom or a newer
++ * CreateRoom sent meanwhile went out before the held request. Off, every request is sent at once, in order, as before. */
 +uint32_t np_psnr_request_after_probe(uint8_t type, const void* body, uint32_t len, np_psnr_reply_fn fn, void* user)
 +{
 +    LOCK();
-+    int hold = s_client && s_p2p_send && !s_probed && switch_on(getenv("PSNR_JOIN_AFTER_PROBE"));
++    const char* on = getenv("PSNR_JOIN_AFTER_PROBE");
++    int hold = on && on[0] == '1' && !on[1] && s_client && s_p2p_send && !s_probed;
 +    struct held* h = NULL;
 +    for (int i = 0; hold && i < HELD_MAX && !h; i++)
 +        if (!s_held[i].used) h = &s_held[i];
@@ -389,7 +397,7 @@ index 17c958b..9fb60c7 100644
  int np_psnr_p2p_filter(void* buf, uint32_t* len, uint8_t from_ip[4], uint16_t* from_port)
  {
      uint8_t ip[4];
-@@ -273,39 +534,60 @@ int np_psnr_p2p_filter(void* buf, uint32_t* len, uint8_t from_ip[4], uint16_t* f
+@@ -273,39 +537,60 @@ int np_psnr_p2p_filter(void* buf, uint32_t* len, uint8_t from_ip[4], uint16_t* f
  
      if (!psnr_is_control(buf, *len)) {
          LOCK();
@@ -461,7 +469,7 @@ index 17c958b..9fb60c7 100644
  }
  
  void np_psnr_peer_lock(void) { NP_PSNR_TEST_PAUSE("peer-lock"); LOCK(); }
-@@ -315,21 +597,29 @@ void np_psnr_punch_locked(uint32_t user, const uint8_t ip[4], uint16_t port)
+@@ -315,21 +600,29 @@ void np_psnr_punch_locked(uint32_t user, const uint8_t ip[4], uint16_t port)
  {
      if (user == s_user_id || !port) return;
      struct peer* p = peer_by_user(user);
@@ -500,7 +508,7 @@ index 17c958b..9fb60c7 100644
      }
  }
  
-@@ -340,22 +630,72 @@ void np_psnr_punch(uint32_t user, const uint8_t ip[4], uint16_t port)
+@@ -340,22 +633,72 @@ void np_psnr_punch(uint32_t user, const uint8_t ip[4], uint16_t port)
      UNLOCK();
  }
  
@@ -583,7 +591,7 @@ index 17c958b..9fb60c7 100644
  }
  
  int64_t np_psnr_stream_connect(const uint8_t ip[4], uint16_t port)
-@@ -363,7 +703,7 @@ int64_t np_psnr_stream_connect(const uint8_t ip[4], uint16_t port)
+@@ -363,7 +706,7 @@ int64_t np_psnr_stream_connect(const uint8_t ip[4], uint16_t port)
      uint32_t to = 0;
      LOCK();
      struct peer* p = peer_at(ip, port);
@@ -592,7 +600,7 @@ index 17c958b..9fb60c7 100644
      UNLOCK();
      if (!to || !s_client) return -2;
      int64_t fd = psnr_stream_connect(s_client, to, port, STREAM_TIMEOUT_MS);
-@@ -379,9 +719,10 @@ static int nat_push(const psnr_msg* m)
+@@ -379,9 +722,10 @@ static int nat_push(const psnr_msg* m)
          int relay = (m->data[12] & PSNR_ROUTE_STREAM_RELAY) != 0;
          LOCK();
          struct peer* p = peer_by_user(user);
@@ -604,7 +612,7 @@ index 17c958b..9fb60c7 100644
          }
          if (p) p->relay_stream = relay;
          UNLOCK();
-@@ -405,8 +746,9 @@ static int nat_push(const psnr_msg* m)
+@@ -405,8 +749,9 @@ static int nat_push(const psnr_msg* m)
  }
  
  /* From np_psnr_pump: probe psnr until it answers (and again now and then),
@@ -616,7 +624,7 @@ index 17c958b..9fb60c7 100644
  static void nat_tick(void)
  {
      uint8_t pkt[PSNR_UDP_PROBE_LEN], ip[4];
-@@ -420,20 +762,28 @@ static void nat_tick(void)
+@@ -420,20 +765,30 @@ static void nat_tick(void)
          s_next_probe = now + (s_probed ? REPROBE_MS : PROBE_MS);
      }
      LOCK();
@@ -626,7 +634,9 @@ index 17c958b..9fb60c7 100644
 -        if (!p->user) continue;
 -        if (p->punches_left && now >= p->next_punch) {
 +        if (!p->user || !p->port) continue;
-+        int slow = !p->punches_left && !p->heard_at && p->punched_at && now - p->punched_at < SLOW_PUNCH_FOR;
++        /* Slow punches go on for SLOW_PUNCH_FOR even once we hear the peer: a NAT that picks a port per destination
++         * may let us hear it while it never heard (and so never learns) our side's view of it. */
++        int slow = !p->punches_left && p->punched_at && now - p->punched_at < SLOW_PUNCH_FOR;
 +        if ((p->punches_left || slow) && now >= p->next_punch) {
              psnr_punch_packet(s_client, pkt);
 -            s_p2p_send(pkt, PSNR_UDP_PUNCH_LEN, p->ip, p->port);
@@ -654,7 +664,7 @@ index 17c958b..9fb60c7 100644
          }
      }
      UNLOCK();
-@@ -447,6 +797,9 @@ void np_psnr_pump(void)
+@@ -447,6 +802,9 @@ void np_psnr_pump(void)
      UNLOCK();
      if (tick) tick();
      nat_tick();
@@ -665,10 +675,10 @@ index 17c958b..9fb60c7 100644
  
      for (;;) {
 diff --git a/libs/network/np_psnr.h b/libs/network/np_psnr.h
-index 411fe14..f0036a6 100644
+index 411fe14..b83f7b1 100644
 --- a/libs/network/np_psnr.h
 +++ b/libs/network/np_psnr.h
-@@ -79,15 +79,39 @@ typedef int (*np_psnr_p2p_send_fn)(const void* buf, uint32_t len,
+@@ -79,15 +79,40 @@ typedef int (*np_psnr_p2p_send_fn)(const void* buf, uint32_t len,
  void np_psnr_set_p2p_sender(np_psnr_p2p_send_fn fn);
  
  /* A datagram that arrived on the P2P socket from from_ip:from_port. 1: it was
@@ -686,7 +696,7 @@ index 411fe14..f0036a6 100644
  
  /* A peer's P2P endpoint became known (Matching2 member entries): punch toward
 - * it a few times. Our own entry is skipped. */
-+ * it a few times, then every 500 ms for up to 10 s while it is unheard. Our own
++ * it a few times, then every 500 ms until 10 s after the first, heard or not. Our own
 + * entry is skipped. A room listing a known peer again starts its path over. */
  void np_psnr_punch(uint32_t user, const uint8_t ip[4], uint16_t port);
  
@@ -705,14 +715,15 @@ index 411fe14..f0036a6 100644
 + * bound but its probe not yet answered, the request is held (at most 1.5 s,
 + * sent from np_psnr_pump), so the server announces this player at the
 + * endpoint it saw the probe come from. Nonzero when taken; the reply comes
-+ * through fn as usual. PSNR_JOIN_AFTER_PROBE=0: sent at once. */
++ * through fn as usual. Off unless PSNR_JOIN_AFTER_PROBE=1: by default it is
++ * np_psnr_request exactly (sent at once, in order). */
 +uint32_t np_psnr_request_after_probe(uint8_t type, const void* body, uint32_t len,
 +                                     np_psnr_reply_fn fn, void* user);
 +
  /* Matching2 peer/state commits acquire this adapter lock BEFORE their state
   * lock. The locked leaf neither relocks nor sends/calls back. Never acquire
   * this lock while holding Matching2 state, or call ordinary adapter APIs inside. */
-@@ -95,10 +119,14 @@ void np_psnr_peer_lock(void);
+@@ -95,10 +120,14 @@ void np_psnr_peer_lock(void);
  void np_psnr_peer_unlock(void);
  void np_psnr_punch_locked(uint32_t user, const uint8_t ip[4], uint16_t port);
  
@@ -830,7 +841,7 @@ index 2aab1ff..ec397db 100644
  /* sysutil: remember the last callback queued */
  static u32 s_cb_opd;
 diff --git a/libs/network/tests/test_np_nat.c b/libs/network/tests/test_np_nat.c
-index 903f2e2..1bdfc57 100644
+index 903f2e2..69a4f98 100644
 --- a/libs/network/tests/test_np_nat.c
 +++ b/libs/network/tests/test_np_nat.c
 @@ -33,6 +33,19 @@ static int fake_send(const void* buf, uint32_t len, const uint8_t ip[4], uint16_
@@ -867,8 +878,8 @@ index 903f2e2..1bdfc57 100644
          sleep_ms(PUNCH_MS / 2 + 10);
      }
 -    assert(count_to(cone, 40001, 0x02) == PUNCHES && count_to(sym, 50000, 0x02) == PUNCHES);
-+    /* Five fast punches each; the unheard one then goes on slowly (every SLOW_PUNCH_MS), the heard one stops. */
-+    assert(count_to(cone, 40001, 0x02) == PUNCHES);
++    /* Five fast punches each, then slow ones (every SLOW_PUNCH_MS), heard or not. */
++    assert(count_to(cone, 40001, 0x02) >= PUNCHES && count_to(cone, 40001, 0x02) <= PUNCHES + 1);
 +    assert(count_to(sym, 50000, 0x02) >= PUNCHES && count_to(sym, 50000, 0x02) <= PUNCHES + 1);
      assert(count_to(cone, 3658, 0x02) == 0);
  
@@ -881,7 +892,7 @@ index 903f2e2..1bdfc57 100644
      len = 12;
      memcpy(buf, "PSNR\x03\x00\x00\x00\x63" "who", 12);
      assert(np_psnr_p2p_filter(buf, &len, got, &gport) == 1);
-@@ -141,6 +159,237 @@ int main(void)
+@@ -141,6 +159,246 @@ int main(void)
      assert(peer_by_user(11)->relay_stream && !peer_by_user(9)->relay_stream);
      assert(np_psnr_stream_connect(cone, 40001) == -2);   /* direct, as usual */
  
@@ -1063,6 +1074,11 @@ index 903f2e2..1bdfc57 100644
 +        assert(count_to(other, 3658, 0x02) == k + 1 && u->next_punch > nat_now_ms() + SLOW_PUNCH_MS - 100);
 +        nat_tick();
 +        assert(count_to(other, 3658, 0x02) == k + 1);   /* not before SLOW_PUNCH_MS */
++        /* Heard (it hears us, but maybe never heard us): the slow punches go on (review 2, D). */
++        u->heard_at = nat_now_ms(); u->relay_udp = 0; u->next_punch = 0;
++        nat_tick();
++        assert(count_to(other, 3658, 0x02) == k + 2);
++        k++;
 +        u->next_punch = 0; u->punched_at = nat_now_ms() - SLOW_PUNCH_FOR - 10;
 +        nat_tick();
 +        assert(count_to(other, 3658, 0x02) == k + 1);   /* and not after SLOW_PUNCH_FOR */
@@ -1096,6 +1112,7 @@ index 903f2e2..1bdfc57 100644
 +    {
 +        s_probed = 0;
 +        s_held_reply = -1;
++        set_env("PSNR_JOIN_AFTER_PROBE", "1");           /* off by default (review 2, A/B); on for these cases */
 +        assert(np_psnr_request_after_probe(PSNR_JOIN_ROOM, "\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00", 10, held_reply, NULL) == 1);
 +        assert(s_held[0].used && s_held[0].len == 10 && s_held_reply == -1);
 +        held_flush(nat_now_ms());
@@ -1109,7 +1126,10 @@ index 903f2e2..1bdfc57 100644
 +        s_held_reply = -1;
 +        held_flush(nat_now_ms());
 +        assert(!s_held[0].used && s_held_reply == 0);
-+        set_env("PSNR_JOIN_AFTER_PROBE", "0");           /* the switch: sent at once */
++        set_env("PSNR_JOIN_AFTER_PROBE", "0");           /* off: sent at once */
++        assert(np_psnr_request_after_probe(PSNR_JOIN_ROOM, "x", 1, held_reply, NULL) == 0 && !s_held[0].used);
++        set_env("PSNR_JOIN_AFTER_PROBE", "");            /* unset (the default): sent at once */
++        assert(!getenv("PSNR_JOIN_AFTER_PROBE") || !*getenv("PSNR_JOIN_AFTER_PROBE"));
 +        assert(np_psnr_request_after_probe(PSNR_JOIN_ROOM, "x", 1, held_reply, NULL) == 0 && !s_held[0].used);
 +        set_env("PSNR_JOIN_AFTER_PROBE", "1");
 +        s_probed = 1;
