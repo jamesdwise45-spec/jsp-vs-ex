@@ -180,6 +180,10 @@ RendezvousNotice g_rdv;
 // ENHANCEMENT (lobby): the start decision's lobby outcome (JSP_ROLLBACK=1 with no role key): jsp_net_game_install installs the hooks and opens no session; the
 // in-game lobby opens one later (jsp_net_lobby_open). Constant-initialized, like g_refusal (decide_env may run from another translation unit's constructor).
 std::atomic<bool> g_boot_lobby{false};
+// FIX (log wording, test13 field): the host closes the link because the other player left the native room (native_close); its handshake
+// Cancel still carries HostCancelled to any client left, but the host's own log line says why instead of "the host cancelled the match".
+// Set by native_poll before native_close, cleared when a link opens (conn_open). Log text only.
+std::atomic<bool> g_close_peer_left{false};
 void decide_env()
 {
     std::string why; jpno::Refusal code = jpno::Refusal::None; bool lobby = false;
@@ -1335,7 +1339,8 @@ void pump_tick(uint64_t t)
             }
         }
         if (st == jpsm::State::Ready) g.mh->start(0);
-        if (jpsm::terminal(st) && st != jpsm::State::Ended) pump_fail(std::string("match cancelled: ") + jpsm::explain(g.mh->reason()));
+        if (jpsm::terminal(st) && st != jpsm::State::Ended)
+            pump_fail(std::string("match cancelled: ") + (g.mh->reason() == jpsm::Reason::HostCancelled && g_close_peer_left.load() ? "the other player left" : jpsm::explain(g.mh->reason())));
         if (st == jpsm::State::Started) g.m2_started = true;
         // ENHANCEMENT (same-link rematch): a re-armed host waiting for its client's Hello says which match it is at, so a client that is still behind follows
         // (jsp_net_match.h; the first match on a link sends nothing new)
@@ -2294,6 +2299,7 @@ std::string own_release()
 // why and calls conn_close to be sure). Main thread, with the pump thread stopped.
 bool conn_open(const Conn& c, std::string* why, jpno::Refusal* code)
 {
+    g_close_peer_left = false;   // a new link: no close reason yet (log text only)
     RepsnIdentity rid;
     g.host = c.host; g.listen_port = c.port; g.join = c.join;
     g_ad_carry = jpdr::Carry();   // ENHANCEMENT (rematch carry): a new link starts from the manifest
@@ -2542,7 +2548,11 @@ void native_poll()
         // FIX (a brief room-view gap ended a live fight): during a running match a brief matching2 reading (a re-psn hiccup) must not end a live fight: 10 s there (the rollback link's own
         // disconnect timer ends a match whose peer is really gone first); 1 s between matches, as before.
         const uint64_t away_ms = g.phase.load() == Phase::Running ? 10000 : 1000;
-        if (g_nat.away_since && now - g_nat.away_since >= away_ms) { native_close(st != 2 ? "this game left the native room" : room != g_nat.room ? "this game is in another native room" : "the other player left the native room"); return; }
+        if (g_nat.away_since && now - g_nat.away_since >= away_ms) {
+            g_close_peer_left = st == 2 && room == g_nat.room;
+            native_close(st != 2 ? "this game left the native room" : room != g_nat.room ? "this game is in another native room" : "the other player left the native room");
+            return;
+        }
         // ENHANCEMENT (4-player online): the room's player count changed outside a fight (a join before the first fight, a leave between matches): the link is planned
         // again for the new count (a new rendezvous; 2 left = the 2-player path). FIX: with JSP_ROLLBACK_MAX_PLAYERS 2, a link opened at 2 members whose room grew
         // to 3-4 is closed (it would take over a fight of more humans than it has slots); the room gets no rollback until it is back to 2 in another room.
