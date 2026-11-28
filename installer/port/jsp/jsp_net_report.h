@@ -40,6 +40,8 @@ inline constexpr size_t kMaxKey = 64;
 inline constexpr size_t kMaxRedactions = 16;
 inline constexpr size_t kMaxBytes = 64 * 1024;  // the whole file stays below this
 inline constexpr const char* kFormat = "jsp-match-report 1";
+inline constexpr size_t kParts = 8;            // hash parts per commit line (all rng glob seed setup cam fi pad); extra columns, the first three stay as they were
+inline constexpr const char* kPartNames = "all rng glob seed setup cam fi pad";
 
 // ---- sanitiser -----------------------------------------------------------------------------------------------------------------------
 
@@ -182,7 +184,12 @@ private:
 
 // ---- the report ----------------------------------------------------------------------------------------------------------------------
 
-struct CommitLine { uint32_t tick = 0; uint64_t hash = 0; uint64_t raw = 0; };   // raw: the caller's packed input word(s) of the tick
+struct CommitLine {
+    uint32_t tick = 0; uint64_t hash = 0; uint64_t raw = 0;   // raw: the caller's packed input word(s) of the tick
+    // DIAGNOSTIC (test13, room 38): the tick's hash parts (all rng glob seed setup cam fi pad), each 64-bit part folded to 32 bits (hi ^ lo); has_parts = given
+    bool has_parts = false; uint32_t part[kParts] = {};
+};
+inline uint32_t fold_part(uint64_t v) { return (uint32_t)(v ^ (v >> 32)); }
 struct RollbackEvent { uint32_t from_tick = 0; uint32_t depth = 0; };             // from_tick: the tick the game was on; depth: ticks re-run
 
 struct SessionFacts {
@@ -220,6 +227,13 @@ public:
     void set_session(const SessionFacts& f) { session_ = f; have_session_ = true; }
     void set_end_reason(const std::string& why) { end_ = why; }
     void commit(uint32_t tick, uint64_t hash, uint64_t raw) { commits_.push(CommitLine{tick, hash, raw}); }
+    // parts: kParts 64-bit hash parts in kPartNames order, or nullptr (the line then has the three columns only)
+    void commit(uint32_t tick, uint64_t hash, uint64_t raw, const uint64_t* parts)
+    {
+        CommitLine c; c.tick = tick; c.hash = hash; c.raw = raw;
+        if (parts) { c.has_parts = true; for (size_t i = 0; i < kParts; i++) c.part[i] = fold_part(parts[i]); }
+        commits_.push(c);
+    }
     void rollback(uint32_t from_tick, uint32_t depth)
     {
         rollbacks_.push(RollbackEvent{from_tick, depth});
@@ -257,7 +271,7 @@ public:
     {
         std::string o;
         o.reserve(16 * 1024);
-        char b[160];
+        char b[256];
         auto line = [&](const std::string& s) { o += s; o += '\n'; };
         auto clean = [&](const std::string& s) { return sanitize(s, redact_); };
 
@@ -295,12 +309,13 @@ public:
         }
         line("");
         line("[commits]");
-        std::snprintf(b, sizeof b, "count: %llu  kept: %zu (oldest first: tick hash raw, hex)", (unsigned long long)commits_.total(),
-                      commits_.size());
+        std::snprintf(b, sizeof b, "count: %llu  kept: %zu (oldest first: tick hash raw, hex; then, when known, the parts %s, each folded to 32 bits)",
+                      (unsigned long long)commits_.total(), commits_.size(), kPartNames);
         line(b);
         for (size_t i = 0; i < commits_.size(); i++) {
             const CommitLine& c = commits_.at(i);
-            std::snprintf(b, sizeof b, "%u %016llx %016llx", (unsigned)c.tick, (unsigned long long)c.hash, (unsigned long long)c.raw);
+            int n = std::snprintf(b, sizeof b, "%u %016llx %016llx", (unsigned)c.tick, (unsigned long long)c.hash, (unsigned long long)c.raw);
+            for (size_t p = 0; c.has_parts && p < kParts && n > 0 && (size_t)n < sizeof b; p++) n += std::snprintf(b + n, sizeof b - n, " %08x", (unsigned)c.part[p]);
             line(b);
         }
         line("");

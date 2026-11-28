@@ -415,6 +415,28 @@ server's polling thread caught awake. A few were a loader worker caught inside i
 `0x004B7908`), the case behind the freeze. Desyncs stayed at 0, restores averaged 10.7 ms, and 4 waits ran past 50 ms.
 `JSP_SNAPSHOT_SITE=0` turns it off.
 
+**A restore that cannot be made safe is refused (test13, `JSP_SNAPSHOT_SITE_REFUSE_MS`, 1500 in rollback matches).** In room 34 (field,
+2026-11-27) the give-up above let a restore go ahead while the file loader (`sp_file_server_load_thread`, tid 18) was inside a job; the job
+queue went back, the loader did not, both job workers then called through garbage descriptors, one looped, and the commit gate waited its
+15 s budget, which ended the match for all 4 PCs. Now only threads whose name starts with a prefix in `JSP_SNAPSHOT_SITE_SAFE` (default `CRI`:
+every CRI move in 12 field logs came back within the 50 ms) keep the short give-up. Any other moved thread is waited for, unfrozen between
+freezes, up to `JSP_SNAPSHOT_SITE_REFUSE_MS`; if it is still away the restore is refused before any memory is touched (`[snap] site ...
+REFUSED`), the session ends with "rollback refused", and the snapshot is NOT failed, so the next match in the process can roll back and the
+room re-arms as after any failure on another player. `0` restores the old give-up for every thread.
+
+**Fail fast on a NULL-call loop (test13, `JSP_NET_NULLCALL_GUARD`, on).** A guest thread that makes 32 NULL indirect calls between two tick
+boundaries (patch 0500's hook, `jsp_rb_guard.h`) is looping on garbage (the toolkit returns from every NULL call). The snapshot gate gives
+up on it at once (`jsp_snapshot_ext_set_stop_hook`) and the match ends with one `[net] NULL-call loop` line.
+
+**Diagnostics (test13).** A Desync polls the session once before the abort so every peer gets this PC's checksum and logs the same DESYNC;
+a Desync is handled before a Disconnected of the same batch. The match report's commit lines carry the 8 hash parts (all rng glob seed setup
+cam fi pad, each folded to 32 bits). Every skipped helper-register write-back is logged with the tick, depth, thread and both wait sites;
+`JSP_NET_REGS_SKIP_FAIL=1` (off) ends the fight on one.
+
+**Loader boundary wait (test13, `JSP_NET_LOADER_WAIT=1`, off).** Before the session iteration the boundary waits (100 ms at most, off for
+the match after 3 timeouts in a row) until the loader sits in its idle wait `0x0052E658` on two samples, so saves and restores see it idle.
+Off by default: the idle site was confirmed in 2 matches only, and a loader the main thread must feed would cost every boundary the timeout.
+
 **GekkoNet's sparse saving does not pay here (`JSP_ROLLBACK_LIMITED_SAVING`, tried 2026-11-21).** A state can only be saved while the game is at
 that tick, and a peer that predicts is always ahead of the confirmed tick. So to save a confirmed tick, GekkoNet rolls back to its last save and runs
 the whole prediction window again: in a two-copy match over a 66 ms link it went back 9 ticks about every 9 ticks, twice the simulation to skip a save.
@@ -487,6 +509,8 @@ Each is a `play_settings.txt` line (or an environment variable). Test-only switc
 | `JSP_ROLLBACK_RECORD`, `JSP_ROLLBACK_RECORD_DIR` | save each match's confirmed inputs as a replay (off by default) | no |
 | `JSP_NET_REPORT_DIR` | folder of the match reports (default `reports`) | no |
 | `JSP_AUDIO_TICKLOCK`, `JSP_NET_GUEST_CLOCK`, `JSP_NET_CRI_LOCK`, `JSP_NET_THREAD_REGS` | the determinism fixes above; on in a match, `0` turns each off | A/B only |
+| `JSP_SNAPSHOT_SITE_REFUSE_MS` (1500), `JSP_SNAPSHOT_SITE_SAFE` (`CRI`), `JSP_NET_NULLCALL_GUARD` | the test13 guards above: refuse an unsafe restore (the fight ends, the room stays), end a NULL-call loop at once; `0` turns the first and third off | A/B only |
+| `JSP_NET_REGS_SKIP_FAIL`, `JSP_NET_LOADER_WAIT` | test13, off by default: `1` ends the fight on a skipped helper-register write-back; `1` waits for the file loader at its idle site at each boundary | yes |
 | `JSP_ROLLBACK_SKIP_FINAL`, `JSP_SNAPSHOT_COPY_THREADS` (3), `JSP_SNAPSHOT_PRECHECK_US` (20000), `JSP_SNAPSHOT_AUDIT_EXEMPT`, `JSP_SNAPSHOT_LWM_CACHE`, `JSP_SNAPSHOT_LAYOUT_GEN`, `JSP_SNAPSHOT_QUICK`, `JSP_SNAPSHOT_QUICK_WAIT_US`, `JSP_SNAPSHOT_FROZEN_WALK_EVERY`, `JSP_SNAPSHOT_AUDIT_ASYNC`, `JSP_SNAPSHOT_SITE`, `JSP_SNAPSHOT_SITE_MS` | snapshot speed-ups, set by default in rollback; `0` turns each off | A/B only |
 | `PSO_ASYNC` | pipelines built on worker threads, on as offline (rollback no longer sets `0`: the bench crash was the blob count race toolkit patch 2072 fixed); `0` builds them on the drawing thread | no |
 | `JSP_STEP_SKIP_DRAWS` | skip the draws of re-run frames (with `JSP_STEP_TURBO`); off offline, a rollback match sets `1` (`jsp_net_online.h`), `0` draws them | no |

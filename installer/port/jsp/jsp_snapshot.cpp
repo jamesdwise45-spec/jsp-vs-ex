@@ -158,6 +158,12 @@ unsigned g_sync_tries = 2000;       // JSP_SNAPSHOT_SYNC_TRIES
 unsigned g_sync_ms = 0;             // JSP_SNAPSHOT_SYNC_MS: wall-time budget of the commit gates since the last budget reset (0 = none; rollback mode sets kGateBudgetMs of jsp_net_game.cpp)
 double g_gate_used_ms = 0;          // gate time (waits, freezes, resumes) summed since the last jsp_snapshot_ext_budget_reset(): ONE budget across all gates between two session updates
 void (*g_idle_hook)() = nullptr;     // jsp_snapshot_ext_set_idle_hook(): called every ~20 ms from the gate's waits so the network is serviced while a commit waits (main thread only)
+// FIX (test13, NULL-call loop): jsp_snapshot_ext_set_stop_hook(): asked between the gate's tries; nonzero = give up now (a guest thread loops on NULL calls, so
+// nothing the gate waits for will come): the gate fails at once instead of after its 15 s budget.
+int (*g_stop_hook)() = nullptr;
+// FIX (test13, room 34): the last rollback was REFUSED by the site rule (jsy::Cfg::site_refuse_ms) before any memory was touched: jsp_snapshot_ext_rollback returns 3.
+bool g_rb_refused = false; uint32_t g_rb_refusals = 0;
+std::string g_site_safe = "CRI";   // JSP_SNAPSHOT_SITE_SAFE: comma-separated thread name prefixes whose moves keep the short give-up ("none" = no thread)
 Clock::time_point g_idle_last = Clock::now();
 unsigned gate_budget_ms()            // what is left of g_sync_ms; 1 when used up (the gate then tries once more and fails loudly)
 {
@@ -181,6 +187,7 @@ bool g_save_clean = false;          // full mode: the save's census had no block
 uint32_t g_rebases = 0;   // incremental mode: how many re-baselines after a committed-set change
 int g_ww = 0;                     // JSP_SNAPSHOT_WW: 0 off, 1 ring, 2 ring + full verify
 bool g_ext = false;               // JSP_SNAPSHOT_EXT=1 (rollback session): no scripted rounds; the netcode drives commit/rollback through jsp_snapshot_ext_*
+uint64_t g_ext_parts[8] = {};   // DIAGNOSTIC (test13): the 8 hash parts of tick g_ext_hash_tick (jsp_snapshot_ext_parts: the match report's commits)
 uint32_t g_ext_hash = 0, g_ext_hash_tick = 0xffffffffu;   // the port's per-tick hash (fight hash `all` component folded to 32 bits) of the last counted pass
 uint32_t g_ww_depth = 10; size_t g_ww_pool = 20480;
 std::vector<jss::Range> g_user_ex;   // JSP_SNAPSHOT_EXCLUDE
@@ -1069,6 +1076,7 @@ struct GateOps {
         }
     }
     bool resume() { return sp.resume(); }
+    bool stop() { return g_stop_hook && g_stop_hook() != 0; }   // FIX (test13): the session's NULL-call loop flag (jsy::stop_)
     // frozen: a fresh page-readability cache by default (the unfrozen precheck reuses the per-tick one). ENHANCEMENT (rollback latency, A/B):
     // JSP_SNAPSHOT_LWM_CACHE=keep keeps it while the committed layout is unchanged (lwm_cache_keep): measured 7.6 ms of the 8 ms census per sample was this re-query.
     void sample(jsy::View* v) {
@@ -1783,9 +1791,38 @@ bool ww_layout_changed_full()
     return true;
 }
 
-// One commit (restore_to == kNoTick) or one rollback of the ring; the caller (jsf::ww_pass_end) has already ruled out a layout change. false = fatal (capture_failed ran).
+// FIX (test13, JSP_SNAPSHOT_SITE_SAFE): the guest threads whose name starts with one of the safe prefixes (bit tid - 1), threads running (before a restore's gate).
+// A thread id is reused after a thread ends, so the mask is read again for every restore.
+uint64_t site_safe_mask()
+{
+    uint64_t m = 0;
+    if (g_site_safe.empty() || g_site_safe == "none") return 0;
+    for (uint32_t t = 1; t < (uint32_t)jsy::kThr; t++) {
+        uint64_t o[5] = {}; char nm[64] = {0};
+        if (!ps3_ppu_thread_view(t, o, nm)) continue;
+        size_t a = 0;
+        while (a <= g_site_safe.size()) {
+            size_t b = g_site_safe.find(',', a); if (b == std::string::npos) b = g_site_safe.size();
+            const std::string p = g_site_safe.substr(a, b - a);
+            if (!p.empty() && !std::strncmp(nm, p.c_str(), p.size())) { m |= jtb::thread_bit(t); break; }
+            a = b + 1;
+        }
+    }
+    return m;
+}
+std::string tid_list(uint64_t m)   // "18,20" ("-" = none), for the site lines
+{
+    std::string s;
+    for (uint32_t t = 1; t <= 64; t++) if (jtb::has_thread(m, t)) { if (!s.empty()) s += ','; s += std::to_string(t); }
+    return s.empty() ? std::string("-") : s;
+}
+
+// One commit (restore_to == kNoTick) or one rollback of the ring; the caller (jsf::ww_pass_end) has already ruled out a layout change. false = fatal (capture_failed ran),
+// except a rollback the site rule refused before anything was copied (g_rb_refused; FIX test13): nothing failed, the caller ends the fight.
 bool ww_transaction(uint32_t k, ppu_context* c, uint32_t restore_to)
 {
+    g_rb_refused = false;
+    if (restore_to != kNoTick && g_cfg.block_site && g_cfg.site_refuse_ms) g_cfg.site_safe_mask = site_safe_mask();
     if (restore_to != kNoTick && g_quiesce >= 2 && !g_views.is_clean(restore_to)) {   // only a tick whose capture was clean is a rollback target
         std::fprintf(stderr, "[snap] rollback k=%u -> tick %u refused: the capture of that tick has no clean census (never stored, or it had blocking reasons)\n", k, restore_to);
         capture_failed("WW ROLLBACK-TARGET-NOT-CLEAN"); return false;
@@ -1845,6 +1882,18 @@ bool ww_transaction(uint32_t k, ppu_context* c, uint32_t restore_to)
         if (restore_to == kNoTick) g_last_commit_notes = op.gr.verdict.notes;   // commits log on a change of the note set, on a block, and every 300th tick
     }
     op.verification_line(restore_to == kNoTick ? "commit" : "rollback");
+    // FIX (test13, room 34): a restore the site rule refused. The gate stopped before collect / apply: guest memory, the ring and the write watch are as they were.
+    // Not a capture failure (rollback stays usable for the next match in this process); the caller ends this fight.
+    if (restore_to != kNoTick && op.gr.site_refused && !(result.failures & ~(unsigned)jso::Pause)) {
+        g_rb_refused = true; g_rb_refusals++;
+        std::fprintf(stderr, "[snap] site k=%u -> tick %u REFUSED: thread(s) %s still away from their wait site at the save after %u ms (first: tid=%u lr 0x%08X -> 0x%08X; all moved %s; safe prefixes \"%s\"): nothing restored, the fight ends (JSP_SNAPSHOT_SITE_REFUSE_MS=0 restores anyway)\n",
+                     k, restore_to, tid_list(op.gr.site_unsafe).c_str(), g_cfg.site_refuse_ms, op.gr.site_tid, op.gr.site_lr_was, op.gr.site_lr_now, tid_list(op.gr.site_mask).c_str(), g_site_safe.c_str());
+        return false;
+    }
+    if (op.gr.stopped) {   // FIX (test13): the session's stop hook (a guest NULL-call loop): the guest state is broken, fail now instead of after the gate budget
+        std::fprintf(stderr, "[snap] gate stopped at k=%u (%s): a guest thread is looping on NULL calls, nothing the gate waits for will come (reasons=0x%X)\n", k, restore_to == kNoTick ? "commit" : "rollback", op.gr.reasons);
+        capture_failed("WW gate stopped (guest NULL-call loop)", result.failures); return false;
+    }
     if (op.fw_pages) { std::fprintf(stderr, "[snap] FROZEN-WRITES k=%u %s pages=%u first=0x%08X: guest pages written between the freeze's collect/reset and the resume (a thread the freeze did not cover, or main)\n", k, restore_to == kNoTick ? "commit" : "rollback", op.fw_pages, op.fw_first); }
     if (!result.ok()) { capture_failed("WW tick transaction", result.failures); return false; }
     if (restore_to == kNoTick) {
@@ -1869,8 +1918,9 @@ bool ww_transaction(uint32_t k, ppu_context* c, uint32_t restore_to)
         return true;
     }
     if (op.gr.site_waited || (op.gr.first_notes & jsy::NSiteMoved))   // a thread was parked elsewhere than at the target's save (first sample): JSP_SNAPSHOT_SITE=1 waits for it
-        std::fprintf(stderr, "[snap] site k=%u -> tick %u tid=%u lr 0x%08X -> 0x%08X waited=%d gave_up=%d still_moved=%u\n", k, restore_to,
-                     op.gr.site_tid, op.gr.site_lr_was, op.gr.site_lr_now, op.gr.site_waited ? 1 : 0, op.gr.site_gave_up ? 1 : 0, op.gr.verdict.site_moved);
+        std::fprintf(stderr, "[snap] site k=%u -> tick %u tid=%u lr 0x%08X -> 0x%08X waited=%d gave_up=%d still_moved=%u moved=%s unsafe=%s settles=%u\n", k, restore_to,
+                     op.gr.site_tid, op.gr.site_lr_was, op.gr.site_lr_now, op.gr.site_waited ? 1 : 0, op.gr.site_gave_up ? 1 : 0, op.gr.verdict.site_moved,
+                     tid_list(op.gr.site_mask).c_str(), tid_list(op.gr.site_unsafe).c_str(), op.gr.site_settles);
     std::fprintf(stderr, "[snap] ww-rollback k=%u -> tick %u ok=1 pages=%u pending=%zu collect=%.3f rollback=%.3f suspend=%.3f total=%.3f ms prep=%.3f ms reset=%.3f%s\n", k, restore_to,
                  g_ring.stats().last_rollback_pages, g_ww_slots.size(), op.collect_ms, op.apply_ms, op.suspend_ms, total_ms, prep_ms, op.reset_ms, tail);
     rng_line("restored", restore_to);
@@ -2039,6 +2089,11 @@ extern "C" int jsp_snapshot_init(uint32_t hash_start, uint32_t hash_n)
     ev = std::getenv("JSP_SNAPSHOT_SYNC_STRICT"); g_cfg.strict = ev && *ev && ev[0] != '0';
     ev = std::getenv("JSP_SNAPSHOT_SITE"); g_cfg.block_site = ev && *ev && ev[0] != '0';
     ev = std::getenv("JSP_SNAPSHOT_SITE_MS"); if (ev && *ev) g_cfg.site_wait_ms = (unsigned)std::strtoul(ev, nullptr, 10);
+    // FIX (test13): a moved thread outside the safe prefixes is waited for up to JSP_SNAPSHOT_SITE_REFUSE_MS, then the restore is refused (0 = off: the give-up above)
+    ev = std::getenv("JSP_SNAPSHOT_SITE_REFUSE_MS"); if (ev && *ev) g_cfg.site_refuse_ms = (unsigned)std::strtoul(ev, nullptr, 10);
+    ev = std::getenv("JSP_SNAPSHOT_SITE_SAFE"); if (ev) g_site_safe = ev;
+    if (g_cfg.block_site && g_cfg.site_refuse_ms)
+        std::fprintf(stderr, "[snap] site rule: a restore waits %u ms for a moved thread named \"%s\"*, %u ms for any other, then is refused (the fight ends)\n", g_cfg.site_wait_ms, g_site_safe.c_str(), g_cfg.site_refuse_ms);
     ev = std::getenv("JSP_SNAPSHOT_SYNC_MS"); if (ev && *ev) g_sync_ms = (unsigned)std::strtoul(ev, nullptr, 10);
     ev = std::getenv("JSP_SNAPSHOT_SYNC_TRIES"); if (ev && *ev) g_sync_tries = (unsigned)std::strtoul(ev, nullptr, 10);
     ev = std::getenv("JSP_SNAPSHOT_QUIESCE"); g_quiesce = ev && *ev ? (ev[0] == '2' ? 2 : ev[0] == '1' ? 1 : 0) : 0;
@@ -2177,7 +2232,7 @@ static void pass_end_impl(uint32_t k, ppu_context* c)
     if (g_rec.have && g_rec_n == k) r = g_rec;
     g_rec.have = false;
     if (g_ext) {   // rollback session: the netcode decides when to commit / roll back (jsp_snapshot_ext_*); here only the per-tick hash is kept
-        if (r.have) { g_ext_hash = (uint32_t)(r.v[0] ^ (r.v[0] >> 32)); g_ext_hash_tick = k; }
+        if (r.have) { g_ext_hash = (uint32_t)(r.v[0] ^ (r.v[0] >> 32)); g_ext_hash_tick = k; for (int i = 0; i < jss::kComps && i < 8; i++) g_ext_parts[i] = r.v[i]; }
         return;
     }
     if (g_ww) {   // incremental mode: the decision flow is jsp_snapshot_flow.h (host-tested with a fake environment); this is its Windows environment
@@ -2236,7 +2291,15 @@ extern "C" uint32_t jsp_snapshot_ext_hash(uint32_t k)
     if (h) g_cw.saved(k, false);   // a hash-only save of a re-run tick also ends its recovery (cost window)
     return h;
 }
-// Restore the state with `to` completed ticks while `k` ticks are done now.
+// DIAGNOSTIC (test13, the match report): the 8 hash parts of tick k (order all, rng, glob, seed, setup, cam, fi, pad: jss::kCompNameImpl). 0 = tick k has none.
+extern "C" int jsp_snapshot_ext_parts(uint32_t k, uint64_t* out8)
+{
+    if (!jsp_snapshot_ext_active() || g_ext_hash_tick != k) return 0;
+    for (int i = 0; i < 8; i++) out8[i] = g_ext_parts[i];
+    return 1;
+}
+// Restore the state with `to` completed ticks while `k` ticks are done now. 3 (FIX test13) = refused by the site rule before any memory was touched: nothing
+// failed, the snapshot stays usable (the caller ends the fight; jsp_snapshot_ext_session_end drops the ring).
 extern "C" int jsp_snapshot_ext_rollback(uint32_t k, uint32_t to, ppu_context* c)
 {
     if (!jsp_snapshot_ext_active()) return 0;
@@ -2248,8 +2311,10 @@ extern "C" int jsp_snapshot_ext_rollback(uint32_t k, uint32_t to, ppu_context* c
     g_cw.rollback_begin(k, to);   // ENHANCEMENT (measurement): the recovery runs until the save of tick k (cost window)
     const bool ok = env.rollback(k, to);
     if (!ok) g_cw.rollback_failed();
+    if (!ok && g_rb_refused && g_on) return 3;
     return ok ? 1 : 0;
 }
+extern "C" void jsp_snapshot_ext_set_stop_hook(int (*fn)()) { g_stop_hook = fn; }   // FIX (test13): see g_stop_hook
 // Entries the ring evicted because its page POOL was short while an entry slot was free (the reachable depth shrank). 0 = fine; > 0 = the pool is too small
 // (JSP_SNAPSHOT_WW_POOL). The SPAN newest-oldest is not a signal: after a rollback of >= 2 ticks it is below the depth until the ring refills.
 extern "C" uint64_t jsp_snapshot_ext_pool_evicted(void)
@@ -2269,6 +2334,7 @@ extern "C" void jsp_snapshot_ext_set_idle_hook(void (*fn)()) { g_idle_hook = fn;
 extern "C" void jsp_snapshot_ext_guard_summary(void)   // session end: how often RSX-side writes into saved memory happened (the log-only measurement)
 {
     if (g_ext) g_cw.maybe_print(true);   // ENHANCEMENT (measurement): the last cost window of the session
+    if (g_ext && g_rb_refusals) std::fprintf(stderr, "[snap] restores refused by the site rule in this process: %u\n", g_rb_refusals);   // FIX (test13)
     if (!g_ext || !g_rg_commits) return;
     rsx_guard_flush_log();
     std::fprintf(stderr, "[snap] RSX write guard summary: %u commits checked, %u with the previous capture RSX-pending, %u of those had saved-memory RSX writes (data %u, label/semaphore %u, ring wraps %u); %u RSX-side main-memory writes noted in all; hazard=%d; ring extensions (committed set grew, history kept): %u; frozen layout walks %llu (mean %.3f ms, max %.3f ms, skipped %llu), re-checks %u\n",

@@ -119,6 +119,11 @@ struct Cfg {
     // thread's load wait never ended, 2026-11-21 R1). Once the thread is back at its save-time site, the rewound memory and the thread agree again. Bounded:
     // after site_wait_ms the restore goes ahead with the note (a thread that moved for good, e.g. a new loading phase, must not stall the match).
     bool block_site = false; unsigned site_wait_ms = 50;
+    // FIX (test13, room 34: a rollback carried on with the file loader mid-job and ended the session for 4 PCs; JSP_SNAPSHOT_SITE_REFUSE_MS, 0 = the give-up above for
+    // every thread): a moved thread NOT in site_safe_mask (bit tid - 1; the port fills it from the thread names, JSP_SNAPSHOT_SITE_SAFE) is waited for up to
+    // site_refuse_ms instead of site_wait_ms. If it is still away then, the gate REFUSES the restore (GateResult::site_refused, ok = false, nothing was copied): the
+    // caller ends the fight in order instead of running on with a helper thread out of step with the restored memory. Safe threads keep the short give-up.
+    unsigned site_refuse_ms = 0; uint64_t site_safe_mask = 0;
     bool strict = false;                    // JSP_SNAPSHOT_SYNC_STRICT=1: threads running guest code or unclassified HLE calls also block
     uint32_t self_tid = 0;                  // the calling (main) thread: not suspended, not judged
     uint32_t nid_parked[16]; int n_parked = 0;     // HLE imports that block waiting for something (sys_lwcond_wait, timers, ...)
@@ -151,6 +156,7 @@ struct Verdict {
     uint32_t evq_woken = 0, evq_buffered = 0, evq_drift = 0, sem_woken = 0, sem_drift = 0;
     uint32_t role_away = 0, role_absent = 0, role_queue = 0, role_at = 0, rsx_pending = 0;
     uint32_t site_moved = 0, site_tid = 0, site_lr_was = 0, site_lr_now = 0;   // threads parked elsewhere than at the save (first one for the log)
+    uint64_t site_mask = 0;   // every moved thread (bit tid - 1): the refusal rule and the log's full list
     uint32_t host_drift = 0;   // fb_total / jc_total / spurs_inst that differ from the saved view (host objects created or destroyed in the window)
     uint32_t jobsrv = 0;   // (js_bits != 0) + job records in state 2
     uint32_t jobs = 0, fibers_away = 0, flip_pending = 0;   // jobs in flight (+ HLE queue pending); fibers running elsewhere + scheduler lock held; flip outstanding (status WAITING, command ahead of the drain, direct flip, undelivered flip pump, flip lock)
@@ -202,7 +208,7 @@ inline Verdict judge(const View& v, const View* saved, const Cfg& c)
             if (classify_thread(saved->t_kind[t], saved->t_id[t], c) != TC::Parked) continue;
             if (saved->t_kind[t] == v.t_kind[t] && saved->t_id[t] == v.t_id[t] && saved->t_lr[t] == v.t_lr[t]) continue;
             if (!d.site_moved) { d.site_tid = (uint32_t)t; d.site_lr_was = saved->t_lr[t]; d.site_lr_now = v.t_lr[t]; }
-            d.site_moved++;
+            d.site_moved++; d.site_mask |= jtb::thread_bit((uint32_t)t);
         }
     if (d.site_moved) { d.notes |= NSiteMoved; if (c.block_site) d.reasons |= SiteMoved; }
     if (c.roles) {   // park points
@@ -281,6 +287,12 @@ struct GateResult {
     unsigned retry_immediate = 0, persist[16] = {0}, timeout_by[16] = {0};
     bool site_waited = false, site_gave_up = false;   // SiteMoved blocked at least once / was dropped after Cfg::site_wait_ms
     uint32_t site_tid = 0, site_lr_was = 0, site_lr_now = 0;   // the first moved thread of the first sample that saw one (the log)
+    // FIX (test13, Cfg::site_refuse_ms): site_refused = the restore was refused (ok = false, the threads are suspended as after a failed gate; nothing was copied);
+    // site_mask / site_unsafe = the moved threads of the last frozen sample that saw any, and of them the ones not in Cfg::site_safe_mask (bit tid - 1);
+    // site_settles = unfrozen waits for a moved thread to come back (presample + yield) between two freezes.
+    bool site_refused = false; uint64_t site_mask = 0, site_unsafe = 0; unsigned site_settles = 0;
+    // FIX (test13, NULL-call loop): the Ops' stop() asked the gate to give up (a guest thread loops on NULL calls: nothing it waits for will come). ok = false.
+    bool stopped = false;
     // DIAGNOSTIC (test12, rollback cost): what the UNFROZEN precheck waited for (Cfg::precheck_us spins, Cfg::prewait_ms waits, gate_ev precheck waits).
     // pre_wait_by[b] = precheck waits (one spin / one sequence wait each) while reason bit b blocked; pre_wait_reasons = the OR of those reasons.
     // The frozen first sample (first_reasons) is usually clean because the precheck already waited: this says what the wait was for.
@@ -298,6 +310,40 @@ struct GateResult {
 // the RSX never finished its frame. So after a try that was blocked by RsxPending, the gate waits UNFROZEN (ops.rsx_busy(), when the ops have it) before it freezes again.
 template<class O> auto rsx_busy_(O& o, int) -> decltype(o.rsx_busy()) { return o.rsx_busy(); }
 template<class O> bool rsx_busy_(O&, long) { return false; }
+// FIX (test13): bool stop() (optional): the session wants the gate to give up now (a guest NULL-call loop); checked between tries and in the unfrozen waits.
+template<class O> auto stop_(O& o, int) -> decltype(bool(o.stop())) { return o.stop(); }
+template<class O> bool stop_(O&, long) { return false; }
+// FIX (test13, Cfg::site_refuse_ms): what a gate does with a SiteMoved sample `since_ms` after it started. Wait = keep blocking; Drop = go ahead with the note (the
+// old give-up: every moved thread is in site_safe_mask, or the refusal is off); Refuse = an unsafe thread is still away after site_refuse_ms.
+enum class SiteStep { Wait, Drop, Refuse };
+inline SiteStep site_step(const Verdict& d, long long since_ms, const Cfg& c)
+{
+    const uint64_t unsafe = d.site_mask & ~c.site_safe_mask;
+    if (since_ms < (long long)c.site_wait_ms) return SiteStep::Wait;
+    if (!unsafe || !c.site_refuse_ms) return SiteStep::Drop;
+    return since_ms < (long long)c.site_refuse_ms ? SiteStep::Wait : SiteStep::Refuse;
+}
+// FIX (test13): between two freezes of a restore blocked by SiteMoved, wait UNFROZEN (presample + yield) until the moved threads are back where the save saw them
+// (the frozen judge confirms) or the site's time is up: a freeze every ~4 ms would give the thread being waited for 1 ms in 4 to finish its job. For Ops with presample().
+template<class O> auto site_settle_(O& ops, const View* saved, const Cfg& cfg, GateResult& g, std::chrono::steady_clock::time_point t_start, unsigned max_ms, int)
+    -> decltype(ops.presample((View*)nullptr), void())
+{
+    using SC = std::chrono::steady_clock;
+    Roles scratch; Cfg pc = cfg; View pv;
+    for (;;) {
+        if (stop_(ops, 0)) return;
+        if (cfg.roles) { scratch = *cfg.roles; pc.roles = &scratch; }   // membership is learned by the frozen judge only
+        ops.presample(&pv);
+        g.prechecks++;
+        const Verdict d = judge(pv, saved, pc);
+        if (!(d.reasons & SiteMoved)) return;
+        const long long since_ms = std::chrono::duration_cast<std::chrono::milliseconds>(SC::now() - t_start).count();
+        if (site_step(d, since_ms, cfg) != SiteStep::Wait || (max_ms && since_ms >= (long long)max_ms)) return;   // the frozen judge gives up or refuses
+        g.site_settles++;
+        ops.yield();
+    }
+}
+template<class O> void site_settle_(O&, const View*, const Cfg&, GateResult&, std::chrono::steady_clock::time_point, unsigned, long) {}
 // max_ms (0 = no bound; when set it replaces max_tries as the limit): wall-time bound on the whole wait (rollback mode: the match's grace window is the budget, the gate must give up well inside it, loudly, like running out of tries).
 // ENHANCEMENT (Cfg::prewait_ms): the unfrozen pre-wait of gate(), for Ops that have the gate_ev calls (seq / presample / wait); others get the no-op overload.
 // FiberAway is judged only frozen (the unfrozen presample does not walk the fiber lists), as in gate_ev.
@@ -338,7 +384,7 @@ template<class O> auto precheck_(O& ops, const View* saved, const Cfg& cfg, Gate
         if (r & SiteMoved) {
             if (!g.site_tid) { g.site_tid = d.site_tid; g.site_lr_was = d.site_lr_was; g.site_lr_now = d.site_lr_now; }
             g.site_waited = true;
-            if (since_ms >= (long long)cfg.site_wait_ms) r &= ~(unsigned)SiteMoved;
+            if (site_step(d, since_ms, cfg) != SiteStep::Wait) r &= ~(unsigned)SiteMoved;   // a give-up or a refusal is the frozen judge's to make
         }
         g.prechecks++;
         const double us = std::chrono::duration<double, std::micro>(SC::now() - t0).count();
@@ -369,13 +415,17 @@ template<class Ops> GateResult gate(Ops& ops, Mode mode, const View* saved, unsi
         if (t == 1) { g.first_reasons = g.reasons; g.first_notes = g.verdict.notes; }
         if (g.verdict.site_moved && !g.site_tid) { g.site_tid = g.verdict.site_tid; g.site_lr_was = g.verdict.site_lr_was; g.site_lr_now = g.verdict.site_lr_now; }
         if (g.reasons & SiteMoved) {
-            g.site_waited = true;
-            if (std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t_start).count() >= (long long)cfg.site_wait_ms) {
-                g.reasons &= ~(unsigned)SiteMoved; g.verdict.reasons = g.reasons; g.site_gave_up = true; }
+            g.site_waited = true; g.site_mask = g.verdict.site_mask; g.site_unsafe = g.verdict.site_mask & ~cfg.site_safe_mask;
+            const SiteStep s = site_step(g.verdict, std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t_start).count(), cfg);
+            if (s == SiteStep::Drop) { g.reasons &= ~(unsigned)SiteMoved; g.verdict.reasons = g.reasons; g.site_gave_up = true; }
+            else if (s == SiteStep::Refuse && mode == Mode::Wait) { g.site_refused = true; g.ok = false; return g; }   // suspended, nothing copied: the caller resumes and ends the fight
         }
         if (mode == Mode::Log || g.reasons == 0) { g.ok = true; return g; }
-        if (t == limit) break;
-        if (max_ms && std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t_start).count() >= (long long)max_ms) break;
+        // out of tries or time with an unsafe moved thread the ONLY blocker: a refusal (the fight ends, nothing was copied), not a capture failure
+        const bool site_only = g.reasons == (unsigned)SiteMoved && (g.verdict.site_mask & ~cfg.site_safe_mask) && cfg.site_refuse_ms;
+        if (t == limit) { g.site_refused = site_only; break; }
+        if (max_ms && std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t_start).count() >= (long long)max_ms) { g.site_refused = site_only; break; }
+        if (stop_(ops, 0)) { g.stopped = true; break; }   // suspended, as a gate that ran out of tries
         if (!ops.resume()) { g.ok = false; g.reasons |= PauseFailed; g.verdict.reasons = g.reasons; return g; }
         g.suspended = false;
         ops.yield();
@@ -383,9 +433,11 @@ template<class Ops> GateResult gate(Ops& ops, Mode mode, const View* saved, unsi
             while (rsx_busy_(ops, 0)) {
                 g.unfrozen_waits++;
                 if (max_ms && std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t_start).count() >= (long long)max_ms) break;
+                if (stop_(ops, 0)) break;
                 ops.yield();
             }
         }
+        if (g.reasons & SiteMoved) site_settle_(ops, saved, cfg, g, t_start, max_ms, 0);
     }
     g.ok = false;   // Wait mode ran out of tries: threads are still suspended, the caller resumes them and fails loudly with the reasons
     return g;
